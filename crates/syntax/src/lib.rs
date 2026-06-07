@@ -110,7 +110,15 @@ mod tests {
 
     #[test]
     fn parse_is_total_and_lossless() {
-        for src in ["", "contract C {}", "this is not solidity !!!"] {
+        for src in [
+            "",
+            "contract C {}",
+            "this is not solidity !!!",
+            "  \n// leading + trailing\ncontract C {}  \n",
+            "// only a comment",
+            "contract C { string s = unicode\"héllo 🌍\"; }",
+            "contract C {",
+        ] {
             assert_eq!(parse(src).syntax().text().to_string(), src);
         }
     }

@@ -93,6 +93,10 @@ pub(crate) fn build_tree(
             }
             Event::Token { kind } => {
                 eat_trivia(&mut builder, &mut raw);
+                debug_assert!(
+                    raw < spans.len(),
+                    "Token event without a matching non-trivia token (parser/lexer desync)"
+                );
                 let (_k, s, e) = spans[raw];
                 builder.token(SolidityLanguage::kind_to_raw(kind), &text[s as usize..e as usize]);
                 raw += 1;

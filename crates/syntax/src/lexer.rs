@@ -264,7 +264,6 @@ fn is_ident_continue(c: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::SyntaxKind::*;
 
     /// Render tokens as (kind, text) pairs for readable assertions.
     fn lex(src: &str) -> Vec<(crate::SyntaxKind, &str)> {
