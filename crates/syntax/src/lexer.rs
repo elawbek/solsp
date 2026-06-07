@@ -397,4 +397,53 @@ mod tests {
         assert_eq!(lex("/* open"), vec![(COMMENT, "/* open")]);
         assert_lossless("/* open");
     }
+
+    const CORPUS: &[&str] = &[
+        "",
+        "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n",
+        r#"
+import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+contract Vault is Ownable {
+    mapping(address => uint256) public balances;
+    uint256 constant FEE = 1_000;
+
+    /// deposit ether
+    function deposit() external payable {
+        balances[msg.sender] += msg.value; // track
+        require(balances[msg.sender] <= 2**128, "overflow");
+    }
+}
+"#,
+        "function f(uint a, uint b) pure returns (uint) { return a ** b; }",
+        "contract C { string s = unicode\"héllo 🌍\"; bytes h = hex\"00ff\"; }",
+        "function id(uint x) pure returns (uint r) { assembly { r := x } }",
+        "this is \u{00A7} not valid !! @# but must still round-trip",
+    ];
+
+    #[test]
+    fn corpus_is_lossless_and_reconstructs() {
+        for &src in CORPUS {
+            // 1. Lengths tile the input.
+            assert_lossless(src);
+            // 2. Concatenating token texts reproduces the source byte-for-byte.
+            let mut rebuilt = String::new();
+            let mut pos = 0usize;
+            for t in tokenize(src) {
+                let end = pos + t.len as usize;
+                rebuilt.push_str(&src[pos..end]);
+                pos = end;
+            }
+            assert_eq!(rebuilt, src, "reconstruction mismatch for {src:?}");
+        }
+    }
+
+    #[test]
+    fn corpus_has_no_zero_length_tokens() {
+        for &src in CORPUS {
+            for t in tokenize(src) {
+                assert!(t.len > 0, "zero-length token {:?} in {src:?}", t.kind);
+            }
+        }
+    }
 }
