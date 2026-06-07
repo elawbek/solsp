@@ -8,10 +8,13 @@
 //! point is [`parse`], a total function that never panics and never fails — errors
 //! are reported in [`Parse::errors`] and the tree always spans the whole input.
 
+mod event;
+mod input;
 mod syntax_kind;
 
 pub mod ast;
 pub mod lexer;
+mod grammar;
 pub mod parser;
 
 pub use syntax_kind::SyntaxKind;
