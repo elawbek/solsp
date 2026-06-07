@@ -75,8 +75,10 @@ impl<'a> Cursor<'a> {
             WHITESPACE
         } else if is_ident_start(c) {
             self.ident_or_keyword()
+        } else if c.is_ascii_digit() {
+            self.number()
         } else {
-            // Later tasks insert comment/number/string arms ABOVE this line.
+            // Later tasks insert comment/string arms ABOVE this line.
             self.punctuation()
         };
         Token {
@@ -92,6 +94,33 @@ impl<'a> Cursor<'a> {
         self.eat_while(is_ident_continue);
         let text = &self.src[start..self.pos];
         SyntaxKind::from_keyword(text).unwrap_or(IDENT)
+    }
+
+    /// Scan a numeric literal: decimal/hex integer, optional fraction, optional
+    /// exponent; `_` digit separators allowed. One `NUMBER` kind covers all forms.
+    fn number(&mut self) -> SyntaxKind {
+        // Hex: 0x / 0X
+        if self.first() == Some('0') && matches!(self.second(), Some('x') | Some('X')) {
+            self.bump(); // 0
+            self.bump(); // x
+            self.eat_while(|c| c.is_ascii_hexdigit() || c == '_');
+            return NUMBER;
+        }
+        self.eat_while(|c| c.is_ascii_digit() || c == '_');
+        // Fraction — only if a digit follows the dot (else the dot is the operator).
+        if self.first() == Some('.') && self.second().is_some_and(|c| c.is_ascii_digit()) {
+            self.bump(); // .
+            self.eat_while(|c| c.is_ascii_digit() || c == '_');
+        }
+        // Exponent.
+        if matches!(self.first(), Some('e') | Some('E')) {
+            self.bump();
+            if matches!(self.first(), Some('+') | Some('-')) {
+                self.bump();
+            }
+            self.eat_while(|c| c.is_ascii_digit() || c == '_');
+        }
+        NUMBER
     }
 
     /// Longest-match punctuation/operator scan. The table is ordered longest-first
@@ -258,5 +287,18 @@ mod tests {
         assert_eq!(lex("contract Foo"), vec![
             (CONTRACT_KW, "contract"), (WHITESPACE, " "), (IDENT, "Foo"),
         ]);
+    }
+
+    #[test]
+    fn numbers() {
+        assert_eq!(lex("0"), vec![(NUMBER, "0")]);
+        assert_eq!(lex("123"), vec![(NUMBER, "123")]);
+        assert_eq!(lex("1_000_000"), vec![(NUMBER, "1_000_000")]);
+        assert_eq!(lex("0xDEAD_beef"), vec![(NUMBER, "0xDEAD_beef")]);
+        assert_eq!(lex("1.5"), vec![(NUMBER, "1.5")]);
+        assert_eq!(lex("2e10"), vec![(NUMBER, "2e10")]);
+        assert_eq!(lex("1.2e-3"), vec![(NUMBER, "1.2e-3")]);
+        // A trailing dot with no digit is the DOT operator, not part of the number:
+        assert_eq!(lex("1.foo"), vec![(NUMBER, "1"), (DOT, "."), (IDENT, "foo")]);
     }
 }
