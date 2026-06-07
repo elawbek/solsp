@@ -73,14 +73,25 @@ impl<'a> Cursor<'a> {
         let kind = if is_whitespace(c) {
             self.eat_while(is_whitespace);
             WHITESPACE
+        } else if is_ident_start(c) {
+            self.ident_or_keyword()
         } else {
-            // Later tasks insert comment/ident/number/string arms ABOVE this line.
+            // Later tasks insert comment/number/string arms ABOVE this line.
             self.punctuation()
         };
         Token {
             kind,
             len: (self.pos - start) as u32,
         }
+    }
+
+    /// Scan an identifier, then classify: keyword table wins, else `IDENT`.
+    fn ident_or_keyword(&mut self) -> SyntaxKind {
+        let start = self.pos;
+        self.bump(); // is_ident_start char
+        self.eat_while(is_ident_continue);
+        let text = &self.src[start..self.pos];
+        SyntaxKind::from_keyword(text).unwrap_or(IDENT)
     }
 
     /// Longest-match punctuation/operator scan. The table is ordered longest-first
@@ -156,6 +167,14 @@ fn is_whitespace(c: char) -> bool {
     c.is_whitespace()
 }
 
+fn is_ident_start(c: char) -> bool {
+    c == '_' || c == '$' || c.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(c: char) -> bool {
+    c == '_' || c == '$' || c.is_ascii_alphanumeric()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,7 +245,18 @@ mod tests {
 
     #[test]
     fn operator_then_paren() {
-        assert_eq!(lex("a"), vec![(ERROR, "a")]); // ident not handled until Task 4
+        assert_eq!(lex("a"), vec![(IDENT, "a")]);
         assert_eq!(lex(">=("), vec![(GT_EQ, ">="), (L_PAREN, "(")]);
+    }
+
+    #[test]
+    fn idents_and_keywords() {
+        assert_eq!(lex("contract"), vec![(CONTRACT_KW, "contract")]);
+        assert_eq!(lex("Foo_$bar1"), vec![(IDENT, "Foo_$bar1")]);
+        assert_eq!(lex("uint256"), vec![(IDENT, "uint256")]); // elementary type = IDENT
+        assert_eq!(lex("contractFoo"), vec![(IDENT, "contractFoo")]); // not a keyword
+        assert_eq!(lex("contract Foo"), vec![
+            (CONTRACT_KW, "contract"), (WHITESPACE, " "), (IDENT, "Foo"),
+        ]);
     }
 }
