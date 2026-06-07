@@ -6,7 +6,6 @@ use crate::{SolidityLanguage, SyntaxError, SyntaxKind};
 use rowan::{GreenNode, GreenNodeBuilder, Language, TextRange, TextSize};
 
 #[derive(Debug)]
-#[allow(dead_code)] // consumers (Parser, build_tree) land in later tasks of this plan
 pub(crate) enum Event {
     /// Open a node. `forward_parent` (if set) is the *relative* index of a later
     /// `Start` that should become this node's parent — the mechanism behind
@@ -33,7 +32,6 @@ pub(crate) enum Event {
 /// right before the next real token (so it lands in whatever node is open), and
 /// trailing trivia is flushed into the root before it closes. This is lossless;
 /// rust-analyzer's finer `n_attached_trivias` rules are a future refinement.
-#[allow(dead_code)] // consumer is parse() in Task 4
 pub(crate) fn build_tree(
     text: &str,
     tokens: &[crate::lexer::Token],

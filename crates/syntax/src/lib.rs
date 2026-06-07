@@ -19,7 +19,7 @@ pub mod parser;
 
 pub use syntax_kind::SyntaxKind;
 
-use rowan::{GreenNode, GreenNodeBuilder, TextRange};
+use rowan::{GreenNode, TextRange};
 
 /// The rowan language marker for Solidity. Ties our [`SyntaxKind`] to rowan trees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,42 +63,78 @@ impl Parse {
     }
 }
 
-/// Parse Solidity source into a lossless syntax tree.
-///
-/// Total function: never panics, never fails. The returned tree always covers the
-/// full input byte-for-byte (trivia included); problems are surfaced via
-/// [`Parse::errors`].
+/// Parse Solidity source into a lossless syntax tree. Total: never panics, never
+/// fails; problems are surfaced via [`Parse::errors`] and the tree spans the whole
+/// input byte-for-byte.
 pub fn parse(text: &str) -> Parse {
-    // TODO(M1 §3): wire the real pipeline:
-    //   let tokens = lexer::tokenize(text);
-    //   let events = parser::parse_events(&tokens);
-    //   let (green, errors) = build_tree(text, &tokens, events);
-    //
-    // Placeholder so ide/server can be wired end-to-end now: wrap the whole input
-    // as a single ERROR token under SOURCE_FILE. Lossless, total, compiles.
-    use rowan::Language;
-    let mut builder = GreenNodeBuilder::new();
-    builder.start_node(SolidityLanguage::kind_to_raw(SyntaxKind::SOURCE_FILE));
-    if !text.is_empty() {
-        builder.token(SolidityLanguage::kind_to_raw(SyntaxKind::ERROR), text);
-    }
-    builder.finish_node();
-    Parse {
-        green: builder.finish(),
-        errors: Vec::new(),
-    }
+    let tokens = lexer::tokenize(text);
+    let input = input::Input::new(&tokens);
+    let mut p = parser::Parser::new(&input);
+    grammar::source_file(&mut p);
+    let events = p.finish();
+    let (green, errors) = event::build_tree(text, &tokens, events);
+    Parse { green, errors }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Deterministic tree dump for assertions: `KIND@start..end` per line, tokens
+    /// show their text. Independent of rowan's own Debug formatting.
+    fn debug_tree(text: &str) -> String {
+        use std::fmt::Write;
+        let node = parse(text).syntax();
+        let mut out = String::new();
+        fn go(out: &mut String, el: SyntaxElement, indent: usize) {
+            for _ in 0..indent {
+                out.push_str("  ");
+            }
+            match el {
+                rowan::NodeOrToken::Node(n) => {
+                    let r = n.text_range();
+                    let _ = writeln!(out, "{:?}@{}..{}", n.kind(), u32::from(r.start()), u32::from(r.end()));
+                    for c in n.children_with_tokens() {
+                        go(out, c, indent + 1);
+                    }
+                }
+                rowan::NodeOrToken::Token(t) => {
+                    let r = t.text_range();
+                    let _ = writeln!(out, "{:?}@{}..{} {:?}", t.kind(), u32::from(r.start()), u32::from(r.end()), t.text());
+                }
+            }
+        }
+        go(&mut out, rowan::NodeOrToken::Node(node), 0);
+        out
+    }
+
     #[test]
     fn parse_is_total_and_lossless() {
         for src in ["", "contract C {}", "this is not solidity !!!"] {
-            let parse = parse(src);
-            // Tree always spans the full input (lossless invariant).
-            assert_eq!(parse.syntax().text().to_string(), src);
+            assert_eq!(parse(src).syntax().text().to_string(), src);
         }
+    }
+
+    #[test]
+    fn parses_pragma_and_contract() {
+        let src = "pragma solidity ^0.8.20;\ncontract C {}";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        // Sanity on structure (not a brittle full snapshot): both items present.
+        assert!(dump.contains("PRAGMA_DIRECTIVE@"));
+        assert!(dump.contains("CONTRACT_DEF@"));
+        assert!(dump.contains("NAME@"));
+    }
+
+    #[test]
+    fn recovers_on_garbage_then_continues() {
+        // Leading junk becomes ERROR nodes; the contract after it still parses.
+        let src = "@@@ contract C {}";
+        let p = parse(src);
+        let dump = debug_tree(src);
+        assert!(dump.contains("ERROR@"));
+        assert!(dump.contains("CONTRACT_DEF@"));
+        assert_eq!(p.syntax().text().to_string(), src); // still lossless
     }
 }

@@ -11,7 +11,6 @@ pub(crate) struct Parser<'t> {
     events: Vec<Event>,
 }
 
-#[allow(dead_code)] // the grammar (its consumer) lands in a later task of this plan
 impl<'t> Parser<'t> {
     pub(crate) fn new(input: &'t Input) -> Parser<'t> {
         Parser { input, pos: 0, events: Vec::new() }
@@ -101,7 +100,6 @@ pub(crate) struct Marker {
     pos: u32,
 }
 
-#[allow(dead_code)] // the grammar (its consumer) lands in a later task of this plan
 impl Marker {
     /// Turn the placeholder into `Start { kind }` and push the matching `Finish`.
     pub(crate) fn complete(self, p: &mut Parser, kind: SyntaxKind) -> CompletedMarker {
@@ -117,6 +115,7 @@ impl Marker {
     }
 
     /// Drop the node. If the placeholder is the last event, pop it.
+    #[allow(dead_code)] // recovery counterpart to `complete`; first consumer is a later grammar plan
     pub(crate) fn abandon(self, p: &mut Parser) {
         let idx = self.pos as usize;
         if idx == p.events.len() - 1 {

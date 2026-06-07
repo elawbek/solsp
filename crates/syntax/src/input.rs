@@ -5,12 +5,10 @@
 use crate::lexer::Token;
 use crate::SyntaxKind;
 
-#[allow(dead_code)] // consumed by Parser, which lands in a later task of this plan
 pub(crate) struct Input {
     kinds: Vec<SyntaxKind>,
 }
 
-#[allow(dead_code)] // consumed by Parser, which lands in a later task of this plan
 impl Input {
     pub(crate) fn new(tokens: &[Token]) -> Input {
         let kinds = tokens
@@ -26,6 +24,7 @@ impl Input {
         self.kinds.get(i).copied().unwrap_or(SyntaxKind::EOF)
     }
 
+    #[allow(dead_code)] // part of the Input API (tested); first parser consumer is a later plan
     pub(crate) fn len(&self) -> usize {
         self.kinds.len()
     }
