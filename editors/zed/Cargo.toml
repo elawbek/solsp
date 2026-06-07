@@ -1,0 +1,13 @@
+# Zed extension — built to wasm, NOT part of the main workspace (see root Cargo.toml
+# `exclude`). Pin `zed_extension_api` to the version matching your installed Zed.
+[package]
+name = "solsp-zed"
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+zed_extension_api = "0.1.0"

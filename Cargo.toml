@@ -1,0 +1,15 @@
+# solsp — LSP server for Solidity (rust-analyzer style).
+# Layering (see docs/.../design.md §2):
+#   solsp-syntax  -> lexer/parser/CST/AST (pure: no LSP, no salsa)
+#   solsp-ide     -> features over syntax, returns "bare" data
+#   solsp-server  -> LSP protocol over stdio (the binary)
+# editors/zed builds for wasm separately and is excluded from the workspace.
+[workspace]
+resolver = "2"
+members = ["crates/syntax", "crates/ide", "crates/server"]
+exclude = ["editors/zed"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"

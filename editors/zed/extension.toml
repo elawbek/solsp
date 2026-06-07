@@ -1,0 +1,12 @@
+id = "solsp"
+name = "Solidity (solsp)"
+version = "0.0.1"
+schema_version = 1
+authors = ["Dmitrii <kdmitrii86@gmail.com>"]
+description = "Solidity language support backed by the solsp language server"
+
+[language_servers.solsp]
+name = "solsp"
+# Languages this server attaches to. The language is declared in
+# languages/solidity/config.toml below.
+languages = ["Solidity"]

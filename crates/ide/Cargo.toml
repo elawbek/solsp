@@ -1,0 +1,9 @@
+[package]
+name = "solsp-ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+solsp-syntax = { path = "../syntax" }
+rowan = "0.15"
