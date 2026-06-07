@@ -74,15 +74,81 @@ impl<'a> Cursor<'a> {
             self.eat_while(is_whitespace);
             WHITESPACE
         } else {
-            // Later tasks add arms BEFORE this fallback (comments, idents, numbers,
-            // strings, punctuation). For now, any non-whitespace byte is an error.
-            self.bump();
-            ERROR
+            // Later tasks insert comment/ident/number/string arms ABOVE this line.
+            self.punctuation()
         };
         Token {
             kind,
             len: (self.pos - start) as u32,
         }
+    }
+
+    /// Longest-match punctuation/operator scan. The table is ordered longest-first
+    /// so `<<=` wins over `<<` over `<`. Unknown bytes become a 1-char ERROR token.
+    fn punctuation(&mut self) -> SyntaxKind {
+        const OPS: &[(&str, SyntaxKind)] = &[
+            // 3-char
+            ("<<=", SHL_EQ),
+            (">>=", SHR_EQ),
+            // 2-char
+            ("**", STAR2),
+            ("==", EQ2),
+            ("!=", NEQ),
+            ("<=", LT_EQ),
+            (">=", GT_EQ),
+            ("&&", AMP2),
+            ("||", PIPE2),
+            ("<<", SHL),
+            (">>", SHR),
+            ("+=", PLUS_EQ),
+            ("-=", MINUS_EQ),
+            ("*=", STAR_EQ),
+            ("/=", SLASH_EQ),
+            ("%=", PERCENT_EQ),
+            ("&=", AMP_EQ),
+            ("|=", PIPE_EQ),
+            ("^=", CARET_EQ),
+            ("++", PLUS2),
+            ("--", MINUS2),
+            ("=>", FAT_ARROW),
+            ("->", THIN_ARROW),
+            (":=", COLON_EQ), // Yul / inline-assembly assignment
+            // 1-char
+            ("(", L_PAREN),
+            (")", R_PAREN),
+            ("[", L_BRACK),
+            ("]", R_BRACK),
+            ("{", L_BRACE),
+            ("}", R_BRACE),
+            (";", SEMICOLON),
+            (",", COMMA),
+            (".", DOT),
+            ("?", QUESTION),
+            (":", COLON),
+            ("=", EQ),
+            ("<", LT),
+            (">", GT),
+            ("+", PLUS),
+            ("-", MINUS),
+            ("*", STAR),
+            ("/", SLASH),
+            ("%", PERCENT),
+            ("!", BANG),
+            ("~", TILDE),
+            ("&", AMP),
+            ("|", PIPE),
+            ("^", CARET),
+        ];
+        let rest = self.rest();
+        for (op, kind) in OPS {
+            if rest.starts_with(op) {
+                self.pos += op.len();
+                return *kind;
+            }
+        }
+        // Unknown byte: consume one char so we always make progress.
+        self.bump();
+        ERROR
     }
 }
 
@@ -133,5 +199,34 @@ mod tests {
         for s in ["", "   ", "\u{00A7}\u{00A7}", " \u{00A7} "] {
             assert_lossless(s);
         }
+    }
+
+    #[test]
+    fn single_char_punct() {
+        assert_eq!(lex("()[]{};,.?:"), vec![
+            (L_PAREN, "("), (R_PAREN, ")"), (L_BRACK, "["), (R_BRACK, "]"),
+            (L_BRACE, "{"), (R_BRACE, "}"), (SEMICOLON, ";"), (COMMA, ","),
+            (DOT, "."), (QUESTION, "?"), (COLON, ":"),
+        ]);
+    }
+
+    #[test]
+    fn longest_match_operators() {
+        assert_eq!(lex("<<="), vec![(SHL_EQ, "<<=")]);
+        assert_eq!(lex("<<"), vec![(SHL, "<<")]);
+        assert_eq!(lex("<"), vec![(LT, "<")]);
+        assert_eq!(lex("=="), vec![(EQ2, "==")]);
+        assert_eq!(lex("="), vec![(EQ, "=")]);
+        assert_eq!(lex("**"), vec![(STAR2, "**")]);
+        assert_eq!(lex("=>"), vec![(FAT_ARROW, "=>")]);
+        assert_eq!(lex("->"), vec![(THIN_ARROW, "->")]);
+        assert_eq!(lex(":="), vec![(COLON_EQ, ":=")]); // Yul assign, longest-match over ':'
+        assert_eq!(lex(":"), vec![(COLON, ":")]);
+    }
+
+    #[test]
+    fn operator_then_paren() {
+        assert_eq!(lex("a"), vec![(ERROR, "a")]); // ident not handled until Task 4
+        assert_eq!(lex(">=("), vec![(GT_EQ, ">="), (L_PAREN, "(")]);
     }
 }
