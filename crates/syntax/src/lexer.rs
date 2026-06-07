@@ -77,11 +77,16 @@ impl<'a> Cursor<'a> {
             self.ident_or_keyword()
         } else if c.is_ascii_digit() {
             self.number()
+        } else if c == '/' && self.second() == Some('/') {
+            self.line_comment();
+            COMMENT
+        } else if c == '/' && self.second() == Some('*') {
+            self.block_comment();
+            COMMENT
         } else if c == '"' || c == '\'' {
             self.string_body(c);
             STRING
         } else {
-            // Later tasks insert comment arms ABOVE this line.
             self.punctuation()
         };
         Token {
@@ -125,6 +130,25 @@ impl<'a> Cursor<'a> {
                 _ => {
                     self.bump();
                 }
+            }
+        }
+    }
+
+    /// `// ...` to end of line (newline not included).
+    fn line_comment(&mut self) {
+        self.bump(); // /
+        self.bump(); // /
+        self.eat_while(|c| c != '\n');
+    }
+
+    /// `/* ... */`; runs to the closing `*/` or EOF (lossless).
+    fn block_comment(&mut self) {
+        self.bump(); // /
+        self.bump(); // *
+        while let Some(c) = self.bump() {
+            if c == '*' && self.first() == Some('/') {
+                self.bump(); // /
+                break;
             }
         }
     }
@@ -351,5 +375,26 @@ mod tests {
         // Runs to EOF; still a single STRING token covering everything.
         assert_eq!(lex("\"oops"), vec![(STRING, "\"oops")]);
         assert_lossless("\"oops");
+    }
+
+    #[test]
+    fn comments() {
+        assert_eq!(lex("// hi"), vec![(COMMENT, "// hi")]);
+        assert_eq!(lex("/* a b */"), vec![(COMMENT, "/* a b */")]);
+        assert_eq!(lex("a // tail\nb"), vec![
+            (IDENT, "a"), (WHITESPACE, " "), (COMMENT, "// tail"),
+            (WHITESPACE, "\n"), (IDENT, "b"),
+        ]);
+        // `/` alone is still the SLASH operator.
+        assert_eq!(lex("a / b"), vec![
+            (IDENT, "a"), (WHITESPACE, " "), (SLASH, "/"),
+            (WHITESPACE, " "), (IDENT, "b"),
+        ]);
+    }
+
+    #[test]
+    fn unterminated_block_comment_is_lossless() {
+        assert_eq!(lex("/* open"), vec![(COMMENT, "/* open")]);
+        assert_lossless("/* open");
     }
 }
