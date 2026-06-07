@@ -77,8 +77,11 @@ impl<'a> Cursor<'a> {
             self.ident_or_keyword()
         } else if c.is_ascii_digit() {
             self.number()
+        } else if c == '"' || c == '\'' {
+            self.string_body(c);
+            STRING
         } else {
-            // Later tasks insert comment/string arms ABOVE this line.
+            // Later tasks insert comment arms ABOVE this line.
             self.punctuation()
         };
         Token {
@@ -93,7 +96,37 @@ impl<'a> Cursor<'a> {
         self.bump(); // is_ident_start char
         self.eat_while(is_ident_continue);
         let text = &self.src[start..self.pos];
+        // `hex"..."` / `unicode"..."` are single string literals, not ident+string.
+        if (text == "hex" || text == "unicode")
+            && matches!(self.first(), Some('"') | Some('\''))
+        {
+            let quote = self.first().unwrap();
+            self.string_body(quote);
+            return STRING;
+        }
         SyntaxKind::from_keyword(text).unwrap_or(IDENT)
+    }
+
+    /// Consume a quoted body starting at the opening quote. Handles `\` escapes;
+    /// stops at the matching quote, a bare newline (recovery), or EOF (lossless).
+    fn string_body(&mut self, quote: char) {
+        self.bump(); // opening quote
+        while let Some(c) = self.first() {
+            match c {
+                '\\' => {
+                    self.bump(); // backslash
+                    self.bump(); // escaped char (if any)
+                }
+                '\n' => break, // unterminated line; let the parser flag it
+                c if c == quote => {
+                    self.bump(); // closing quote
+                    break;
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
     }
 
     /// Scan a numeric literal: decimal/hex integer, optional fraction, optional
@@ -300,5 +333,23 @@ mod tests {
         assert_eq!(lex("1.2e-3"), vec![(NUMBER, "1.2e-3")]);
         // A trailing dot with no digit is the DOT operator, not part of the number:
         assert_eq!(lex("1.foo"), vec![(NUMBER, "1"), (DOT, "."), (IDENT, "foo")]);
+    }
+
+    #[test]
+    fn strings() {
+        assert_eq!(lex(r#""hello""#), vec![(STRING, r#""hello""#)]);
+        assert_eq!(lex("'world'"), vec![(STRING, "'world'")]);
+        assert_eq!(lex(r#""a\"b""#), vec![(STRING, r#""a\"b""#)]); // escaped quote
+        assert_eq!(lex(r#"hex"00ff""#), vec![(STRING, r#"hex"00ff""#)]);
+        assert_eq!(lex(r#"unicode"héllo""#), vec![(STRING, r#"unicode"héllo""#)]);
+        // `hexx` is a plain identifier, not a hex-string prefix:
+        assert_eq!(lex(r#"hexx"#), vec![(IDENT, "hexx")]);
+    }
+
+    #[test]
+    fn unterminated_string_is_lossless() {
+        // Runs to EOF; still a single STRING token covering everything.
+        assert_eq!(lex("\"oops"), vec![(STRING, "\"oops")]);
+        assert_lossless("\"oops");
     }
 }
