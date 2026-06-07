@@ -67,6 +67,7 @@ pub enum SyntaxKind {
     MINUS2,     // --
     FAT_ARROW,  // =>
     THIN_ARROW, // ->
+    COLON_EQ,   // := (Yul / inline assembly assignment)
 
     // -- keywords --
     PRAGMA_KW,
@@ -119,6 +120,11 @@ pub enum SyntaxKind {
     NEW_KW,
     DELETE_KW,
     ASSEMBLY_KW,
+    LET_KW,     // Yul
+    LEAVE_KW,   // Yul
+    SWITCH_KW,  // Yul
+    CASE_KW,    // Yul
+    DEFAULT_KW, // Yul
     UNCHECKED_KW,
     TYPE_KW,
     TRUE_KW,
@@ -217,6 +223,11 @@ impl SyntaxKind {
             "new" => NEW_KW,
             "delete" => DELETE_KW,
             "assembly" => ASSEMBLY_KW,
+            "let" => LET_KW,
+            "leave" => LEAVE_KW,
+            "switch" => SWITCH_KW,
+            "case" => CASE_KW,
+            "default" => DEFAULT_KW,
             "unchecked" => UNCHECKED_KW,
             "type" => TYPE_KW,
             "true" => TRUE_KW,
@@ -245,6 +256,7 @@ mod tests {
         assert_eq!(SyntaxKind::from_keyword("contract"), Some(CONTRACT_KW));
         assert_eq!(SyntaxKind::from_keyword("mapping"), Some(MAPPING_KW));
         assert_eq!(SyntaxKind::from_keyword("returns"), Some(RETURNS_KW));
+        assert_eq!(SyntaxKind::from_keyword("let"), Some(LET_KW)); // Yul/assembly
         assert_eq!(SyntaxKind::from_keyword("Foo"), None);
         assert_eq!(SyntaxKind::from_keyword("uint256"), None); // elementary types stay IDENT
     }
