@@ -203,6 +203,22 @@ mod tests {
     }
 
     #[test]
+    fn parses_structs_and_enums() {
+        let src = "contract C {\n  \
+            struct Point { uint256 x; uint256 y; }\n  \
+            enum State { Idle, Running, Done }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("STRUCT_DEF@"));
+        assert!(dump.contains("STRUCT_FIELD@"));
+        assert!(dump.contains("ENUM_DEF@"));
+        assert!(dump.contains("ENUM_VARIANT@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
     fn recovers_on_garbage_then_continues() {
         // Leading junk becomes ERROR nodes; the contract after it still parses.
         let src = "@@@ contract C {}";

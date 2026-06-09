@@ -72,6 +72,8 @@ fn member(p: &mut Parser) {
         FUNCTION_KW | FALLBACK_KW | RECEIVE_KW => function_def(p),
         MODIFIER_KW => modifier_def(p),
         CONSTRUCTOR_KW => constructor_def(p),
+        STRUCT_KW => struct_def(p),
+        ENUM_KW => enum_def(p),
         IDENT | MAPPING_KW => state_var_def(p),
         _ => p.err_and_bump("expected a contract member"),
     }
@@ -228,6 +230,68 @@ fn constructor_def(p: &mut Parser) {
         p.expect(SEMICOLON);
     }
     m.complete(p, CONSTRUCTOR_DEF);
+}
+
+// ---- structs & enums ---------------------------------------------------------
+
+/// `'struct' NAME? '{' struct_field* '}'`
+fn struct_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(STRUCT_KW);
+    if p.at(IDENT) {
+        name(p);
+    }
+    if p.eat(L_BRACE) {
+        while !p.at(R_BRACE) && !p.at(EOF) {
+            if at_type_start(p) {
+                struct_field(p);
+            } else {
+                p.err_and_bump("expected a struct field");
+            }
+        }
+        p.expect(R_BRACE);
+    } else {
+        p.error("expected '{'");
+    }
+    m.complete(p, STRUCT_DEF);
+}
+
+/// `type_name NAME? ';'`
+fn struct_field(p: &mut Parser) {
+    let m = p.start();
+    type_name(p);
+    if p.at(IDENT) {
+        name(p);
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, STRUCT_FIELD);
+}
+
+/// `'enum' NAME? '{' (enum_variant (',' enum_variant)*)? ','? '}'`
+fn enum_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(ENUM_KW);
+    if p.at(IDENT) {
+        name(p);
+    }
+    if p.eat(L_BRACE) {
+        while !p.at(R_BRACE) && !p.at(EOF) {
+            if p.at(IDENT) {
+                let v = p.start();
+                name(p);
+                v.complete(p, ENUM_VARIANT);
+                if !p.eat(COMMA) {
+                    break;
+                }
+            } else {
+                p.err_and_bump("expected an enum variant");
+            }
+        }
+        p.expect(R_BRACE);
+    } else {
+        p.error("expected '{'");
+    }
+    m.complete(p, ENUM_DEF);
 }
 
 // ---- types -------------------------------------------------------------------
