@@ -74,6 +74,9 @@ fn member(p: &mut Parser) {
         CONSTRUCTOR_KW => constructor_def(p),
         STRUCT_KW => struct_def(p),
         ENUM_KW => enum_def(p),
+        EVENT_KW => event_def(p),
+        ERROR_KW => error_def(p),
+        TYPE_KW => user_defined_value_type(p),
         IDENT | MAPPING_KW => state_var_def(p),
         _ => p.err_and_bump("expected a contract member"),
     }
@@ -292,6 +295,52 @@ fn enum_def(p: &mut Parser) {
         p.error("expected '{'");
     }
     m.complete(p, ENUM_DEF);
+}
+
+// ---- events, errors & user-defined value types -------------------------------
+
+/// `'event' NAME? param_list? IDENT? /*anonymous*/ ';'`
+fn event_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(EVENT_KW);
+    if p.at(IDENT) {
+        name(p);
+    }
+    if p.at(L_PAREN) {
+        param_list(p);
+    }
+    if p.at(IDENT) {
+        p.bump_any(); // soft `anonymous`
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, EVENT_DEF);
+}
+
+/// `'error' NAME? param_list? ';'`
+fn error_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(ERROR_KW);
+    if p.at(IDENT) {
+        name(p);
+    }
+    if p.at(L_PAREN) {
+        param_list(p);
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, ERROR_DEF);
+}
+
+/// `'type' NAME? 'is' type_name ';'`
+fn user_defined_value_type(p: &mut Parser) {
+    let m = p.start();
+    p.bump(TYPE_KW);
+    if p.at(IDENT) {
+        name(p);
+    }
+    p.expect(IS_KW);
+    type_name(p);
+    p.expect(SEMICOLON);
+    m.complete(p, USER_DEFINED_VALUE_TYPE);
 }
 
 // ---- types -------------------------------------------------------------------

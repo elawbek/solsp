@@ -219,6 +219,23 @@ mod tests {
     }
 
     #[test]
+    fn parses_events_errors_udvt() {
+        let src = "contract C {\n  \
+            event Transfer(address indexed from, address indexed to, uint256 value);\n  \
+            event Flag() anonymous;\n  \
+            error Unauthorized(address caller);\n  \
+            type Price is uint128;\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("EVENT_DEF@"));
+        assert!(dump.contains("ERROR_DEF@"));
+        assert!(dump.contains("USER_DEFINED_VALUE_TYPE@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
     fn recovers_on_garbage_then_continues() {
         // Leading junk becomes ERROR nodes; the contract after it still parses.
         let src = "@@@ contract C {}";
