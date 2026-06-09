@@ -130,19 +130,34 @@ pub enum SyntaxKind {
     TRUE_KW,
     FALSE_KW,
 
-    // -- nodes (grow in Plan 2) --
+    // -- nodes --
     SOURCE_FILE,
     PRAGMA_DIRECTIVE,
     IMPORT_DIRECTIVE,
+    USING_DIRECTIVE,
     CONTRACT_DEF,
+    INHERITANCE_SPECIFIER,
+    CONTRACT_BODY,
     FUNCTION_DEF,
+    MODIFIER_DEF,
+    CONSTRUCTOR_DEF,
     STATE_VAR_DEF,
     STRUCT_DEF,
+    STRUCT_FIELD,
     ENUM_DEF,
+    ENUM_VARIANT,
     EVENT_DEF,
     ERROR_DEF,
+    USER_DEFINED_VALUE_TYPE,
     NAME,
+    NAME_REF,
     PARAM_LIST,
+    PARAM,
+    PATH_TYPE,
+    MAPPING_TYPE,
+    ARRAY_TYPE,
+    FUNCTION_TYPE,
+    MODIFIER_INVOCATION,
     BLOCK,
 
     // Keep last: marks the valid discriminant range for `from_u16`.
@@ -248,6 +263,19 @@ mod tests {
         // Every discriminant 0..=__LAST must survive a round-trip.
         for d in 0..=SyntaxKind::__LAST as u16 {
             assert_eq!(SyntaxKind::from_u16(d).to_u16(), d);
+        }
+    }
+
+    #[test]
+    fn new_decl_node_kinds_exist_and_roundtrip() {
+        // Spot-check a few of the Plan-3 node kinds compile and round-trip.
+        for k in [
+            CONTRACT_BODY, PARAM, NAME_REF, PATH_TYPE, MAPPING_TYPE, ARRAY_TYPE,
+            FUNCTION_TYPE, MODIFIER_DEF, CONSTRUCTOR_DEF, STRUCT_FIELD, ENUM_VARIANT,
+            USING_DIRECTIVE, USER_DEFINED_VALUE_TYPE, INHERITANCE_SPECIFIER,
+            MODIFIER_INVOCATION,
+        ] {
+            assert_eq!(SyntaxKind::from_u16(k.to_u16()), k);
         }
     }
 
