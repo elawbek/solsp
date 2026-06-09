@@ -69,6 +69,7 @@ fn contract_body(p: &mut Parser) {
 /// `err_and_bump` does), so the `contract_body` loop always makes progress.
 fn member(p: &mut Parser) {
     match p.current() {
+        FUNCTION_KW | FALLBACK_KW | RECEIVE_KW => function_def(p),
         IDENT | MAPPING_KW => state_var_def(p),
         _ => p.err_and_bump("expected a contract member"),
     }
@@ -105,6 +106,83 @@ fn override_spec(p: &mut Parser) {
     if p.at(L_PAREN) {
         skip_parens(p);
     }
+}
+
+// ---- functions ---------------------------------------------------------------
+
+/// `('function' NAME? | 'fallback' | 'receive') param_list function_attribute*
+///  ('returns' param_list)? (block | ';')`
+fn function_def(p: &mut Parser) {
+    let m = p.start();
+    let named = p.at(FUNCTION_KW);
+    p.bump_any(); // function / fallback / receive
+    if named && p.at(IDENT) {
+        name(p);
+    }
+    if p.at(L_PAREN) {
+        param_list(p);
+    } else {
+        p.error("expected '(' after function");
+    }
+    function_attributes(p);
+    if p.eat(RETURNS_KW) {
+        if p.at(L_PAREN) {
+            param_list(p);
+        } else {
+            p.error("expected '(' after returns");
+        }
+    }
+    if p.at(L_BRACE) {
+        block(p);
+    } else {
+        p.expect(SEMICOLON);
+    }
+    m.complete(p, FUNCTION_DEF);
+}
+
+/// Visibility / mutability / `virtual` / `override(...)` / modifier invocations,
+/// in any order, until the body or `returns`.
+fn function_attributes(p: &mut Parser) {
+    loop {
+        match p.current() {
+            PUBLIC_KW | PRIVATE_KW | INTERNAL_KW | EXTERNAL_KW | PURE_KW | VIEW_KW
+            | PAYABLE_KW | VIRTUAL_KW => p.bump_any(),
+            OVERRIDE_KW => override_spec(p),
+            IDENT => modifier_invocation(p),
+            _ => break,
+        }
+    }
+}
+
+/// `name_ref ('(' <args> ')')?` — a base-modifier/constructor call in a header.
+fn modifier_invocation(p: &mut Parser) {
+    let m = p.start();
+    name_ref(p);
+    if p.at(L_PAREN) {
+        skip_parens(p);
+    }
+    m.complete(p, MODIFIER_INVOCATION);
+}
+
+/// A `{ … }` body. Statements land in a later plan, so the interior is span-
+/// skipped to the matching brace; the node is still a real `BLOCK`.
+fn block(p: &mut Parser) {
+    let m = p.start();
+    p.bump(L_BRACE);
+    let mut depth = 1usize;
+    while depth > 0 && !p.at(EOF) {
+        match p.current() {
+            L_BRACE => depth += 1,
+            R_BRACE => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            break;
+        }
+        p.bump_any();
+    }
+    p.expect(R_BRACE);
+    m.complete(p, BLOCK);
 }
 
 // ---- types -------------------------------------------------------------------

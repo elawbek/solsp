@@ -168,6 +168,26 @@ mod tests {
     }
 
     #[test]
+    fn parses_functions() {
+        let src = "contract C {\n  \
+            function f(uint a, uint b) public pure returns (uint) {}\n  \
+            function g() external onlyOwner(msg.sender) {}\n  \
+            function h(uint x) external view returns (uint);\n  \
+            receive() external payable {}\n  \
+            fallback() external {}\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("FUNCTION_DEF@"));
+        assert!(dump.contains("PARAM_LIST@"));
+        assert!(dump.contains("PARAM@"));
+        assert!(dump.contains("BLOCK@"));
+        assert!(dump.contains("MODIFIER_INVOCATION@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
     fn recovers_on_garbage_then_continues() {
         // Leading junk becomes ERROR nodes; the contract after it still parses.
         let src = "@@@ contract C {}";
