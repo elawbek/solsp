@@ -73,7 +73,7 @@ pub enum SyntaxKind {
     PRAGMA_KW,
     IMPORT_KW,
     AS_KW,
-    FROM_KW,
+    FROM_KW, // contextual: `from` lexes as IDENT; reserved for import grammar (M2)
     USING_KW,
     CONTRACT_KW,
     INTERFACE_KW,
@@ -191,7 +191,6 @@ impl SyntaxKind {
             "pragma" => PRAGMA_KW,
             "import" => IMPORT_KW,
             "as" => AS_KW,
-            "from" => FROM_KW,
             "using" => USING_KW,
             "contract" => CONTRACT_KW,
             "interface" => INTERFACE_KW,
@@ -287,6 +286,7 @@ mod tests {
         assert_eq!(SyntaxKind::from_keyword("let"), Some(LET_KW)); // Yul/assembly
         assert_eq!(SyntaxKind::from_keyword("Foo"), None);
         assert_eq!(SyntaxKind::from_keyword("uint256"), None); // elementary types stay IDENT
+        assert_eq!(SyntaxKind::from_keyword("from"), None); // contextual, stays IDENT
     }
 
     #[test]
