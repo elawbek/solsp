@@ -109,9 +109,25 @@ fn override_spec(p: &mut Parser) {
 
 // ---- types -------------------------------------------------------------------
 
-/// A type: a path (`uint256`, `A.B`); array/mapping/function forms land in Task 3.
+/// A type: a path/mapping/function base, then zero or more `[ size? ]` suffixes.
+/// Array suffixes wrap left-associatively via `precede` (`uint[2][]` ⇒
+/// ARRAY_TYPE(ARRAY_TYPE(uint, 2))).
 fn type_name(p: &mut Parser) {
-    path_type(p);
+    let mut cm = match p.current() {
+        MAPPING_KW => mapping_type(p),
+        FUNCTION_KW => function_type(p),
+        _ => path_type(p),
+    };
+    while p.at(L_BRACK) {
+        let wrap = cm.precede(p);
+        p.bump(L_BRACK);
+        // array size is a constant expression — skipped until a later plan.
+        while !p.at(R_BRACK) && !p.at(EOF) {
+            p.bump_any();
+        }
+        p.expect(R_BRACK);
+        cm = wrap.complete(p, ARRAY_TYPE);
+    }
 }
 
 /// `name_ref ('.' name_ref)*` — covers elementary (`uint256`) and user (`A.B`)
@@ -125,6 +141,92 @@ fn path_type(p: &mut Parser) -> CompletedMarker {
         name_ref(p);
     }
     m.complete(p, PATH_TYPE)
+}
+
+/// `'mapping' '(' type_name NAME? '=>' type_name NAME? ')'` — the optional names
+/// are the 0.8.18+ named key/value syntax.
+fn mapping_type(p: &mut Parser) -> CompletedMarker {
+    let m = p.start();
+    p.bump(MAPPING_KW);
+    p.expect(L_PAREN);
+    type_name(p);
+    if p.at(IDENT) {
+        name(p); // optional key name
+    }
+    p.expect(FAT_ARROW);
+    type_name(p);
+    if p.at(IDENT) {
+        name(p); // optional value name
+    }
+    p.expect(R_PAREN);
+    m.complete(p, MAPPING_TYPE)
+}
+
+/// `'function' param_list (visibility|mutability)* ('returns' param_list)?`
+fn function_type(p: &mut Parser) -> CompletedMarker {
+    let m = p.start();
+    p.bump(FUNCTION_KW);
+    if p.at(L_PAREN) {
+        param_list(p);
+    } else {
+        p.error("expected '(' in function type");
+    }
+    while let INTERNAL_KW | EXTERNAL_KW | PUBLIC_KW | PRIVATE_KW | PURE_KW | VIEW_KW
+    | PAYABLE_KW = p.current()
+    {
+        p.bump_any();
+    }
+    if p.eat(RETURNS_KW) {
+        if p.at(L_PAREN) {
+            param_list(p);
+        } else {
+            p.error("expected '(' after returns");
+        }
+    }
+    m.complete(p, FUNCTION_TYPE)
+}
+
+/// `'(' (param (',' param)*)? ')'`
+fn param_list(p: &mut Parser) {
+    let m = p.start();
+    p.expect(L_PAREN);
+    while !p.at(R_PAREN) && !p.at(EOF) {
+        if !at_type_start(p) {
+            // not the start of a parameter — recover one token and retry.
+            p.err_and_bump("expected a parameter");
+            continue;
+        }
+        param(p);
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    p.expect(R_PAREN);
+    m.complete(p, PARAM_LIST);
+}
+
+/// `type_name (data_location | soft_modifier)* NAME?` — `soft_modifier` covers
+/// `indexed`/`anonymous`-style words that lex as IDENT (a real name, if present,
+/// is the final IDENT).
+fn param(p: &mut Parser) {
+    let m = p.start();
+    type_name(p);
+    loop {
+        match p.current() {
+            MEMORY_KW | STORAGE_KW | CALLDATA_KW => p.bump_any(),
+            IDENT if p.nth(1) == IDENT => p.bump_any(),
+            _ => break,
+        }
+    }
+    if p.at(IDENT) {
+        name(p);
+    }
+    m.complete(p, PARAM);
+}
+
+/// True when the current token can begin a `type_name`.
+fn at_type_start(p: &Parser) -> bool {
+    matches!(p.current(), IDENT | MAPPING_KW | FUNCTION_KW)
 }
 
 // ---- names -------------------------------------------------------------------

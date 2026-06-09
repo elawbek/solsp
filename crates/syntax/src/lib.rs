@@ -150,6 +150,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_array_mapping_function_types() {
+        let src = "contract C {\n  \
+            uint256[] a;\n  \
+            mapping(address => uint256) bal;\n  \
+            mapping(address owner => uint256 amount) named;\n  \
+            uint8[2][] grid;\n  \
+            mapping(uint256 => function (uint) external returns (bool)) cbs;\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("ARRAY_TYPE@"));
+        assert!(dump.contains("MAPPING_TYPE@"));
+        assert!(dump.contains("FUNCTION_TYPE@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
     fn recovers_on_garbage_then_continues() {
         // Leading junk becomes ERROR nodes; the contract after it still parses.
         let src = "@@@ contract C {}";

@@ -134,7 +134,6 @@ pub(crate) struct CompletedMarker {
 impl CompletedMarker {
     /// Start a new node that will wrap this one. Records the relationship as a
     /// `forward_parent` the tree builder resolves.
-    #[allow(dead_code)] // first consumer is the expression parser (later plan)
     pub(crate) fn precede(self, p: &mut Parser) -> Marker {
         let new_m = p.start();
         if let Event::Start { forward_parent, .. } = &mut p.events[self.pos as usize] {
