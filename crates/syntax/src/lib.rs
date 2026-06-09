@@ -136,6 +136,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_state_vars_and_paths() {
+        let src = "contract C {\n    uint256 x;\n    A.B y = z;\n}";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("CONTRACT_BODY@"));
+        assert!(dump.contains("STATE_VAR_DEF@"));
+        assert!(dump.contains("PATH_TYPE@"));
+        assert!(dump.contains("NAME_REF@")); // type segments are name refs
+        assert!(dump.contains("NAME@"));     // the variable's own name
+        assert_eq!(p.syntax().text().to_string(), src); // lossless
+    }
+
+    #[test]
     fn recovers_on_garbage_then_continues() {
         // Leading junk becomes ERROR nodes; the contract after it still parses.
         let src = "@@@ contract C {}";
