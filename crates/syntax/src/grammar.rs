@@ -70,6 +70,8 @@ fn contract_body(p: &mut Parser) {
 fn member(p: &mut Parser) {
     match p.current() {
         FUNCTION_KW | FALLBACK_KW | RECEIVE_KW => function_def(p),
+        MODIFIER_KW => modifier_def(p),
+        CONSTRUCTOR_KW => constructor_def(p),
         IDENT | MAPPING_KW => state_var_def(p),
         _ => p.err_and_bump("expected a contract member"),
     }
@@ -183,6 +185,49 @@ fn block(p: &mut Parser) {
     }
     p.expect(R_BRACE);
     m.complete(p, BLOCK);
+}
+
+// ---- modifiers & constructors ------------------------------------------------
+
+/// `'modifier' NAME? param_list? ('virtual'|override_spec)* (block | ';')`
+fn modifier_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(MODIFIER_KW);
+    if p.at(IDENT) {
+        name(p);
+    }
+    if p.at(L_PAREN) {
+        param_list(p);
+    }
+    loop {
+        match p.current() {
+            VIRTUAL_KW => p.bump_any(),
+            OVERRIDE_KW => override_spec(p),
+            _ => break,
+        }
+    }
+    if p.at(L_BRACE) {
+        block(p);
+    } else {
+        p.expect(SEMICOLON);
+    }
+    m.complete(p, MODIFIER_DEF);
+}
+
+/// `'constructor' param_list? function_attribute* (block | ';')`
+fn constructor_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(CONSTRUCTOR_KW);
+    if p.at(L_PAREN) {
+        param_list(p);
+    }
+    function_attributes(p); // visibility / payable / base-constructor invocations
+    if p.at(L_BRACE) {
+        block(p);
+    } else {
+        p.expect(SEMICOLON);
+    }
+    m.complete(p, CONSTRUCTOR_DEF);
 }
 
 // ---- types -------------------------------------------------------------------

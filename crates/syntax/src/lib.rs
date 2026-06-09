@@ -188,6 +188,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_modifiers_and_constructors() {
+        let src = "contract C {\n  \
+            modifier onlyOwner() virtual { _; }\n  \
+            modifier nonReentrant;\n  \
+            constructor(uint x) Ownable(msg.sender) payable {}\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("MODIFIER_DEF@"));
+        assert!(dump.contains("CONSTRUCTOR_DEF@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
     fn recovers_on_garbage_then_continues() {
         // Leading junk becomes ERROR nodes; the contract after it still parses.
         let src = "@@@ contract C {}";
