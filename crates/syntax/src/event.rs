@@ -57,14 +57,20 @@ pub(crate) fn build_tree(
     let eat_trivia = |builder: &mut GreenNodeBuilder, raw: &mut usize| {
         while *raw < spans.len() && spans[*raw].0.is_trivia() {
             let (k, s, e) = spans[*raw];
-            builder.token(SolidityLanguage::kind_to_raw(k), &text[s as usize..e as usize]);
+            builder.token(
+                SolidityLanguage::kind_to_raw(k),
+                &text[s as usize..e as usize],
+            );
             *raw += 1;
         }
     };
 
     for i in 0..events.len() {
         match std::mem::replace(&mut events[i], Event::Tombstone) {
-            Event::Start { kind, forward_parent } => {
+            Event::Start {
+                kind,
+                forward_parent,
+            } => {
                 // Collect this node + any forward-parent chain, outermost last.
                 forward_parents.push(kind);
                 let mut fp = forward_parent;
@@ -72,7 +78,10 @@ pub(crate) fn build_tree(
                 while let Some(fwd) = fp {
                     idx += fwd as usize;
                     fp = match std::mem::replace(&mut events[idx], Event::Tombstone) {
-                        Event::Start { kind, forward_parent } => {
+                        Event::Start {
+                            kind,
+                            forward_parent,
+                        } => {
                             forward_parents.push(kind);
                             forward_parent
                         }
@@ -98,11 +107,18 @@ pub(crate) fn build_tree(
                     "Token event without a matching non-trivia token (parser/lexer desync)"
                 );
                 let (_k, s, e) = spans[raw];
-                builder.token(SolidityLanguage::kind_to_raw(kind), &text[s as usize..e as usize]);
+                builder.token(
+                    SolidityLanguage::kind_to_raw(kind),
+                    &text[s as usize..e as usize],
+                );
                 raw += 1;
             }
             Event::Error { msg } => {
-                let at = if raw < spans.len() { spans[raw].1 } else { text_len };
+                let at = if raw < spans.len() {
+                    spans[raw].1
+                } else {
+                    text_len
+                };
                 errors.push(SyntaxError {
                     message: msg,
                     range: TextRange::empty(TextSize::from(at)),
@@ -127,7 +143,10 @@ mod tests {
         let src = "contract C";
         let tokens = tokenize(src);
         let events = vec![
-            Event::Start { kind: CONTRACT_DEF, forward_parent: None },
+            Event::Start {
+                kind: CONTRACT_DEF,
+                forward_parent: None,
+            },
             Event::Token { kind: CONTRACT_KW },
             Event::Token { kind: IDENT },
             Event::Finish,
@@ -145,7 +164,10 @@ mod tests {
         let src = "contract";
         let tokens = tokenize(src);
         let events = vec![
-            Event::Start { kind: SOURCE_FILE, forward_parent: None },
+            Event::Start {
+                kind: SOURCE_FILE,
+                forward_parent: None,
+            },
             Event::Token { kind: CONTRACT_KW },
             Event::Error { msg: "boom".into() },
             Event::Finish,

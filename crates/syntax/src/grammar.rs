@@ -152,8 +152,8 @@ fn function_def(p: &mut Parser) {
 fn function_attributes(p: &mut Parser) {
     loop {
         match p.current() {
-            PUBLIC_KW | PRIVATE_KW | INTERNAL_KW | EXTERNAL_KW | PURE_KW | VIEW_KW
-            | PAYABLE_KW | VIRTUAL_KW => p.bump_any(),
+            PUBLIC_KW | PRIVATE_KW | INTERNAL_KW | EXTERNAL_KW | PURE_KW | VIEW_KW | PAYABLE_KW
+            | VIRTUAL_KW => p.bump_any(),
             OVERRIDE_KW => override_spec(p),
             IDENT => modifier_invocation(p),
             _ => break,
@@ -407,8 +407,8 @@ fn function_type(p: &mut Parser) -> CompletedMarker {
     } else {
         p.error("expected '(' in function type");
     }
-    while let INTERNAL_KW | EXTERNAL_KW | PUBLIC_KW | PRIVATE_KW | PURE_KW | VIEW_KW
-    | PAYABLE_KW = p.current()
+    while let INTERNAL_KW | EXTERNAL_KW | PUBLIC_KW | PRIVATE_KW | PURE_KW | VIEW_KW | PAYABLE_KW =
+        p.current()
     {
         p.bump_any();
     }

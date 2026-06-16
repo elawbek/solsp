@@ -102,9 +102,7 @@ impl<'a> Cursor<'a> {
         self.eat_while(is_ident_continue);
         let text = &self.src[start..self.pos];
         // `hex"..."` / `unicode"..."` are single string literals, not ident+string.
-        if (text == "hex" || text == "unicode")
-            && matches!(self.first(), Some('"') | Some('\''))
-        {
+        if (text == "hex" || text == "unicode") && matches!(self.first(), Some('"') | Some('\'')) {
             let quote = self.first().unwrap();
             self.string_body(quote);
             return STRING;
@@ -280,7 +278,11 @@ mod tests {
     /// The core invariant for EVERY lexer task: token lengths tile the input exactly.
     fn assert_lossless(src: &str) {
         let total: usize = tokenize(src).iter().map(|t| t.len as usize).sum();
-        assert_eq!(total, src.len(), "tokens must cover the whole input: {src:?}");
+        assert_eq!(
+            total,
+            src.len(),
+            "tokens must cover the whole input: {src:?}"
+        );
     }
 
     #[test]
@@ -307,11 +309,22 @@ mod tests {
 
     #[test]
     fn single_char_punct() {
-        assert_eq!(lex("()[]{};,.?:"), vec![
-            (L_PAREN, "("), (R_PAREN, ")"), (L_BRACK, "["), (R_BRACK, "]"),
-            (L_BRACE, "{"), (R_BRACE, "}"), (SEMICOLON, ";"), (COMMA, ","),
-            (DOT, "."), (QUESTION, "?"), (COLON, ":"),
-        ]);
+        assert_eq!(
+            lex("()[]{};,.?:"),
+            vec![
+                (L_PAREN, "("),
+                (R_PAREN, ")"),
+                (L_BRACK, "["),
+                (R_BRACK, "]"),
+                (L_BRACE, "{"),
+                (R_BRACE, "}"),
+                (SEMICOLON, ";"),
+                (COMMA, ","),
+                (DOT, "."),
+                (QUESTION, "?"),
+                (COLON, ":"),
+            ]
+        );
     }
 
     #[test]
@@ -340,9 +353,10 @@ mod tests {
         assert_eq!(lex("Foo_$bar1"), vec![(IDENT, "Foo_$bar1")]);
         assert_eq!(lex("uint256"), vec![(IDENT, "uint256")]); // elementary type = IDENT
         assert_eq!(lex("contractFoo"), vec![(IDENT, "contractFoo")]); // not a keyword
-        assert_eq!(lex("contract Foo"), vec![
-            (CONTRACT_KW, "contract"), (WHITESPACE, " "), (IDENT, "Foo"),
-        ]);
+        assert_eq!(
+            lex("contract Foo"),
+            vec![(CONTRACT_KW, "contract"), (WHITESPACE, " "), (IDENT, "Foo"),]
+        );
     }
 
     #[test]
@@ -355,7 +369,10 @@ mod tests {
         assert_eq!(lex("2e10"), vec![(NUMBER, "2e10")]);
         assert_eq!(lex("1.2e-3"), vec![(NUMBER, "1.2e-3")]);
         // A trailing dot with no digit is the DOT operator, not part of the number:
-        assert_eq!(lex("1.foo"), vec![(NUMBER, "1"), (DOT, "."), (IDENT, "foo")]);
+        assert_eq!(
+            lex("1.foo"),
+            vec![(NUMBER, "1"), (DOT, "."), (IDENT, "foo")]
+        );
     }
 
     #[test]
@@ -364,7 +381,10 @@ mod tests {
         assert_eq!(lex("'world'"), vec![(STRING, "'world'")]);
         assert_eq!(lex(r#""a\"b""#), vec![(STRING, r#""a\"b""#)]); // escaped quote
         assert_eq!(lex(r#"hex"00ff""#), vec![(STRING, r#"hex"00ff""#)]);
-        assert_eq!(lex(r#"unicode"héllo""#), vec![(STRING, r#"unicode"héllo""#)]);
+        assert_eq!(
+            lex(r#"unicode"héllo""#),
+            vec![(STRING, r#"unicode"héllo""#)]
+        );
         // `hexx` is a plain identifier, not a hex-string prefix:
         assert_eq!(lex(r#"hexx"#), vec![(IDENT, "hexx")]);
     }
@@ -380,15 +400,27 @@ mod tests {
     fn comments() {
         assert_eq!(lex("// hi"), vec![(COMMENT, "// hi")]);
         assert_eq!(lex("/* a b */"), vec![(COMMENT, "/* a b */")]);
-        assert_eq!(lex("a // tail\nb"), vec![
-            (IDENT, "a"), (WHITESPACE, " "), (COMMENT, "// tail"),
-            (WHITESPACE, "\n"), (IDENT, "b"),
-        ]);
+        assert_eq!(
+            lex("a // tail\nb"),
+            vec![
+                (IDENT, "a"),
+                (WHITESPACE, " "),
+                (COMMENT, "// tail"),
+                (WHITESPACE, "\n"),
+                (IDENT, "b"),
+            ]
+        );
         // `/` alone is still the SLASH operator.
-        assert_eq!(lex("a / b"), vec![
-            (IDENT, "a"), (WHITESPACE, " "), (SLASH, "/"),
-            (WHITESPACE, " "), (IDENT, "b"),
-        ]);
+        assert_eq!(
+            lex("a / b"),
+            vec![
+                (IDENT, "a"),
+                (WHITESPACE, " "),
+                (SLASH, "/"),
+                (WHITESPACE, " "),
+                (IDENT, "b"),
+            ]
+        );
     }
 
     #[test]

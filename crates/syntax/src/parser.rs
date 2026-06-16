@@ -13,7 +13,11 @@ pub(crate) struct Parser<'t> {
 
 impl<'t> Parser<'t> {
     pub(crate) fn new(input: &'t Input) -> Parser<'t> {
-        Parser { input, pos: 0, events: Vec::new() }
+        Parser {
+            input,
+            pos: 0,
+            events: Vec::new(),
+        }
     }
 
     /// Kind of the token `n` ahead (0 = current); `EOF` past the end.
@@ -39,7 +43,12 @@ impl<'t> Parser<'t> {
     /// Consume the current token as a leaf of `kind`. Panics if not at `kind`
     /// (callers must check first) — keeps grammar bugs loud.
     pub(crate) fn bump(&mut self, kind: SyntaxKind) {
-        assert!(self.at(kind), "expected to bump {:?}, found {:?}", kind, self.current());
+        assert!(
+            self.at(kind),
+            "expected to bump {:?}, found {:?}",
+            kind,
+            self.current()
+        );
         self.do_bump(kind);
     }
 
@@ -106,7 +115,10 @@ impl Marker {
         let idx = self.pos as usize;
         match &mut p.events[idx] {
             slot @ Event::Tombstone => {
-                *slot = Event::Start { kind, forward_parent: None };
+                *slot = Event::Start {
+                    kind,
+                    forward_parent: None,
+                };
             }
             other => unreachable!("marker slot was not a tombstone: {:?}", other),
         }
@@ -166,7 +178,13 @@ mod tests {
         let events = p.finish();
         // Start(CONTRACT_DEF), Token(CONTRACT_KW), Finish
         assert_eq!(events.len(), 3);
-        assert!(matches!(events[0], Event::Start { kind: CONTRACT_DEF, .. }));
+        assert!(matches!(
+            events[0],
+            Event::Start {
+                kind: CONTRACT_DEF,
+                ..
+            }
+        ));
         assert!(matches!(events[1], Event::Token { kind: CONTRACT_KW }));
         assert!(matches!(events[2], Event::Finish));
     }

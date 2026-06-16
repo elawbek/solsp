@@ -13,8 +13,8 @@ mod input;
 mod syntax_kind;
 
 pub mod ast;
-pub mod lexer;
 mod grammar;
+pub mod lexer;
 pub mod parser;
 
 pub use syntax_kind::SyntaxKind;
@@ -93,14 +93,27 @@ mod tests {
             match el {
                 rowan::NodeOrToken::Node(n) => {
                     let r = n.text_range();
-                    let _ = writeln!(out, "{:?}@{}..{}", n.kind(), u32::from(r.start()), u32::from(r.end()));
+                    let _ = writeln!(
+                        out,
+                        "{:?}@{}..{}",
+                        n.kind(),
+                        u32::from(r.start()),
+                        u32::from(r.end())
+                    );
                     for c in n.children_with_tokens() {
                         go(out, c, indent + 1);
                     }
                 }
                 rowan::NodeOrToken::Token(t) => {
                     let r = t.text_range();
-                    let _ = writeln!(out, "{:?}@{}..{} {:?}", t.kind(), u32::from(r.start()), u32::from(r.end()), t.text());
+                    let _ = writeln!(
+                        out,
+                        "{:?}@{}..{} {:?}",
+                        t.kind(),
+                        u32::from(r.start()),
+                        u32::from(r.end()),
+                        t.text()
+                    );
                 }
             }
         }
@@ -145,7 +158,7 @@ mod tests {
         assert!(dump.contains("STATE_VAR_DEF@"));
         assert!(dump.contains("PATH_TYPE@"));
         assert!(dump.contains("NAME_REF@")); // type segments are name refs
-        assert!(dump.contains("NAME@"));     // the variable's own name
+        assert!(dump.contains("NAME@")); // the variable's own name
         assert_eq!(p.syntax().text().to_string(), src); // lossless
     }
 

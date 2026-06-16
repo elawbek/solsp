@@ -269,9 +269,20 @@ mod tests {
     fn new_decl_node_kinds_exist_and_roundtrip() {
         // Spot-check a few of the Plan-3 node kinds compile and round-trip.
         for k in [
-            CONTRACT_BODY, PARAM, NAME_REF, PATH_TYPE, MAPPING_TYPE, ARRAY_TYPE,
-            FUNCTION_TYPE, MODIFIER_DEF, CONSTRUCTOR_DEF, STRUCT_FIELD, ENUM_VARIANT,
-            USING_DIRECTIVE, USER_DEFINED_VALUE_TYPE, INHERITANCE_SPECIFIER,
+            CONTRACT_BODY,
+            PARAM,
+            NAME_REF,
+            PATH_TYPE,
+            MAPPING_TYPE,
+            ARRAY_TYPE,
+            FUNCTION_TYPE,
+            MODIFIER_DEF,
+            CONSTRUCTOR_DEF,
+            STRUCT_FIELD,
+            ENUM_VARIANT,
+            USING_DIRECTIVE,
+            USER_DEFINED_VALUE_TYPE,
+            INHERITANCE_SPECIFIER,
             MODIFIER_INVOCATION,
         ] {
             assert_eq!(SyntaxKind::from_u16(k.to_u16()), k);
