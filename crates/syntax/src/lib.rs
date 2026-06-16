@@ -131,6 +131,9 @@ mod tests {
             "// only a comment",
             "contract C { string s = unicode\"héllo 🌍\"; }",
             "contract C {",
+            "contract C is A, , B {}", // empty base between commas → zero-width specifier
+            "contract C is A(((",      // unbalanced inheritance args run to EOF
+            "contract C is",           // EOF right after `is`
         ] {
             assert_eq!(parse(src).syntax().text().to_string(), src);
         }
@@ -245,6 +248,17 @@ mod tests {
         assert!(dump.contains("EVENT_DEF@"));
         assert!(dump.contains("ERROR_DEF@"));
         assert!(dump.contains("USER_DEFINED_VALUE_TYPE@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
+    fn parses_inheritance() {
+        let src = "abstract contract C is Ownable, IERC20, Base(1, 2) {}";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("INHERITANCE_SPECIFIER@"));
+        assert!(dump.matches("INHERITANCE_SPECIFIER@").count() == 3);
         assert_eq!(p.syntax().text().to_string(), src);
     }
 

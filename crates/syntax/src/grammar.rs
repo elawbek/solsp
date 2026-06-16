@@ -47,12 +47,36 @@ fn contract(p: &mut Parser) {
     } else {
         p.error("expected a contract name");
     }
+    if p.eat(IS_KW) {
+        inheritance_specifier(p);
+        while p.eat(COMMA) {
+            inheritance_specifier(p);
+        }
+    }
     if p.at(L_BRACE) {
         contract_body(p);
     } else {
         p.error("expected '{'");
     }
     m.complete(p, CONTRACT_DEF);
+}
+
+/// `path_type ('(' <constructor args> ')')?` — a base in an `is` list. The args
+/// are expressions, span-skipped until a later plan.
+fn inheritance_specifier(p: &mut Parser) {
+    let m = p.start();
+    if p.at(IDENT) {
+        path_type(p);
+    } else {
+        // Error-only recovery (no bump): safe ONLY because the caller's base-list
+        // loop is driven by `eat(COMMA)`, not by this function consuming a token.
+        // Don't make any loop iterate on `inheritance_specifier` directly.
+        p.error("expected a base contract name");
+    }
+    if p.at(L_PAREN) {
+        skip_parens(p);
+    }
+    m.complete(p, INHERITANCE_SPECIFIER);
 }
 
 fn contract_body(p: &mut Parser) {
