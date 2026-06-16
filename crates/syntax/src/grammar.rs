@@ -18,8 +18,17 @@ pub(crate) fn source_file(p: &mut Parser) {
 fn item(p: &mut Parser) {
     match p.current() {
         PRAGMA_KW => pragma(p),
+        IMPORT_KW => import_directive(p),
+        USING_KW => using_directive(p),
         CONTRACT_KW | INTERFACE_KW | LIBRARY_KW | ABSTRACT_KW => contract(p),
-        _ => p.err_and_bump("expected an item (pragma, contract, …)"),
+        FUNCTION_KW => function_def(p), // free function
+        STRUCT_KW => struct_def(p),
+        ENUM_KW => enum_def(p),
+        EVENT_KW => event_def(p),
+        ERROR_KW => error_def(p),
+        TYPE_KW => user_defined_value_type(p),
+        IDENT | MAPPING_KW => state_var_def(p), // file-level constant
+        _ => p.err_and_bump("expected an item (pragma, import, contract, …)"),
     }
 }
 
@@ -33,6 +42,29 @@ fn pragma(p: &mut Parser) {
     }
     p.expect(SEMICOLON);
     m.complete(p, PRAGMA_DIRECTIVE);
+}
+
+/// `'import' <anything> ';'` — structured into targets/paths in M2; here we span
+/// to the semicolon (lossless), wrapped as one directive node.
+fn import_directive(p: &mut Parser) {
+    let m = p.start();
+    p.bump(IMPORT_KW);
+    while !p.at(SEMICOLON) && !p.at(EOF) {
+        p.bump_any();
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, IMPORT_DIRECTIVE);
+}
+
+/// `'using' <anything> ';'` — same span-to-`;` treatment as imports for M1.
+fn using_directive(p: &mut Parser) {
+    let m = p.start();
+    p.bump(USING_KW);
+    while !p.at(SEMICOLON) && !p.at(EOF) {
+        p.bump_any();
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, USING_DIRECTIVE);
 }
 
 /// `('contract'|'interface'|'library'|'abstract' 'contract'?) NAME contract_body`
@@ -101,6 +133,7 @@ fn member(p: &mut Parser) {
         EVENT_KW => event_def(p),
         ERROR_KW => error_def(p),
         TYPE_KW => user_defined_value_type(p),
+        USING_KW => using_directive(p),
         IDENT | MAPPING_KW => state_var_def(p),
         _ => p.err_and_bump("expected a contract member"),
     }

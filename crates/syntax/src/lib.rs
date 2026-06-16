@@ -134,6 +134,11 @@ mod tests {
             "contract C is A, , B {}", // empty base between commas → zero-width specifier
             "contract C is A(((",      // unbalanced inheritance args run to EOF
             "contract C is",           // EOF right after `is`
+            "import",                  // bare directive keyword at EOF
+            "import \"x\"",            // unterminated import (no `;`)
+            "using",                   // bare `using` keyword at EOF
+            "foo",                     // file-level stray IDENT → state_var_def path
+            "function",                // free-function keyword then EOF
         ] {
             assert_eq!(parse(src).syntax().text().to_string(), src);
         }
@@ -260,6 +265,77 @@ mod tests {
         assert!(dump.contains("INHERITANCE_SPECIFIER@"));
         assert!(dump.matches("INHERITANCE_SPECIFIER@").count() == 3);
         assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
+    fn parses_file_level_items() {
+        let src = "// SPDX-License-Identifier: MIT\n\
+pragma solidity ^0.8.20;\n\
+import {ERC20} from \"@openzeppelin/contracts/token/ERC20/ERC20.sol\";\n\
+using SafeMath for uint256;\n\
+type Wad is uint256;\n\
+uint256 constant CHAIN_ID = 1;\n\
+function freeAdd(uint a, uint b) pure returns (uint) {}\n\
+contract C is ERC20 {}\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("IMPORT_DIRECTIVE@"));
+        assert!(dump.contains("USING_DIRECTIVE@"));
+        assert!(dump.contains("USER_DEFINED_VALUE_TYPE@"));
+        assert!(dump.contains("STATE_VAR_DEF@")); // file-level constant
+        assert!(dump.contains("FUNCTION_DEF@")); // free function
+        assert!(dump.contains("CONTRACT_DEF@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
+    fn parses_realistic_contract_losslessly_without_errors() {
+        let src = "// SPDX-License-Identifier: MIT\n\
+pragma solidity ^0.8.20;\n\
+\n\
+import {Ownable} from \"@openzeppelin/contracts/access/Ownable.sol\";\n\
+\n\
+contract Vault is Ownable {\n\
+    mapping(address => uint256) public balances;\n\
+    uint256 public constant FEE = 1_000;\n\
+    address immutable owner;\n\
+\n\
+    event Deposit(address indexed who, uint256 amount);\n\
+    error InsufficientBalance(uint256 have, uint256 want);\n\
+\n\
+    struct Account { uint256 balance; bool frozen; }\n\
+    enum Status { Open, Closed }\n\
+\n\
+    modifier onlyPositive(uint256 v) { _; }\n\
+\n\
+    constructor() Ownable(msg.sender) {}\n\
+\n\
+    function deposit() external payable onlyPositive(msg.value) {}\n\
+    function balanceOf(address a) external view returns (uint256) {}\n\
+}\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        assert_eq!(p.syntax().text().to_string(), src);
+        let dump = debug_tree(src);
+        for kind in [
+            "PRAGMA_DIRECTIVE@",
+            "IMPORT_DIRECTIVE@",
+            "CONTRACT_DEF@",
+            "INHERITANCE_SPECIFIER@",
+            "STATE_VAR_DEF@",
+            "MAPPING_TYPE@",
+            "EVENT_DEF@",
+            "ERROR_DEF@",
+            "STRUCT_DEF@",
+            "ENUM_DEF@",
+            "MODIFIER_DEF@",
+            "CONSTRUCTOR_DEF@",
+            "FUNCTION_DEF@",
+            "BLOCK@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
     }
 
     #[test]
