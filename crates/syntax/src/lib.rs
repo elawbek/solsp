@@ -700,4 +700,40 @@ contract Vault is Ownable {\n\
         }
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_yul_function_def_and_flow() {
+        // Yul function definitions (params + `-> r` returns), nested control flow,
+        // and `leave`/`break`/`continue`.
+        let src = "contract C {\n  \
+            function f() public {\n    \
+                assembly {\n      \
+                    function add2(a, b) -> r {\n        \
+                        r := add(a, b)\n        \
+                        leave\n      \
+                    }\n      \
+                    function loop() {\n        \
+                        for { let i := 0 } lt(i, 10) { i := add(i, 1) } {\n          \
+                            if eq(i, 5) { break }\n          \
+                            if eq(i, 3) { continue }\n        \
+                        }\n      \
+                    }\n      \
+                    let x := add2(1, 2)\n    \
+                }\n  \
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in [
+            "YUL_FUNCTION_DEF@",
+            "YUL_PARAM_LIST@",
+            "YUL_LEAVE@",
+            "YUL_BREAK@",
+            "YUL_CONTINUE@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }

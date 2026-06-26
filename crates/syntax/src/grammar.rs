@@ -1109,9 +1109,9 @@ fn yul_block(p: &mut Parser) {
 /// Dispatch one Yul statement on `current()`. CRITICAL: every arm consumes ≥1
 /// token (keyword-led statements bump their keyword first; the identifier arm
 /// bumps the identifier; `_ =>` recovers via `err_and_bump`), so the `yul_block`
-/// loop can't spin. Grown across Plan-5 tasks: function defs + `leave`/`break`/
-/// `continue` land in Task 4. For now: nested blocks, `let` declarations,
-/// control flow (`if`/`for`/`switch`), and identifier-led statements.
+/// loop can't spin. Final dispatch: nested blocks, `let` declarations, control
+/// flow (`if`/`for`/`switch`), function definitions, `leave`/`break`/`continue`,
+/// and identifier-led statements (assignment / call).
 fn yul_statement(p: &mut Parser) {
     match p.current() {
         L_BRACE => yul_block(p),
@@ -1119,6 +1119,10 @@ fn yul_statement(p: &mut Parser) {
         IF_KW => yul_if(p),
         FOR_KW => yul_for(p),
         SWITCH_KW => yul_switch(p),
+        FUNCTION_KW => yul_function_def(p),
+        LEAVE_KW => yul_leaf_stmt(p, LEAVE_KW, YUL_LEAVE),
+        BREAK_KW => yul_leaf_stmt(p, BREAK_KW, YUL_BREAK),
+        CONTINUE_KW => yul_leaf_stmt(p, CONTINUE_KW, YUL_CONTINUE),
         IDENT | RETURN_KW | REVERT_KW => yul_ident_statement(p),
         _ => p.err_and_bump("expected a Yul statement"),
     }
@@ -1344,6 +1348,69 @@ fn yul_literal(p: &mut Parser) {
     } else {
         p.error("expected a Yul literal");
     }
+}
+
+/// `'function' NAME yul_param_list ('->' NAME (',' NAME)*)? yul_block` ⇒
+/// YUL_FUNCTION_DEF. Parameters are wrapped in a YUL_PARAM_LIST (they're
+/// parenthesized, so the `(`/`)` give natural boundaries). The optional return
+/// identifiers after `->` are inline NAME children of the YUL_FUNCTION_DEF — they
+/// have no delimiters of their own, and the THIN_ARROW token marks where they
+/// begin (mirroring how `yul_var_decl` lists its binding names inline).
+fn yul_function_def(p: &mut Parser) {
+    let m = p.start();
+    p.bump(FUNCTION_KW);
+    if p.at(IDENT) {
+        name(p);
+    } else {
+        p.error("expected a Yul function name");
+    }
+    yul_param_list(p);
+    if p.eat(THIN_ARROW) {
+        name(p); // first return name
+        while p.eat(COMMA) {
+            name(p);
+        }
+    }
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for function body");
+    }
+    m.complete(p, YUL_FUNCTION_DEF);
+}
+
+/// `'(' (NAME (',' NAME)*)? ')'` ⇒ YUL_PARAM_LIST (a function definition's
+/// parameter list — bare binding names, no types). The loop advances on every
+/// branch (`name` bumps an IDENT, else `err_and_bump`), so it can't spin.
+fn yul_param_list(p: &mut Parser) {
+    let m = p.start();
+    p.expect(L_PAREN);
+    // Stop on `}` as well as `)`/EOF: a misplaced brace in an unterminated param
+    // list (`function f( }`) should re-sync the enclosing `yul_block` rather than
+    // be swallowed by `err_and_bump`.
+    while !p.at(R_PAREN) && !p.at(R_BRACE) && !p.at(EOF) {
+        if p.at(IDENT) {
+            name(p);
+        } else {
+            p.err_and_bump("expected a parameter name");
+            continue;
+        }
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    p.expect(R_PAREN);
+    m.complete(p, YUL_PARAM_LIST);
+}
+
+/// A single-keyword Yul flow statement (`leave` / `break` / `continue`). Each gets
+/// its own node kind so the later AST layer distinguishes them without reading
+/// token text (consistent with the project's text-free-parser stance). The caller
+/// matched `current() == kw`, so `bump(kw)` is guarded.
+fn yul_leaf_stmt(p: &mut Parser, kw: SyntaxKind, node: SyntaxKind) {
+    let m = p.start();
+    p.bump(kw);
+    m.complete(p, node);
 }
 
 // ---- types -------------------------------------------------------------------
