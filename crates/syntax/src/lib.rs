@@ -635,4 +635,38 @@ contract Vault is Ownable {\n\
             );
         }
     }
+
+    #[test]
+    fn parses_yul_block_let_assign_call() {
+        // `let`, single + multi assignment, function-call statement, dotted path
+        // target, and the `return` builtin (a Solidity keyword reused as a Yul
+        // callee). No binary operators anywhere — every computation is a call.
+        let src = "contract C {\n  \
+            function f() public {\n    \
+                assembly {\n      \
+                    let x := add(1, 2)\n      \
+                    let y, z := mload(0x40)\n      \
+                    x := mul(x, 3)\n      \
+                    x, y := calldataload(0)\n      \
+                    sstore(0, x)\n      \
+                    return(0, 0x20)\n    \
+                }\n  \
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in [
+            "ASSEMBLY_STMT@",
+            "YUL_BLOCK@",
+            "YUL_VAR_DECL@",
+            "YUL_ASSIGNMENT@",
+            "YUL_FUNCTION_CALL@",
+            "YUL_PATH@",
+            "YUL_LITERAL@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src); // lossless
+    }
 }

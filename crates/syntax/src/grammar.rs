@@ -1070,10 +1070,10 @@ fn catch_clause(p: &mut Parser) {
     m.complete(p, CATCH_CLAUSE);
 }
 
-/// `'assembly' STRING? ('(' <flags> ')')? '{' <yul> '}'` — the Yul interior is
-/// span-skipped to the matching brace (Plan 5 parses it). The node is a real
-/// ASSEMBLY_STMT; the optional `"evmasm"` dialect string and `(...)` flags are
-/// consumed as leaves.
+/// `'assembly' STRING? ('(' <flags> ')')? '{' yul_block '}'` — a real ASSEMBLY_STMT
+/// whose `{ … }` body is now a parsed YUL_BLOCK (Plan 5). The optional `"evmasm"`
+/// dialect string and the `("memory-safe")` flag parens are still consumed as
+/// opaque leaves (their internal structure is out of M1 scope).
 fn assembly_stmt(p: &mut Parser) {
     let m = p.start();
     p.bump(ASSEMBLY_KW);
@@ -1081,33 +1081,162 @@ fn assembly_stmt(p: &mut Parser) {
         p.bump(STRING); // dialect, e.g. "evmasm"
     }
     if p.at(L_PAREN) {
-        skip_parens(p); // memory-safe flags etc. — structured in Plan 5
+        skip_parens(p); // memory-safe flag — kept as a leaf-skip in M1
     }
     if p.at(L_BRACE) {
-        skip_braces(p); // Yul body span-skipped to matching `}` (Plan 5)
+        yul_block(p); // real Yul interior (Plan 5)
     } else {
         p.error("expected '{' for assembly body");
     }
     m.complete(p, ASSEMBLY_STMT);
 }
 
-/// Balanced `'{' … '}'` whose interior is span-skipped (Yul, parsed in Plan 5).
-/// Mirrors `skip_parens`. Used only by `assembly_stmt`.
-fn skip_braces(p: &mut Parser) {
+// ---- Yul (inline assembly) ---------------------------------------------------
+
+/// `'{' yul_statement* '}'` ⇒ YUL_BLOCK. The caller guarantees we're at `{`. Each
+/// `yul_statement` consumes ≥1 token (or `err_and_bump` does), so the loop always
+/// makes progress.
+fn yul_block(p: &mut Parser) {
+    let m = p.start();
     p.bump(L_BRACE);
-    let mut depth = 1usize;
-    while depth > 0 && !p.at(EOF) {
-        match p.current() {
-            L_BRACE => depth += 1,
-            R_BRACE => depth -= 1,
-            _ => {}
-        }
-        if depth == 0 {
-            break;
-        }
-        p.bump_any();
+    while !p.at(R_BRACE) && !p.at(EOF) {
+        yul_statement(p);
     }
     p.expect(R_BRACE);
+    m.complete(p, YUL_BLOCK);
+}
+
+/// Dispatch one Yul statement on `current()`. CRITICAL: every arm consumes ≥1
+/// token (keyword-led statements bump their keyword first; the identifier arm
+/// bumps the identifier; `_ =>` recovers via `err_and_bump`), so the `yul_block`
+/// loop can't spin. Grown across Plan-5 tasks: control flow lands in Task 3,
+/// function defs + `leave`/`break`/`continue` in Task 4. For now: nested blocks,
+/// `let` declarations, and identifier-led statements (assignment / call).
+fn yul_statement(p: &mut Parser) {
+    match p.current() {
+        L_BRACE => yul_block(p),
+        LET_KW => yul_var_decl(p),
+        IDENT | RETURN_KW | REVERT_KW => yul_ident_statement(p),
+        _ => p.err_and_bump("expected a Yul statement"),
+    }
+}
+
+/// `'let' NAME (',' NAME)* (':=' yul_expr)?` ⇒ YUL_VAR_DECL. Binding names are
+/// NAME nodes (defining occurrences). The optional initializer is a Yul
+/// expression (call / path / literal — there are no binary operators in Yul).
+fn yul_var_decl(p: &mut Parser) {
+    let m = p.start();
+    p.bump(LET_KW);
+    name(p); // first binding name
+    while p.eat(COMMA) {
+        name(p);
+    }
+    if p.eat(COLON_EQ) && !yul_expr(p) {
+        p.error("expected a Yul expression after ':='");
+    }
+    m.complete(p, YUL_VAR_DECL);
+}
+
+/// An identifier-led Yul statement. Yul is LL(1) here: a `(` immediately after the
+/// leading identifier means a **function-call statement** (`mstore(p, v)`); any
+/// other follow-set means an **assignment** whose targets are a path list
+/// (`x := …`, `x, y := …`, `x.slot := …`). No speculation/`checkpoint` is needed —
+/// one token of lookahead (`nth(1)`) disambiguates, because Yul has no dotted
+/// callees and no postfix chains.
+fn yul_ident_statement(p: &mut Parser) {
+    if p.nth(1) == L_PAREN {
+        yul_function_call(p); // a bare call statement ⇒ a YUL_FUNCTION_CALL node
+        return;
+    }
+    let m = p.start();
+    yul_path(p);
+    while p.eat(COMMA) {
+        yul_path(p);
+    }
+    p.expect(COLON_EQ);
+    if !yul_expr(p) {
+        p.error("expected a Yul expression after ':='");
+    }
+    m.complete(p, YUL_ASSIGNMENT);
+}
+
+/// `yul_function_call | yul_path | yul_literal` ⇒ one Yul expression. Returns
+/// `true` if an expression was parsed (consuming ≥1 token), `false` if `current()`
+/// can't begin one (the caller recovers). There are **no binary operators** in
+/// Yul, so this is a flat choice — never reuse the Solidity `expr`/`expr_bp`.
+fn yul_expr(p: &mut Parser) -> bool {
+    match p.current() {
+        NUMBER | STRING | TRUE_KW | FALSE_KW => {
+            let m = p.start();
+            p.bump_any();
+            m.complete(p, YUL_LITERAL);
+            true
+        }
+        IDENT | RETURN_KW | REVERT_KW => {
+            if p.nth(1) == L_PAREN {
+                yul_function_call(p);
+            } else {
+                yul_path(p);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `yul_ident '(' (yul_expr (',' yul_expr)*)? ')'` ⇒ YUL_FUNCTION_CALL. The callee
+/// (`mstore`, `add`, a user-defined Yul function, …) is a plain NAME_REF — opcodes
+/// are NOT special-cased here (the IDE highlights them later via the builtins
+/// registry). The arg loop advances on every branch, so it can't spin.
+fn yul_function_call(p: &mut Parser) {
+    let m = p.start();
+    yul_name_ref(p); // callee identifier (or the `return`/`revert` builtin)
+    p.expect(L_PAREN);
+    while !p.at(R_PAREN) && !p.at(EOF) {
+        if !yul_expr(p) {
+            p.err_and_bump("expected a Yul argument expression");
+            continue;
+        }
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    p.expect(R_PAREN);
+    m.complete(p, YUL_FUNCTION_CALL);
+}
+
+/// `yul_ident ('.' IDENT)*` ⇒ YUL_PATH (a dotted Yul identifier, e.g. `x` or
+/// `x.slot`). Mirrors the Solidity `path_type` dotted-segment loop; dotted
+/// segments are plain IDENTs.
+fn yul_path(p: &mut Parser) {
+    let m = p.start();
+    yul_name_ref(p);
+    while p.at(DOT) && p.nth(1) == IDENT {
+        p.bump(DOT);
+        name_ref(p);
+    }
+    m.complete(p, YUL_PATH);
+}
+
+/// A token that can begin a Yul identifier: a normal `IDENT`, plus the two
+/// builtins that collide with Solidity keywords because the lexer is
+/// context-free — `return` (RETURN_KW) and `revert` (REVERT_KW), as in the
+/// ubiquitous `return(0, 0x20)` / `revert(p, s)`. They are the only two
+/// collisions among Yul builtins.
+fn at_yul_ident(p: &Parser) -> bool {
+    matches!(p.current(), IDENT | RETURN_KW | REVERT_KW)
+}
+
+/// Consume a Yul identifier as a NAME_REF (a use occurrence). Accepts the
+/// contextual `return`/`revert` builtin spellings in addition to `IDENT`.
+fn yul_name_ref(p: &mut Parser) {
+    if at_yul_ident(p) {
+        let m = p.start();
+        p.bump_any(); // IDENT, or the contextual `return`/`revert` keyword
+        m.complete(p, NAME_REF);
+    } else {
+        p.error("expected a Yul identifier");
+    }
 }
 
 // ---- types -------------------------------------------------------------------
