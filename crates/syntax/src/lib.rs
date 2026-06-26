@@ -475,4 +475,26 @@ contract Vault is Ownable {\n\
         assert!(dump.contains("PATH_EXPR@")); // the `_`
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_nested_control_flow() {
+        let src = "contract C {\n  \
+            function f(uint n) public {\n    \
+                for (uint i = 0; i < n; i++) {\n      \
+                    if (i == 0) { continue; }\n      \
+                    else if (i == 1) { break; }\n      \
+                    else { x = i; }\n    \
+                }\n    \
+                while (n > 0) { n--; }\n    \
+                do { n++; } while (n < 10);\n  \
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in ["IF_STMT@", "FOR_STMT@", "WHILE_STMT@", "DO_WHILE_STMT@"] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }

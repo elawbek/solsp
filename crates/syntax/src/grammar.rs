@@ -759,18 +759,86 @@ fn paren_or_tuple_expr(p: &mut Parser) -> CompletedMarker {
 /// modifier placeholder `_;` flows through `_ =>` → `simple_statement` →
 /// `expr_statement` (it's a PATH_EXPR `_` followed by `;`).
 ///
-/// Control-flow keywords (`if`/`for`/`while`/`do`) are added to this dispatch in
-/// Task 5, and the Solidity-specific statements (`emit`/`revert`/`try`/
-/// `unchecked`/`assembly`) in Task 6; until then they fall through to
-/// `simple_statement` and parse as expression statements.
+/// The Solidity-specific statements (`emit`/`revert`/`try`/`unchecked`/
+/// `assembly`) are added to this dispatch in Task 6; until then they fall through
+/// to `simple_statement` and parse as expression statements.
 fn stmt(p: &mut Parser) {
     match p.current() {
         L_BRACE => block(p),
+        IF_KW => if_stmt(p),
+        FOR_KW => for_stmt(p),
+        WHILE_KW => while_stmt(p),
+        DO_KW => do_while_stmt(p),
         RETURN_KW => return_stmt(p),
         BREAK_KW => break_stmt(p),
         CONTINUE_KW => continue_stmt(p),
         _ => simple_statement(p),
     }
+}
+
+/// `'if' '(' expr ')' stmt ('else' stmt)?` — `else` binds to the nearest `if`,
+/// and `else if` is just an `else` whose statement is another `if_stmt`.
+fn if_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(IF_KW);
+    p.expect(L_PAREN);
+    expr(p);
+    p.expect(R_PAREN);
+    stmt(p);
+    if p.eat(ELSE_KW) {
+        stmt(p);
+    }
+    m.complete(p, IF_STMT);
+}
+
+/// `'for' '(' (simple_statement | ';') expr? ';' expr? ')' stmt`. The init slot
+/// is either a simple statement (which consumes its own `;`) or a bare `;`.
+fn for_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(FOR_KW);
+    p.expect(L_PAREN);
+    // init
+    if p.eat(SEMICOLON) {
+        // empty init
+    } else {
+        simple_statement(p); // consumes the trailing `;`
+    }
+    // condition (optional)
+    if !p.at(SEMICOLON) {
+        expr(p);
+    }
+    p.expect(SEMICOLON);
+    // update (optional)
+    if !p.at(R_PAREN) {
+        expr(p);
+    }
+    p.expect(R_PAREN);
+    stmt(p);
+    m.complete(p, FOR_STMT);
+}
+
+/// `'while' '(' expr ')' stmt`
+fn while_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(WHILE_KW);
+    p.expect(L_PAREN);
+    expr(p);
+    p.expect(R_PAREN);
+    stmt(p);
+    m.complete(p, WHILE_STMT);
+}
+
+/// `'do' stmt 'while' '(' expr ')' ';'`
+fn do_while_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(DO_KW);
+    stmt(p);
+    p.expect(WHILE_KW);
+    p.expect(L_PAREN);
+    expr(p);
+    p.expect(R_PAREN);
+    p.expect(SEMICOLON);
+    m.complete(p, DO_WHILE_STMT);
 }
 
 /// `'return' expr? ';'`
