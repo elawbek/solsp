@@ -1109,13 +1109,16 @@ fn yul_block(p: &mut Parser) {
 /// Dispatch one Yul statement on `current()`. CRITICAL: every arm consumes ≥1
 /// token (keyword-led statements bump their keyword first; the identifier arm
 /// bumps the identifier; `_ =>` recovers via `err_and_bump`), so the `yul_block`
-/// loop can't spin. Grown across Plan-5 tasks: control flow lands in Task 3,
-/// function defs + `leave`/`break`/`continue` in Task 4. For now: nested blocks,
-/// `let` declarations, and identifier-led statements (assignment / call).
+/// loop can't spin. Grown across Plan-5 tasks: function defs + `leave`/`break`/
+/// `continue` land in Task 4. For now: nested blocks, `let` declarations,
+/// control flow (`if`/`for`/`switch`), and identifier-led statements.
 fn yul_statement(p: &mut Parser) {
     match p.current() {
         L_BRACE => yul_block(p),
         LET_KW => yul_var_decl(p),
+        IF_KW => yul_if(p),
+        FOR_KW => yul_for(p),
+        SWITCH_KW => yul_switch(p),
         IDENT | RETURN_KW | REVERT_KW => yul_ident_statement(p),
         _ => p.err_and_bump("expected a Yul statement"),
     }
@@ -1236,6 +1239,110 @@ fn yul_name_ref(p: &mut Parser) {
         m.complete(p, NAME_REF);
     } else {
         p.error("expected a Yul identifier");
+    }
+}
+
+/// `'if' yul_expr yul_block` ⇒ YUL_IF. NOTE the Yul shape: **no parentheses**
+/// around the condition and **no `else`** branch (unlike Solidity `if`).
+fn yul_if(p: &mut Parser) {
+    let m = p.start();
+    p.bump(IF_KW);
+    if !yul_expr(p) {
+        p.error("expected a Yul condition expression");
+    }
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for if body");
+    }
+    m.complete(p, YUL_IF);
+}
+
+/// `'for' yul_block yul_expr yul_block yul_block` ⇒ YUL_FOR — the
+/// `for { init } cond { post } { body }` shape. init/post/body are blocks; the
+/// condition is a bare Yul expression (no parens).
+fn yul_for(p: &mut Parser) {
+    let m = p.start();
+    p.bump(FOR_KW);
+    // init block
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for for-init");
+    }
+    // condition
+    if !yul_expr(p) {
+        p.error("expected a Yul condition expression");
+    }
+    // post block
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for for-post");
+    }
+    // body block
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for for-body");
+    }
+    m.complete(p, YUL_FOR);
+}
+
+/// `'switch' yul_expr ( yul_case+ yul_default? | yul_default )` ⇒ YUL_SWITCH. The
+/// `case`/`default` parse is keyword-driven; a `switch` with neither a case nor a
+/// default is semantically illegal but still parses losslessly (semantics flags
+/// it later).
+fn yul_switch(p: &mut Parser) {
+    let m = p.start();
+    p.bump(SWITCH_KW);
+    if !yul_expr(p) {
+        p.error("expected a Yul switch expression");
+    }
+    while p.at(CASE_KW) {
+        yul_case(p);
+    }
+    if p.at(DEFAULT_KW) {
+        yul_default(p);
+    }
+    m.complete(p, YUL_SWITCH);
+}
+
+/// `'case' yul_literal yul_block` ⇒ YUL_CASE. The case label is a Yul literal.
+fn yul_case(p: &mut Parser) {
+    let m = p.start();
+    p.bump(CASE_KW);
+    yul_literal(p);
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for case body");
+    }
+    m.complete(p, YUL_CASE);
+}
+
+/// `'default' yul_block` ⇒ YUL_DEFAULT.
+fn yul_default(p: &mut Parser) {
+    let m = p.start();
+    p.bump(DEFAULT_KW);
+    if p.at(L_BRACE) {
+        yul_block(p);
+    } else {
+        p.error("expected '{' for default body");
+    }
+    m.complete(p, YUL_DEFAULT);
+}
+
+/// `NUMBER | STRING | 'true' | 'false'` ⇒ YUL_LITERAL (hex/decimal numbers and
+/// strings already lex as NUMBER/STRING). Used for `case` labels; the
+/// expression-position literal is handled inline by `yul_expr`.
+fn yul_literal(p: &mut Parser) {
+    if matches!(p.current(), NUMBER | STRING | TRUE_KW | FALSE_KW) {
+        let m = p.start();
+        p.bump_any();
+        m.complete(p, YUL_LITERAL);
+    } else {
+        p.error("expected a Yul literal");
     }
 }
 

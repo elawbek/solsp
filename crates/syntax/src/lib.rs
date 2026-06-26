@@ -669,4 +669,35 @@ contract Vault is Ownable {\n\
         }
         assert_eq!(p.syntax().text().to_string(), src); // lossless
     }
+
+    #[test]
+    fn parses_yul_control_flow() {
+        // `if` has no parens/else; `for { init } cond { post } { body }`; `switch`
+        // with case literals + default.
+        let src = "contract C {\n  \
+            function f() public {\n    \
+                assembly {\n      \
+                    if lt(x, 3) { x := 0 }\n      \
+                    for { let i := 0 } lt(i, 10) { i := add(i, 1) } { mstore(i, i) }\n      \
+                    switch x\n      \
+                    case 0 { y := 1 }\n      \
+                    case 1 { y := 2 }\n      \
+                    default { y := 0 }\n    \
+                }\n  \
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in [
+            "YUL_IF@",
+            "YUL_FOR@",
+            "YUL_SWITCH@",
+            "YUL_CASE@",
+            "YUL_DEFAULT@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }
