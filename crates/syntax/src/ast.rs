@@ -94,6 +94,11 @@ mod support {
     pub(super) fn children<N: AstNode>(parent: &SyntaxNode) -> impl Iterator<Item = N> {
         parent.children().filter_map(N::cast)
     }
+
+    /// The first direct **node** child of `parent` castable to `N`.
+    pub(super) fn child<N: AstNode>(parent: &SyntaxNode) -> Option<N> {
+        parent.children().find_map(N::cast)
+    }
 }
 
 // ---- names -------------------------------------------------------------------
@@ -168,6 +173,96 @@ impl SourceFile {
     }
 }
 
+// ---- contract ----------------------------------------------------------------
+
+ast_node!(ContractBody, CONTRACT_BODY);
+ast_node!(InheritanceSpecifier, INHERITANCE_SPECIFIER);
+ast_node!(ModifierDef, MODIFIER_DEF);
+ast_node!(ConstructorDef, CONSTRUCTOR_DEF);
+
+/// Which `contract`-family keyword introduced a `CONTRACT_DEF`. `abstract` is a
+/// modifier on a contract (see `is_abstract`), not a distinct kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractKind {
+    Contract,
+    Interface,
+    Library,
+}
+
+impl ContractDef {
+    /// The contract's defining name (grammar `contract(p)` calls `name(p)` ⇒ a
+    /// direct `NAME` child).
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+
+    /// `contract` / `interface` / `library`. The introducer keyword is a direct
+    /// token child (bumped by `contract(p)` before the marker completes).
+    pub fn kind(&self) -> ContractKind {
+        if support::token(self.syntax(), SyntaxKind::INTERFACE_KW).is_some() {
+            ContractKind::Interface
+        } else if support::token(self.syntax(), SyntaxKind::LIBRARY_KW).is_some() {
+            ContractKind::Library
+        } else {
+            ContractKind::Contract
+        }
+    }
+
+    /// Whether the contract carries the `abstract` modifier (`abstract contract …`).
+    pub fn is_abstract(&self) -> bool {
+        support::token(self.syntax(), SyntaxKind::ABSTRACT_KW).is_some()
+    }
+
+    /// The brace-delimited body, if present (a direct `CONTRACT_BODY` child).
+    pub fn body(&self) -> Option<ContractBody> {
+        support::child(self.syntax())
+    }
+
+    /// The `is A, B(args)` base specifiers (direct `INHERITANCE_SPECIFIER` children).
+    pub fn inheritance_specifiers(&self) -> impl Iterator<Item = InheritanceSpecifier> {
+        support::children(self.syntax())
+    }
+
+    /// Collect all body members of a given typed kind. A contract has at most one
+    /// `CONTRACT_BODY`; returning an owned `Vec` keeps the signature borrow-free and
+    /// sidesteps `Option`-of-iterator lifetime gymnastics (allocation is negligible —
+    /// outline materializes these anyway).
+    fn members<N: AstNode>(&self) -> Vec<N> {
+        match self.body() {
+            Some(body) => support::children(body.syntax()).collect(),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn functions(&self) -> Vec<FunctionDef> {
+        self.members()
+    }
+    pub fn state_vars(&self) -> Vec<StateVarDef> {
+        self.members()
+    }
+    pub fn structs(&self) -> Vec<StructDef> {
+        self.members()
+    }
+    pub fn enums(&self) -> Vec<EnumDef> {
+        self.members()
+    }
+    pub fn events(&self) -> Vec<EventDef> {
+        self.members()
+    }
+    pub fn errors(&self) -> Vec<ErrorDef> {
+        self.members()
+    }
+    pub fn modifiers(&self) -> Vec<ModifierDef> {
+        self.members()
+    }
+    pub fn constructors(&self) -> Vec<ConstructorDef> {
+        self.members()
+    }
+    pub fn user_defined_value_types(&self) -> Vec<UserDefinedValueType> {
+        self.members()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +301,38 @@ mod tests {
         );
         // the enum discriminates the contract variant
         assert!(matches!(file.items().nth(1), Some(Item::Contract(_))));
+    }
+
+    #[test]
+    fn reads_contract_header_and_member_counts() {
+        let src = "abstract contract C is A, B {\n  \
+            uint x;\n  \
+            function f() public {}\n  \
+            function g() public {}\n  \
+            struct P { uint a; }\n\
+        }";
+        let p = parse(src);
+        let file = SourceFile::cast(p.syntax()).unwrap();
+        let c = file
+            .items()
+            .find_map(|it| match it {
+                Item::Contract(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(c.name().and_then(|n| n.text()).as_deref(), Some("C"));
+        assert!(matches!(c.kind(), ContractKind::Contract));
+        assert!(c.is_abstract());
+        assert_eq!(c.inheritance_specifiers().count(), 2);
+        assert!(c.body().is_some());
+        assert_eq!(c.functions().len(), 2);
+        assert_eq!(c.state_vars().len(), 1);
+        assert_eq!(c.structs().len(), 1);
+        assert_eq!(c.enums().len(), 0);
+        assert_eq!(c.events().len(), 0);
+        assert_eq!(c.errors().len(), 0);
+        assert_eq!(c.modifiers().len(), 0);
+        assert_eq!(c.constructors().len(), 0);
+        assert_eq!(c.user_defined_value_types().len(), 0);
     }
 }
