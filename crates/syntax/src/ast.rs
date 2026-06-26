@@ -263,6 +263,195 @@ impl ContractDef {
     }
 }
 
+// ---- types -------------------------------------------------------------------
+
+ast_node!(PathType, PATH_TYPE);
+ast_node!(MappingType, MAPPING_TYPE);
+ast_node!(ArrayType, ARRAY_TYPE);
+ast_node!(FunctionType, FUNCTION_TYPE);
+
+// A type name node, as built by `grammar.rs::type_name`. Deep navigation (mapping
+// key/value, array element/size, function-type params) is deferred to M2; outline
+// renders a type via `self.syntax().text()`.
+ast_enum!(Type {
+    Path(PathType) = PATH_TYPE,
+    Mapping(MappingType) = MAPPING_TYPE,
+    Array(ArrayType) = ARRAY_TYPE,
+    Function(FunctionType) = FUNCTION_TYPE,
+});
+
+// ---- params, fields, variants, blocks ----------------------------------------
+
+ast_node!(ParamList, PARAM_LIST);
+ast_node!(Param, PARAM);
+ast_node!(StructField, STRUCT_FIELD);
+ast_node!(EnumVariant, ENUM_VARIANT);
+ast_node!(Block, BLOCK);
+
+impl ParamList {
+    /// The parameters, in order (direct `PARAM` children).
+    pub fn params(&self) -> impl Iterator<Item = Param> {
+        support::children(self.syntax())
+    }
+}
+
+impl Param {
+    /// The parameter's type (the leading `type_name` ⇒ a direct `Type` child).
+    pub fn ty(&self) -> Option<Type> {
+        support::child(self.syntax())
+    }
+    /// The parameter's bound name, if any. Soft modifiers like `indexed` are bumped
+    /// as bare `IDENT` tokens (not `NAME` nodes) by `grammar.rs::param`, so the only
+    /// `NAME` child is the real parameter name.
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+}
+
+impl StructField {
+    pub fn ty(&self) -> Option<Type> {
+        support::child(self.syntax())
+    }
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+}
+
+impl EnumVariant {
+    /// The variant's name (`grammar.rs::enum_def` wraps a single `NAME` in each
+    /// `ENUM_VARIANT`).
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+}
+
+// ---- member detail accessors -------------------------------------------------
+
+impl FunctionDef {
+    /// The function name. `None` for `fallback`/`receive` (grammar emits no `NAME`).
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    /// The parameter list. Normally the **first** `PARAM_LIST` child. But on the
+    /// error-recovery path where the parameter `(` is missing (`function f returns
+    /// (uint) {}`, a common mid-edit state), the lone `PARAM_LIST` belongs to
+    /// `returns`, not the params — so we use the `RETURNS_KW` token to disambiguate:
+    /// with `returns` present and only one list, the params are absent (`None`).
+    pub fn param_list(&self) -> Option<ParamList> {
+        let mut lists = support::children::<ParamList>(self.syntax());
+        let first = lists.next()?;
+        let has_returns = support::token(self.syntax(), SyntaxKind::RETURNS_KW).is_some();
+        if has_returns && lists.next().is_none() {
+            None // the single list is the returns list; params are missing
+        } else {
+            Some(first)
+        }
+    }
+    /// The `returns (...)` list, if present. Gated on the `RETURNS_KW` token: with
+    /// two `PARAM_LIST`s the returns list is the second; with one (params `(`
+    /// missing), the lone list IS the returns list.
+    pub fn return_param_list(&self) -> Option<ParamList> {
+        support::token(self.syntax(), SyntaxKind::RETURNS_KW)?; // no `returns` ⇒ no list
+        let mut lists = support::children::<ParamList>(self.syntax());
+        match (lists.next(), lists.next()) {
+            (Some(_params), Some(ret)) => Some(ret),
+            (Some(only), None) => Some(only),
+            _ => None,
+        }
+    }
+    /// The body block, if the function is defined (vs. a `;`-terminated declaration).
+    pub fn body(&self) -> Option<Block> {
+        support::child(self.syntax())
+    }
+}
+
+impl ModifierDef {
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(self.syntax())
+    }
+    pub fn body(&self) -> Option<Block> {
+        support::child(self.syntax())
+    }
+}
+
+impl ConstructorDef {
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(self.syntax())
+    }
+    pub fn body(&self) -> Option<Block> {
+        support::child(self.syntax())
+    }
+}
+
+impl StateVarDef {
+    /// The declared type — the leading `type_name`, a direct `Type` child (the
+    /// initializer expression, if any, is a different child kind and is not a `Type`).
+    pub fn ty(&self) -> Option<Type> {
+        support::child(self.syntax())
+    }
+    /// The variable's name (a direct `NAME` child, after the type and modifiers).
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+}
+
+impl StructDef {
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    pub fn fields(&self) -> impl Iterator<Item = StructField> {
+        support::children(self.syntax())
+    }
+}
+
+impl EnumDef {
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    pub fn variants(&self) -> impl Iterator<Item = EnumVariant> {
+        support::children(self.syntax())
+    }
+}
+
+impl EventDef {
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(self.syntax())
+    }
+}
+
+impl ErrorDef {
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    pub fn param_list(&self) -> Option<ParamList> {
+        support::child(self.syntax())
+    }
+}
+
+impl UserDefinedValueType {
+    pub fn name(&self) -> Option<Name> {
+        support::child(self.syntax())
+    }
+    /// The underlying value type (after `is`); a direct `Type` child.
+    pub fn ty(&self) -> Option<Type> {
+        support::child(self.syntax())
+    }
+}
+
+impl InheritanceSpecifier {
+    /// The base contract's path (`grammar.rs::inheritance_specifier` emits a
+    /// `PATH_TYPE` for the name; any `(args)` is a separate `ARG_LIST` child).
+    pub fn path_type(&self) -> Option<PathType> {
+        support::child(self.syntax())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,5 +523,140 @@ mod tests {
         assert_eq!(c.modifiers().len(), 0);
         assert_eq!(c.constructors().len(), 0);
         assert_eq!(c.user_defined_value_types().len(), 0);
+    }
+
+    #[test]
+    fn reads_member_details() {
+        let src = "contract C {\n  \
+            mapping(address => uint256) public balances;\n  \
+            uint256 constant FEE = 1;\n  \
+            struct Account { uint256 balance; bool frozen; }\n  \
+            enum Status { Open, Closed }\n  \
+            event Deposit(address indexed who, uint256 amount);\n  \
+            error Bad(uint256 x);\n  \
+            type Price is uint128;\n  \
+            modifier m(uint256 v) { _; }\n  \
+            constructor(uint256 a) {}\n  \
+            function f(uint256 p, bool q) public returns (uint256) {}\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let file = SourceFile::cast(p.syntax()).unwrap();
+        let c = file
+            .items()
+            .find_map(|it| match it {
+                Item::Contract(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+
+        // state vars: names in order, and the first var's type is a mapping.
+        let svs = c.state_vars();
+        let sv_names: Vec<String> = svs
+            .iter()
+            .filter_map(|v| v.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(sv_names, vec!["balances".to_string(), "FEE".to_string()]);
+        assert!(matches!(svs[0].ty(), Some(Type::Mapping(_))));
+
+        // function: name, parameter names, a returns list, and a body block.
+        let fns = c.functions();
+        let f = &fns[0];
+        assert_eq!(f.name().and_then(|n| n.text()).as_deref(), Some("f"));
+        let params: Vec<String> = f
+            .param_list()
+            .unwrap()
+            .params()
+            .filter_map(|prm| prm.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(params, vec!["p".to_string(), "q".to_string()]);
+        assert!(f.return_param_list().is_some());
+        assert!(f.body().is_some());
+        assert!(matches!(
+            f.param_list().unwrap().params().next().unwrap().ty(),
+            Some(Type::Path(_))
+        ));
+
+        // struct fields, enum variants.
+        let structs = c.structs();
+        let fields: Vec<String> = structs[0]
+            .fields()
+            .filter_map(|fl| fl.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(fields, vec!["balance".to_string(), "frozen".to_string()]);
+        let enums = c.enums();
+        let variants: Vec<String> = enums[0]
+            .variants()
+            .filter_map(|v| v.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(variants, vec!["Open".to_string(), "Closed".to_string()]);
+
+        // event params — `indexed` is a soft modifier, so the bound name is `who`.
+        let events = c.events();
+        let ev_params: Vec<String> = events[0]
+            .param_list()
+            .unwrap()
+            .params()
+            .filter_map(|prm| prm.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(ev_params, vec!["who".to_string(), "amount".to_string()]);
+
+        // error param.
+        let errors = c.errors();
+        assert_eq!(
+            errors[0].name().and_then(|n| n.text()).as_deref(),
+            Some("Bad")
+        );
+        assert_eq!(errors[0].param_list().unwrap().params().count(), 1);
+
+        // UDVT: name + underlying type.
+        let udvts = c.user_defined_value_types();
+        assert_eq!(
+            udvts[0].name().and_then(|n| n.text()).as_deref(),
+            Some("Price")
+        );
+        assert!(matches!(udvts[0].ty(), Some(Type::Path(_))));
+
+        // modifier + constructor.
+        let mods = c.modifiers();
+        assert_eq!(mods[0].name().and_then(|n| n.text()).as_deref(), Some("m"));
+        assert!(mods[0].param_list().is_some());
+        assert!(mods[0].body().is_some());
+        let ctors = c.constructors();
+        assert!(ctors[0].param_list().is_some());
+        assert!(ctors[0].body().is_some());
+    }
+
+    #[test]
+    fn function_param_vs_returns_disambiguation() {
+        // Well-formed: params present, returns present.
+        let f = first_function("contract C { function g() public returns (uint) {} }");
+        assert!(f.param_list().is_some());
+        assert!(f.return_param_list().is_some());
+
+        // No returns: param_list is the only list; return_param_list is None.
+        let f = first_function("contract C { function h(uint a) public {} }");
+        assert!(f.param_list().is_some());
+        assert_eq!(f.param_list().unwrap().params().count(), 1);
+        assert!(f.return_param_list().is_none());
+
+        // Error recovery — the parameter `(` is missing (mid-edit). The lone
+        // PARAM_LIST belongs to `returns`, so param_list() must be None (not the
+        // returns list) and return_param_list() must be the returns list.
+        let f = first_function("contract C { function k returns (uint) {} }");
+        assert!(f.param_list().is_none());
+        assert!(f.return_param_list().is_some());
+    }
+
+    fn first_function(src: &str) -> FunctionDef {
+        let p = parse(src);
+        SourceFile::cast(p.syntax())
+            .unwrap()
+            .items()
+            .find_map(|it| match it {
+                Item::Contract(c) => c.functions().into_iter().next(),
+                _ => None,
+            })
+            .unwrap()
     }
 }
