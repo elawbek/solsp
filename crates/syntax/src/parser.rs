@@ -102,6 +102,37 @@ impl<'t> Parser<'t> {
     pub(crate) fn finish(self) -> Vec<Event> {
         self.events
     }
+
+    /// Save the current position for speculative parsing. Pair with `rewind`.
+    pub(crate) fn checkpoint(&self) -> Checkpoint {
+        Checkpoint {
+            pos: self.pos,
+            events_len: self.events.len(),
+        }
+    }
+
+    /// Undo everything parsed since `cp`: restore the token cursor and truncate
+    /// the event buffer back to its saved length.
+    ///
+    /// Safety of truncation: the only events removed are those created strictly
+    /// after the checkpoint. We use this exclusively for *bounded* speculation in
+    /// `is_var_decl_start`/`is_tuple_var_decl`, where the speculative region opens
+    /// and completes **all** of its own markers and no `precede` reaches across
+    /// the checkpoint boundary. So no surviving event refers (via a
+    /// `forward_parent` offset) into the truncated range, and no open marker
+    /// straddles it. Truncating to `events_len` therefore restores an exact
+    /// pre-speculation event sequence.
+    pub(crate) fn rewind(&mut self, cp: Checkpoint) {
+        self.pos = cp.pos;
+        self.events.truncate(cp.events_len);
+    }
+}
+
+/// A saved parser position for bounded speculation. Records the token cursor and
+/// the event-buffer length so a failed speculative parse can be fully undone.
+pub(crate) struct Checkpoint {
+    pos: usize,
+    events_len: usize,
 }
 
 /// A pending open node. Complete it with a kind, or abandon it.

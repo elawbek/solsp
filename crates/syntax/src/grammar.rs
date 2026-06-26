@@ -1,9 +1,8 @@
-//! Solidity declaration, type & expression grammar. The parser emits events; this
-//! module is the recursive-descent grammar that drives it. Expressions use a
-//! precedence-climbing (Pratt) core (Plan 4); initializers, array sizes and
-//! call/inheritance/modifier argument lists are real expression trees. Statements
-//! and the inline-assembly interior land in later tasks/plans — here,
-//! function/modifier bodies are still a single `BLOCK` whose interior is span-skipped.
+//! Solidity declaration, type, expression & statement grammar. The parser emits
+//! events; this module is the recursive-descent grammar that drives it.
+//! Expressions use a precedence-climbing (Pratt) core; statements are a flat
+//! dispatch on the current token (Plan 4). The inline-assembly (Yul) interior is
+//! the remaining span-skip, parsed in a later plan.
 
 use crate::parser::{CompletedMarker, Parser};
 use crate::SyntaxKind::{self, *};
@@ -226,22 +225,13 @@ fn modifier_invocation(p: &mut Parser) {
     m.complete(p, MODIFIER_INVOCATION);
 }
 
-/// A `{ … }` body. Statements land in a later plan, so the interior is span-
-/// skipped to the matching brace; the node is still a real `BLOCK`.
+/// A `{ … }` statement block: zero or more statements between the braces.
+/// Each `stmt` consumes ≥1 token, so the loop always makes progress.
 fn block(p: &mut Parser) {
     let m = p.start();
     p.bump(L_BRACE);
-    let mut depth = 1usize;
-    while depth > 0 && !p.at(EOF) {
-        match p.current() {
-            L_BRACE => depth += 1,
-            R_BRACE => depth -= 1,
-            _ => {}
-        }
-        if depth == 0 {
-            break;
-        }
-        p.bump_any();
+    while !p.at(R_BRACE) && !p.at(EOF) {
+        stmt(p); // each `stmt` consumes ≥1 token, so this loop always progresses
     }
     p.expect(R_BRACE);
     m.complete(p, BLOCK);
@@ -758,6 +748,181 @@ fn paren_or_tuple_expr(p: &mut Parser) -> CompletedMarker {
         PAREN_EXPR
     };
     m.complete(p, kind)
+}
+
+// ---- statements --------------------------------------------------------------
+
+/// Parse one statement. Dispatches on `current()`. CRITICAL: this must consume
+/// ≥1 token on every input (including recovery) so the `block` loop can't spin —
+/// the `_ =>` arm routes to `simple_statement`, which either parses a real
+/// statement (consuming the trailing `;`) or recovers via `err_and_bump`. The
+/// modifier placeholder `_;` flows through `_ =>` → `simple_statement` →
+/// `expr_statement` (it's a PATH_EXPR `_` followed by `;`).
+///
+/// Control-flow keywords (`if`/`for`/`while`/`do`) are added to this dispatch in
+/// Task 5, and the Solidity-specific statements (`emit`/`revert`/`try`/
+/// `unchecked`/`assembly`) in Task 6; until then they fall through to
+/// `simple_statement` and parse as expression statements.
+fn stmt(p: &mut Parser) {
+    match p.current() {
+        L_BRACE => block(p),
+        RETURN_KW => return_stmt(p),
+        BREAK_KW => break_stmt(p),
+        CONTINUE_KW => continue_stmt(p),
+        _ => simple_statement(p),
+    }
+}
+
+/// `'return' expr? ';'`
+fn return_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(RETURN_KW);
+    if !p.at(SEMICOLON) && !p.at(R_BRACE) && !p.at(EOF) {
+        expr(p);
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, RETURN_STMT);
+}
+
+/// `'break' ';'`
+fn break_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(BREAK_KW);
+    p.expect(SEMICOLON);
+    m.complete(p, BREAK_STMT);
+}
+
+/// `'continue' ';'`
+fn continue_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(CONTINUE_KW);
+    p.expect(SEMICOLON);
+    m.complete(p, CONTINUE_STMT);
+}
+
+/// A simple statement: a local variable declaration or an expression statement,
+/// each consuming through the trailing `;`.
+fn simple_statement(p: &mut Parser) {
+    if is_var_decl_start(p) || is_tuple_var_decl(p) {
+        var_decl_statement(p);
+    } else {
+        expr_statement(p);
+    }
+}
+
+/// `expr ';'` ⇒ EXPR_STMT. On a token that can't start an expression, recover by
+/// bumping one token so the `block` loop progresses (and we never emit an empty
+/// EXPR_STMT that would re-loop forever).
+fn expr_statement(p: &mut Parser) {
+    let m = p.start();
+    if expr_bp(p, 0).is_none() {
+        // Nothing parseable here: consume one token as an error and bail, still
+        // completing an EXPR_STMT so the tree is well-formed and lossless.
+        p.err_and_bump("expected a statement");
+        m.complete(p, EXPR_STMT);
+        return;
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, EXPR_STMT);
+}
+
+/// Speculative predicate: does a single-variable declaration start here? We
+/// tentatively parse a `type_name` and check that an IDENT (the variable name)
+/// or a data-location keyword follows; then rewind. Never consumes on return.
+fn is_var_decl_start(p: &mut Parser) -> bool {
+    let cp = p.checkpoint();
+    type_name(p);
+    let looks_like_decl =
+        p.at(IDENT) || matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW);
+    p.rewind(cp);
+    looks_like_decl
+}
+
+/// Speculative predicate for the leading-`(` tuple form `(uint a, bool b) = …`.
+/// We only treat a `(` as a tuple var-decl when at least one element parses as
+/// `type_name (loc)? IDENT` and the closing `)` is immediately followed by `=`.
+/// Otherwise it is an expression statement (e.g. a tuple-assignment `(a, b) =`).
+fn is_tuple_var_decl(p: &mut Parser) -> bool {
+    if !p.at(L_PAREN) {
+        return false;
+    }
+    let cp = p.checkpoint();
+    let mut saw_typed_element = false;
+    p.bump(L_PAREN);
+    loop {
+        if p.at(R_PAREN) || p.at(EOF) {
+            break;
+        }
+        if p.at(COMMA) {
+            p.bump(COMMA); // empty tuple slot
+            continue;
+        }
+        // Try to parse `type_name (loc)? IDENT`. A bare expression element (e.g.
+        // `a` in `(a, b)`) will parse `a` as a path type with no trailing IDENT.
+        type_name(p);
+        if matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW) {
+            p.bump_any();
+        }
+        if p.at(IDENT) {
+            saw_typed_element = true;
+            p.bump(IDENT);
+        }
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    let closes_then_assigns = p.at(R_PAREN) && p.nth(1) == EQ;
+    p.rewind(cp);
+    saw_typed_element && closes_then_assigns
+}
+
+/// `var_decl ('=' expr)? ';'` (single) or
+/// `'(' var_decl? (',' var_decl?)* ')' '=' expr ';'` (tuple) ⇒ VAR_DECL_STMT.
+fn var_decl_statement(p: &mut Parser) {
+    let m = p.start();
+    if p.at(L_PAREN) {
+        // tuple form
+        p.bump(L_PAREN);
+        loop {
+            if p.at(R_PAREN) || p.at(EOF) {
+                break;
+            }
+            if p.at(COMMA) {
+                p.bump(COMMA); // empty slot
+                continue;
+            }
+            var_decl(p);
+            if !p.eat(COMMA) {
+                break;
+            }
+        }
+        p.expect(R_PAREN);
+        p.expect(EQ);
+        expr(p);
+    } else {
+        // single form
+        var_decl(p);
+        if p.eat(EQ) {
+            expr(p);
+        }
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, VAR_DECL_STMT);
+}
+
+/// `type_name (data_location)? NAME` ⇒ VAR_DECL (one declared variable).
+fn var_decl(p: &mut Parser) {
+    let m = p.start();
+    type_name(p);
+    if matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW) {
+        p.bump_any();
+    }
+    if p.at(IDENT) {
+        name(p);
+    } else {
+        p.error("expected a variable name");
+    }
+    m.complete(p, VAR_DECL);
 }
 
 // ---- types -------------------------------------------------------------------

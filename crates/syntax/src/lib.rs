@@ -426,4 +426,53 @@ contract Vault is Ownable {\n\
         assert!(dump.contains("INHERITANCE_SPECIFIER@"));
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_function_body_with_locals_and_return() {
+        let src = "contract C {\n  \
+            function f(uint a) public returns (uint) {\n    \
+                uint x = a + 1;\n    \
+                uint[] memory ys;\n    \
+                (uint p, bool q) = g();\n    \
+                x = x * 2;\n    \
+                x[0] = 1;\n    \
+                a.b.c(x);\n    \
+                return x;\n  \
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in [
+            "VAR_DECL_STMT@",
+            "VAR_DECL@",
+            "EXPR_STMT@",
+            "RETURN_STMT@",
+            "ASSIGN_EXPR@",
+            "CALL_EXPR@",
+            "INDEX_EXPR@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
+    fn parses_break_continue_and_underscore() {
+        // `_;` in a modifier body parses as an ordinary EXPR_STMT (PATH_EXPR `_`);
+        // there is no dedicated PLACEHOLDER_STMT.
+        let src = "contract C {\n  \
+            modifier m() { _; }\n  \
+            function f() public { break; continue; return; }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("BREAK_STMT@"));
+        assert!(dump.contains("CONTINUE_STMT@"));
+        assert!(dump.contains("RETURN_STMT@"));
+        assert!(dump.contains("EXPR_STMT@")); // the `_;`
+        assert!(dump.contains("PATH_EXPR@")); // the `_`
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }
