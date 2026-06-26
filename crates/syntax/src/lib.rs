@@ -736,4 +736,90 @@ contract Vault is Ownable {\n\
         }
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_realistic_assembly_losslessly() {
+        // A representative inline-assembly block: dialect flag, function defs with
+        // returns, control flow, switch, builtins (incl. the `return`/`revert`
+        // keyword-collision builtins), dotted slot paths, calls.
+        let src = "contract C {\n\
+    function f(uint256 n) public pure returns (uint256 out) {\n\
+        assembly (\"memory-safe\") {\n\
+            function max(a, b) -> r {\n\
+                r := a\n\
+                if lt(a, b) { r := b }\n\
+            }\n\
+            let ptr := mload(0x40)\n\
+            let acc := 0\n\
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } {\n\
+                acc := add(acc, mul(i, 2))\n\
+                switch mod(i, 2)\n\
+                case 0 { mstore(ptr, acc) }\n\
+                default { sstore(i, acc) }\n\
+            }\n\
+            out.slot := max(acc, n)\n\
+            if iszero(acc) { revert(0, 0) }\n\
+            return(ptr, 0x20)\n\
+        }\n\
+    }\n\
+}\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        assert_eq!(p.syntax().text().to_string(), src); // lossless
+        let dump = debug_tree(src);
+        for kind in [
+            "ASSEMBLY_STMT@",
+            "YUL_BLOCK@",
+            "YUL_FUNCTION_DEF@",
+            "YUL_PARAM_LIST@",
+            "YUL_VAR_DECL@",
+            "YUL_ASSIGNMENT@",
+            "YUL_FUNCTION_CALL@",
+            "YUL_PATH@",
+            "YUL_LITERAL@",
+            "YUL_IF@",
+            "YUL_FOR@",
+            "YUL_SWITCH@",
+            "YUL_CASE@",
+            "YUL_DEFAULT@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+    }
+
+    #[test]
+    fn yul_bodies_are_total() {
+        // Adversarial Yul bodies must never panic and must round-trip losslessly.
+        // Errors are allowed (these are malformed); only totality + losslessness
+        // are asserted.
+        for body in [
+            "assembly { }",                      // empty block
+            "assembly {",                        // unterminated block
+            "assembly { let x }",                // let with no initializer (valid)
+            "assembly { let x := }",             // let with missing rhs
+            "assembly { x := }",                 // assignment with missing rhs
+            "assembly { x, y := f() }",          // multi-assignment
+            "assembly { x.slot := 1 }",          // dotted assignment target
+            "assembly { let x := add(1, 2 }",    // unterminated call
+            "assembly { mstore(0x40, ) }",       // missing argument
+            "assembly { if x }",                 // if missing body block
+            "assembly { for {} 1 {} }",          // for missing body block
+            "assembly { switch x }",             // switch with no case/default
+            "assembly { case 0 {} }",            // stray case (no switch)
+            "assembly { function f( }",          // unterminated param list
+            "assembly { function g() -> }",      // arrow with no return names
+            "assembly { 123 }",                  // bare literal statement (invalid)
+            "assembly { leave break continue }", // bare flow keywords
+            "assembly { return(0, 0x20) }",      // `return` builtin (keyword reuse)
+            "assembly { revert(0, 0) }",         // `revert` builtin (keyword reuse)
+        ] {
+            let src = format!("contract C {{ function f() public {{ {body} }} }}");
+            let p = parse(&src);
+            assert_eq!(
+                p.syntax().text().to_string(),
+                src,
+                "lossy on yul body: {body:?}"
+            );
+        }
+    }
 }
