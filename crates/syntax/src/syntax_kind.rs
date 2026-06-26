@@ -198,6 +198,24 @@ pub enum SyntaxKind {
     UNCHECKED_BLOCK,
     ASSEMBLY_STMT,
 
+    // -- Yul / inline assembly (Plan 5) --
+    YUL_BLOCK,
+    YUL_VAR_DECL,
+    YUL_ASSIGNMENT,
+    YUL_FUNCTION_CALL,
+    YUL_PATH,
+    YUL_LITERAL,
+    YUL_IF,
+    YUL_FOR,
+    YUL_SWITCH,
+    YUL_CASE,
+    YUL_DEFAULT,
+    YUL_FUNCTION_DEF,
+    YUL_PARAM_LIST,
+    YUL_LEAVE,
+    YUL_BREAK,
+    YUL_CONTINUE,
+
     // Keep last: marks the valid discriminant range for `from_u16`.
     #[doc(hidden)]
     __LAST,
@@ -366,6 +384,32 @@ mod tests {
             CATCH_CLAUSE,
             UNCHECKED_BLOCK,
             ASSEMBLY_STMT,
+        ] {
+            assert_eq!(SyntaxKind::from_u16(k.to_u16()), k);
+        }
+    }
+
+    #[test]
+    fn new_yul_node_kinds_exist_and_roundtrip() {
+        // Spot-check the Plan-5 Yul node kinds compile and round-trip through
+        // `from_u16`/`to_u16`.
+        for k in [
+            YUL_BLOCK,
+            YUL_VAR_DECL,
+            YUL_ASSIGNMENT,
+            YUL_FUNCTION_CALL,
+            YUL_PATH,
+            YUL_LITERAL,
+            YUL_IF,
+            YUL_FOR,
+            YUL_SWITCH,
+            YUL_CASE,
+            YUL_DEFAULT,
+            YUL_FUNCTION_DEF,
+            YUL_PARAM_LIST,
+            YUL_LEAVE,
+            YUL_BREAK,
+            YUL_CONTINUE,
         ] {
             assert_eq!(SyntaxKind::from_u16(k.to_u16()), k);
         }
