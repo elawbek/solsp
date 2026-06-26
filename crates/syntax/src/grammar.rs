@@ -1,8 +1,9 @@
-//! Solidity declaration & type grammar (Plan 3). The parser emits events; this
-//! module is the recursive-descent grammar that drives it. Statements, Pratt
-//! expressions and inline assembly are later plans — here, function/modifier
-//! bodies are a single `BLOCK` whose interior is span-skipped, and state-variable
-//! initializers are span-skipped to `;`.
+//! Solidity declaration, type & expression grammar. The parser emits events; this
+//! module is the recursive-descent grammar that drives it. Expressions use a
+//! precedence-climbing (Pratt) core (Plan 4); initializers, array sizes and
+//! call/inheritance/modifier argument lists are real expression trees. Statements
+//! and the inline-assembly interior land in later tasks/plans — here,
+//! function/modifier bodies are still a single `BLOCK` whose interior is span-skipped.
 
 use crate::parser::{CompletedMarker, Parser};
 use crate::SyntaxKind::{self, *};
@@ -94,7 +95,7 @@ fn contract(p: &mut Parser) {
 }
 
 /// `path_type ('(' <constructor args> ')')?` — a base in an `is` list. The args
-/// are expressions, span-skipped until a later plan.
+/// are a real ARG_LIST of expressions (Plan 4).
 fn inheritance_specifier(p: &mut Parser) {
     let m = p.start();
     if p.at(IDENT) {
@@ -106,7 +107,7 @@ fn inheritance_specifier(p: &mut Parser) {
         p.error("expected a base contract name");
     }
     if p.at(L_PAREN) {
-        skip_parens(p);
+        arg_list(p);
     }
     m.complete(p, INHERITANCE_SPECIFIER);
 }
@@ -220,7 +221,7 @@ fn modifier_invocation(p: &mut Parser) {
     let m = p.start();
     name_ref(p);
     if p.at(L_PAREN) {
-        skip_parens(p);
+        arg_list(p);
     }
     m.complete(p, MODIFIER_INVOCATION);
 }
@@ -481,15 +482,183 @@ fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<CompletedMarker> {
     Some(lhs)
 }
 
-/// Parse a unary-prefix-and-postfix operand: `prefix_op* primary postfix*`.
-/// Returns `None` if no primary can start at `current()` (the caller recovers);
-/// prefix and postfix handling come in Task 3 — for now `lhs` is just `primary`.
+/// Binding power above every binary level (level 13 ⇒ left bp 26). Unary prefix
+/// binds tighter than `**`, so prefix operands are parsed at this bound.
+const UNARY_BP: u8 = 27;
+
+/// `prefix_op* primary postfix*`. A prefix operator wraps a recursively-parsed
+/// operand (at unary binding power) in a PREFIX_EXPR; otherwise we parse a
+/// primary and then apply the postfix cluster. Returns `None` only when no
+/// prefix op is present AND no primary can start here.
 fn lhs(p: &mut Parser) -> Option<CompletedMarker> {
-    primary(p)
+    let cm = match p.current() {
+        BANG | TILDE | MINUS | PLUS | PLUS2 | MINUS2 | DELETE_KW => {
+            let m = p.start();
+            p.bump_any(); // the prefix operator
+                          // Operand binds at unary power (tighter than `**`). If the operand is
+                          // missing, record an error but still complete the PREFIX_EXPR.
+            if expr_bp(p, UNARY_BP).is_none() {
+                p.error("expected an operand after unary operator");
+            }
+            m.complete(p, PREFIX_EXPR)
+        }
+        _ => primary(p)?,
+    };
+    Some(postfix(p, cm))
+}
+
+/// Apply zero or more postfix operators to an already-parsed operand:
+/// call `(...)` / call-options `{...}(...)` / index `[...]` (with optional
+/// calldata slice) / member `.x` / postfix `++` `--`. Each wraps via `precede`,
+/// so they nest left-to-right. Loops until the next token is not a postfix.
+fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
+    loop {
+        cm = match p.current() {
+            L_PAREN => call_expr(p, cm),
+            L_BRACE => {
+                // call-options `{value: …}` must be followed by an arg list to be
+                // a call; bare `{` is not a postfix (it begins a block elsewhere).
+                if !is_call_options(p) {
+                    break;
+                }
+                let m = cm.precede(p);
+                call_options(p);
+                arg_list(p);
+                m.complete(p, CALL_EXPR)
+            }
+            L_BRACK => {
+                let m = cm.precede(p);
+                p.bump(L_BRACK);
+                index_or_slice(p);
+                p.expect(R_BRACK);
+                m.complete(p, INDEX_EXPR)
+            }
+            DOT => {
+                let m = cm.precede(p);
+                p.bump(DOT);
+                if p.at(IDENT) {
+                    name_ref(p);
+                } else {
+                    p.error("expected a member name after '.'");
+                }
+                m.complete(p, MEMBER_EXPR)
+            }
+            PLUS2 | MINUS2 => {
+                let m = cm.precede(p);
+                p.bump_any(); // `++` or `--`
+                m.complete(p, POSTFIX_EXPR)
+            }
+            _ => break,
+        };
+    }
+    cm
+}
+
+/// `'(' (expr (',' expr)*)? ')'` ⇒ CALL_EXPR wrapping an ARG_LIST or, for the
+/// `({a: 1, b: 2})` form, a NAMED_ARG_LIST.
+fn call_expr(p: &mut Parser, cm: CompletedMarker) -> CompletedMarker {
+    let m = cm.precede(p);
+    if is_named_args(p) {
+        named_arg_list(p);
+    } else {
+        arg_list(p);
+    }
+    m.complete(p, CALL_EXPR)
+}
+
+/// Lookahead: `(` immediately followed by `{` is the `({name: expr, …})` named-
+/// argument call form.
+fn is_named_args(p: &Parser) -> bool {
+    p.at(L_PAREN) && p.nth(1) == L_BRACE
+}
+
+/// Lookahead for call-options: `{ IDENT :` (an options block), vs a bare `{`.
+fn is_call_options(p: &Parser) -> bool {
+    p.at(L_BRACE) && p.nth(1) == IDENT && p.nth(2) == COLON
+}
+
+/// `'(' (expr (',' expr)*)? ')'` ⇒ ARG_LIST.
+fn arg_list(p: &mut Parser) {
+    let m = p.start();
+    p.expect(L_PAREN);
+    while !p.at(R_PAREN) && !p.at(EOF) {
+        if expr_bp(p, 0).is_none() {
+            p.err_and_bump("expected an argument expression");
+            continue;
+        }
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    p.expect(R_PAREN);
+    m.complete(p, ARG_LIST);
+}
+
+/// `'(' '{' (NAME ':' expr (',' …)*)? '}' ')'` ⇒ NAMED_ARG_LIST. Called only
+/// when `is_named_args` held, so we are positioned at `(`.
+fn named_arg_list(p: &mut Parser) {
+    let m = p.start();
+    p.bump(L_PAREN);
+    named_arg_fields(p);
+    p.expect(R_PAREN);
+    m.complete(p, NAMED_ARG_LIST);
+}
+
+/// `'{' (NAME ':' expr (',' …)*)? '}'` ⇒ CALL_OPTIONS (the `{value: …, gas: …}`
+/// block between a callee and its argument list).
+fn call_options(p: &mut Parser) {
+    let m = p.start();
+    named_arg_fields(p);
+    m.complete(p, CALL_OPTIONS);
+}
+
+/// Shared `'{' (NAME ':' expr (',' …)*)? '}'` body used by both NAMED_ARG_LIST
+/// and CALL_OPTIONS. Each name is a defining-position-free key; we model it as a
+/// NAME node (a label) followed by `:` and an expression.
+fn named_arg_fields(p: &mut Parser) {
+    p.expect(L_BRACE);
+    while !p.at(R_BRACE) && !p.at(EOF) {
+        if p.at(IDENT) {
+            name(p);
+            p.expect(COLON);
+            if expr_bp(p, 0).is_none() {
+                p.error("expected a value expression");
+            }
+        } else {
+            p.err_and_bump("expected a named argument");
+            continue;
+        }
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    p.expect(R_BRACE);
+}
+
+/// Index or calldata slice inside `[ … ]`: `expr`, `expr : expr?`, `: expr?`, or
+/// empty. The caller has already bumped `[` and will expect `]`.
+fn index_or_slice(p: &mut Parser) {
+    if p.at(R_BRACK) {
+        return; // empty `[]` (rare, but keep it lossless rather than erroring)
+    }
+    if p.at(COLON) {
+        // slice with no start: `[:end]` or `[:]`
+        p.bump(COLON);
+        if !p.at(R_BRACK) {
+            expr(p);
+        }
+        return;
+    }
+    expr(p);
+    if p.eat(COLON) {
+        // slice `[start:end]` / `[start:]`
+        if !p.at(R_BRACK) {
+            expr(p);
+        }
+    }
 }
 
 /// Parse a primary expression. Returns `None` when `current()` cannot start one.
-/// Task 3 extends this with `new`, `type(...)`, prefix ops and array literals.
 fn primary(p: &mut Parser) -> Option<CompletedMarker> {
     let cm = match p.current() {
         NUMBER | STRING | TRUE_KW | FALSE_KW => {
@@ -502,10 +671,52 @@ fn primary(p: &mut Parser) -> Option<CompletedMarker> {
             name_ref(p);
             m.complete(p, PATH_EXPR)
         }
+        NEW_KW => {
+            // `new T` — the constructed type; the following `(args)` is attached
+            // by the postfix loop as a CALL_EXPR.
+            let m = p.start();
+            p.bump(NEW_KW);
+            type_name(p);
+            m.complete(p, NEW_EXPR)
+        }
+        TYPE_KW => {
+            // `type(T)` meta-expression; `.max`/`.min` attach via postfix MEMBER.
+            let m = p.start();
+            p.bump(TYPE_KW);
+            p.expect(L_PAREN);
+            type_name(p);
+            p.expect(R_PAREN);
+            m.complete(p, TYPE_EXPR)
+        }
+        PAYABLE_KW => {
+            // `payable(x)` — a keyword-leaf path-shaped expr; the postfix `(`
+            // makes it a CALL_EXPR. (No NAME_REF child — it's a leaf keyword.)
+            let m = p.start();
+            p.bump(PAYABLE_KW);
+            m.complete(p, PATH_EXPR)
+        }
         L_PAREN => paren_or_tuple_expr(p),
+        L_BRACK => array_expr(p),
         _ => return None,
     };
     Some(cm)
+}
+
+/// `'[' (expr (',' expr)*)? ']'` ⇒ ARRAY_EXPR (an inline array literal).
+fn array_expr(p: &mut Parser) -> CompletedMarker {
+    let m = p.start();
+    p.bump(L_BRACK);
+    while !p.at(R_BRACK) && !p.at(EOF) {
+        if expr_bp(p, 0).is_none() {
+            p.err_and_bump("expected an array element");
+            continue;
+        }
+        if !p.eat(COMMA) {
+            break;
+        }
+    }
+    p.expect(R_BRACK);
+    m.complete(p, ARRAY_EXPR)
 }
 
 /// `'(' expr ')'` ⇒ PAREN_EXPR; anything with a comma or a hole ⇒ TUPLE_EXPR.
@@ -563,9 +774,8 @@ fn type_name(p: &mut Parser) {
     while p.at(L_BRACK) {
         let wrap = cm.precede(p);
         p.bump(L_BRACK);
-        // array size is a constant expression — skipped until a later plan.
-        while !p.at(R_BRACK) && !p.at(EOF) {
-            p.bump_any();
+        if !p.at(R_BRACK) {
+            expr(p); // array size is a constant expression (optional: `T[]` vs `T[N]`)
         }
         p.expect(R_BRACK);
         cm = wrap.complete(p, ARRAY_TYPE);
@@ -697,8 +907,9 @@ fn name_ref(p: &mut Parser) {
 
 // ---- shared skips ------------------------------------------------------------
 
-/// Balanced `'(' … ')'` whose interior is span-skipped (it holds expressions,
-/// parsed in a later plan).
+/// Balanced `'(' … ')'` whose interior is span-skipped. Its one remaining caller
+/// is `override_spec` — a list of contract/type paths (not expressions),
+/// structured in M2.
 fn skip_parens(p: &mut Parser) {
     p.bump(L_PAREN);
     let mut depth = 1usize;

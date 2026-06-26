@@ -374,4 +374,56 @@ contract Vault is Ownable {\n\
         assert!(dump.contains("TUPLE_EXPR@"));
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_rich_expression() {
+        // Calls (positional + named + options), index + slice, member access,
+        // prefix/postfix, ternary, new, type(), array literal — all inside one
+        // state-var initializer so we don't need statements yet.
+        let src = "contract C { uint x = \
+            a.b.c{value: 1, gas: g}(p, q) \
+            + f({to: x, amount: y}) \
+            + arr[0] + data[1:n] \
+            + (cond ? -m++ : ~k) \
+            + uint8(z) + new Token(1) + type(uint).max \
+            + [1, 2, 3][i]; }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in [
+            "CALL_EXPR@",
+            "ARG_LIST@",
+            "NAMED_ARG_LIST@",
+            "CALL_OPTIONS@",
+            "INDEX_EXPR@",
+            "MEMBER_EXPR@",
+            "PREFIX_EXPR@",
+            "POSTFIX_EXPR@",
+            "TERNARY_EXPR@",
+            "NEW_EXPR@",
+            "TYPE_EXPR@",
+            "ARRAY_EXPR@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
+
+    #[test]
+    fn parses_array_size_and_real_call_args() {
+        // Array size is now a real expression; modifier/inheritance args are a
+        // real ARG_LIST, not a span-skip.
+        let src = "contract C is Base(1 + 2) {\n  \
+            uint256[2 * N] grid;\n  \
+            function f() public mod(a, b) {}\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("ARRAY_TYPE@"));
+        assert!(dump.contains("ARG_LIST@")); // both Base(...) and mod(...)
+        assert!(dump.contains("MODIFIER_INVOCATION@"));
+        assert!(dump.contains("INHERITANCE_SPECIFIER@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }
