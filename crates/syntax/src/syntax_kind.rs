@@ -160,6 +160,44 @@ pub enum SyntaxKind {
     MODIFIER_INVOCATION,
     BLOCK,
 
+    // -- expressions (Plan 4) --
+    LITERAL_EXPR,
+    PATH_EXPR,
+    PAREN_EXPR,
+    TUPLE_EXPR,
+    ARRAY_EXPR,
+    PREFIX_EXPR,
+    POSTFIX_EXPR,
+    BIN_EXPR,
+    ASSIGN_EXPR,
+    TERNARY_EXPR,
+    CALL_EXPR,
+    INDEX_EXPR,
+    MEMBER_EXPR,
+    NEW_EXPR,
+    TYPE_EXPR,
+    ARG_LIST,
+    NAMED_ARG_LIST,
+    CALL_OPTIONS,
+
+    // -- statements (Plan 4) --
+    EXPR_STMT,
+    VAR_DECL_STMT,
+    VAR_DECL,
+    IF_STMT,
+    FOR_STMT,
+    WHILE_STMT,
+    DO_WHILE_STMT,
+    RETURN_STMT,
+    BREAK_STMT,
+    CONTINUE_STMT,
+    EMIT_STMT,
+    REVERT_STMT,
+    TRY_STMT,
+    CATCH_CLAUSE,
+    UNCHECKED_BLOCK,
+    ASSEMBLY_STMT,
+
     // Keep last: marks the valid discriminant range for `from_u16`.
     #[doc(hidden)]
     __LAST,
@@ -284,6 +322,50 @@ mod tests {
             USER_DEFINED_VALUE_TYPE,
             INHERITANCE_SPECIFIER,
             MODIFIER_INVOCATION,
+        ] {
+            assert_eq!(SyntaxKind::from_u16(k.to_u16()), k);
+        }
+    }
+
+    #[test]
+    fn new_expr_stmt_node_kinds_exist_and_roundtrip() {
+        // Spot-check the Plan-4 expression & statement node kinds compile and
+        // round-trip through `from_u16`/`to_u16`.
+        for k in [
+            LITERAL_EXPR,
+            PATH_EXPR,
+            PAREN_EXPR,
+            TUPLE_EXPR,
+            ARRAY_EXPR,
+            PREFIX_EXPR,
+            POSTFIX_EXPR,
+            BIN_EXPR,
+            ASSIGN_EXPR,
+            TERNARY_EXPR,
+            CALL_EXPR,
+            INDEX_EXPR,
+            MEMBER_EXPR,
+            NEW_EXPR,
+            TYPE_EXPR,
+            ARG_LIST,
+            NAMED_ARG_LIST,
+            CALL_OPTIONS,
+            EXPR_STMT,
+            VAR_DECL_STMT,
+            VAR_DECL,
+            IF_STMT,
+            FOR_STMT,
+            WHILE_STMT,
+            DO_WHILE_STMT,
+            RETURN_STMT,
+            BREAK_STMT,
+            CONTINUE_STMT,
+            EMIT_STMT,
+            REVERT_STMT,
+            TRY_STMT,
+            CATCH_CLAUSE,
+            UNCHECKED_BLOCK,
+            ASSEMBLY_STMT,
         ] {
             assert_eq!(SyntaxKind::from_u16(k.to_u16()), k);
         }
