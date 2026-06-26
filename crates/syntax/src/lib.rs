@@ -497,4 +497,34 @@ contract Vault is Ownable {\n\
         }
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_solidity_statements() {
+        let src = "contract C {\n  \
+            function f() public {\n    \
+                emit Transfer(a, b, 1);\n    \
+                revert Unauthorized(msg.sender);\n    \
+                revert(\"nope\");\n    \
+                unchecked { x = x + 1; }\n    \
+                try g(x) returns (uint v) { y = v; }\n    \
+                catch Error(string memory reason) { z = 0; }\n    \
+                catch { z = 1; }\n    \
+                assembly { let p := mload(0x40) }\n  \
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        for kind in [
+            "EMIT_STMT@",
+            "REVERT_STMT@",
+            "UNCHECKED_BLOCK@",
+            "TRY_STMT@",
+            "CATCH_CLAUSE@",
+            "ASSEMBLY_STMT@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }

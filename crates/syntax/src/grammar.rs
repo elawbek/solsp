@@ -758,10 +758,6 @@ fn paren_or_tuple_expr(p: &mut Parser) -> CompletedMarker {
 /// statement (consuming the trailing `;`) or recovers via `err_and_bump`. The
 /// modifier placeholder `_;` flows through `_ =>` → `simple_statement` →
 /// `expr_statement` (it's a PATH_EXPR `_` followed by `;`).
-///
-/// The Solidity-specific statements (`emit`/`revert`/`try`/`unchecked`/
-/// `assembly`) are added to this dispatch in Task 6; until then they fall through
-/// to `simple_statement` and parse as expression statements.
 fn stmt(p: &mut Parser) {
     match p.current() {
         L_BRACE => block(p),
@@ -772,6 +768,11 @@ fn stmt(p: &mut Parser) {
         RETURN_KW => return_stmt(p),
         BREAK_KW => break_stmt(p),
         CONTINUE_KW => continue_stmt(p),
+        EMIT_KW => emit_stmt(p),
+        REVERT_KW => revert_stmt(p),
+        TRY_KW => try_stmt(p),
+        UNCHECKED_KW => unchecked_block(p),
+        ASSEMBLY_KW => assembly_stmt(p),
         _ => simple_statement(p),
     }
 }
@@ -993,6 +994,122 @@ fn var_decl(p: &mut Parser) {
     m.complete(p, VAR_DECL);
 }
 
+/// `'emit' expr ';'` — the expression is the event call (`Name(args)`).
+fn emit_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(EMIT_KW);
+    expr(p);
+    p.expect(SEMICOLON);
+    m.complete(p, EMIT_STMT);
+}
+
+/// `'revert' expr? ';'` — `revert;` is legal, as is `revert Err(args);` and the
+/// string form `revert("msg");` (a call expression).
+fn revert_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(REVERT_KW);
+    if !p.at(SEMICOLON) && !p.at(EOF) {
+        expr(p);
+    }
+    p.expect(SEMICOLON);
+    m.complete(p, REVERT_STMT);
+}
+
+/// `'unchecked' block` ⇒ UNCHECKED_BLOCK (a block whose arithmetic does not
+/// revert on over/underflow).
+fn unchecked_block(p: &mut Parser) {
+    let m = p.start();
+    p.bump(UNCHECKED_KW);
+    if p.at(L_BRACE) {
+        block(p);
+    } else {
+        p.error("expected '{' after 'unchecked'");
+    }
+    m.complete(p, UNCHECKED_BLOCK);
+}
+
+/// `'try' expr ('returns' param_list)? block catch_clause+`
+fn try_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(TRY_KW);
+    expr(p);
+    if p.eat(RETURNS_KW) {
+        if p.at(L_PAREN) {
+            param_list(p);
+        } else {
+            p.error("expected '(' after returns");
+        }
+    }
+    if p.at(L_BRACE) {
+        block(p);
+    } else {
+        p.error("expected '{' for try body");
+    }
+    while p.at(CATCH_KW) {
+        catch_clause(p);
+    }
+    m.complete(p, TRY_STMT);
+}
+
+/// `'catch' (IDENT? param_list)? block` — the optional IDENT is the error name
+/// (`Error`, `Panic`) and `param_list` binds the destructured values.
+fn catch_clause(p: &mut Parser) {
+    let m = p.start();
+    p.bump(CATCH_KW);
+    if p.at(IDENT) {
+        name_ref(p); // catch Error(...) / catch Panic(...)
+    }
+    if p.at(L_PAREN) {
+        param_list(p);
+    }
+    if p.at(L_BRACE) {
+        block(p);
+    } else {
+        p.error("expected '{' for catch body");
+    }
+    m.complete(p, CATCH_CLAUSE);
+}
+
+/// `'assembly' STRING? ('(' <flags> ')')? '{' <yul> '}'` — the Yul interior is
+/// span-skipped to the matching brace (Plan 5 parses it). The node is a real
+/// ASSEMBLY_STMT; the optional `"evmasm"` dialect string and `(...)` flags are
+/// consumed as leaves.
+fn assembly_stmt(p: &mut Parser) {
+    let m = p.start();
+    p.bump(ASSEMBLY_KW);
+    if p.at(STRING) {
+        p.bump(STRING); // dialect, e.g. "evmasm"
+    }
+    if p.at(L_PAREN) {
+        skip_parens(p); // memory-safe flags etc. — structured in Plan 5
+    }
+    if p.at(L_BRACE) {
+        skip_braces(p); // Yul body span-skipped to matching `}` (Plan 5)
+    } else {
+        p.error("expected '{' for assembly body");
+    }
+    m.complete(p, ASSEMBLY_STMT);
+}
+
+/// Balanced `'{' … '}'` whose interior is span-skipped (Yul, parsed in Plan 5).
+/// Mirrors `skip_parens`. Used only by `assembly_stmt`.
+fn skip_braces(p: &mut Parser) {
+    p.bump(L_BRACE);
+    let mut depth = 1usize;
+    while depth > 0 && !p.at(EOF) {
+        match p.current() {
+            L_BRACE => depth += 1,
+            R_BRACE => depth -= 1,
+            _ => {}
+        }
+        if depth == 0 {
+            break;
+        }
+        p.bump_any();
+    }
+    p.expect(R_BRACE);
+}
+
 // ---- types -------------------------------------------------------------------
 
 /// A type: a path/mapping/function base, then zero or more `[ size? ]` suffixes.
@@ -1140,9 +1257,9 @@ fn name_ref(p: &mut Parser) {
 
 // ---- shared skips ------------------------------------------------------------
 
-/// Balanced `'(' … ')'` whose interior is span-skipped. Its one remaining caller
-/// is `override_spec` — a list of contract/type paths (not expressions),
-/// structured in M2.
+/// Balanced `'(' … ')'` whose interior is span-skipped. Callers: `override_spec`
+/// (a list of contract/type paths, not expressions — structured in M2) and
+/// `assembly_stmt` (the memory-safe flags — structured in Plan 5).
 fn skip_parens(p: &mut Parser) {
     p.bump(L_PAREN);
     let mut depth = 1usize;
