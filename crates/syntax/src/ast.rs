@@ -42,12 +42,44 @@ macro_rules! ast_node {
     };
 }
 
+/// Generate a typed-AST sum type over several [`SyntaxKind`]s (e.g. `Item`,
+/// `Type`). `can_cast` is the OR of the variant kinds; `cast` dispatches on
+/// `node.kind()` and wraps the matching leaf wrapper. Each `$ty` must itself be an
+/// [`AstNode`] (declared via `ast_node!`).
+macro_rules! ast_enum {
+    ($name:ident { $($variant:ident($ty:ty) = $kind:ident),+ $(,)? }) => {
+        #[derive(Debug, Clone, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($variant($ty)),+
+        }
+
+        impl AstNode for $name {
+            fn can_cast(kind: SyntaxKind) -> bool {
+                matches!(kind, $(SyntaxKind::$kind)|+)
+            }
+            fn cast(node: SyntaxNode) -> Option<Self> {
+                let res = match node.kind() {
+                    $(SyntaxKind::$kind => Self::$variant(<$ty>::cast(node)?),)+
+                    _ => return None,
+                };
+                Some(res)
+            }
+            fn syntax(&self) -> &SyntaxNode {
+                match self {
+                    $(Self::$variant(it) => it.syntax()),+
+                }
+            }
+        }
+    };
+}
+
 /// Tiny accessor helpers over rowan's child iterators, shared by every wrapper.
 /// Kept in a submodule so the call sites read `support::child(...)` etc. Grown
 /// across tasks: `token` (Task 1), `children` (Task 2), `child` (Task 3) — each
 /// introduced where first used (a `pub(super) fn` with no caller is a clippy
 /// `dead_code` error under `-D warnings`).
 mod support {
+    use super::AstNode;
     use crate::{SyntaxKind, SyntaxNode, SyntaxToken};
 
     /// The first direct **token** child of `parent` with the given kind.
@@ -56,6 +88,11 @@ mod support {
             .children_with_tokens()
             .filter_map(|it| it.into_token())
             .find(|it| it.kind() == kind)
+    }
+
+    /// All direct **node** children of `parent` castable to `N`, in tree order.
+    pub(super) fn children<N: AstNode>(parent: &SyntaxNode) -> impl Iterator<Item = N> {
+        parent.children().filter_map(N::cast)
     }
 }
 
@@ -91,6 +128,46 @@ impl NameRef {
 
 ast_node!(SourceFile, SOURCE_FILE);
 
+// ---- file-level items --------------------------------------------------------
+
+ast_node!(PragmaDirective, PRAGMA_DIRECTIVE);
+ast_node!(ImportDirective, IMPORT_DIRECTIVE);
+ast_node!(UsingDirective, USING_DIRECTIVE);
+ast_node!(ContractDef, CONTRACT_DEF);
+ast_node!(FunctionDef, FUNCTION_DEF);
+ast_node!(StructDef, STRUCT_DEF);
+ast_node!(EnumDef, ENUM_DEF);
+ast_node!(EventDef, EVENT_DEF);
+ast_node!(ErrorDef, ERROR_DEF);
+ast_node!(UserDefinedValueType, USER_DEFINED_VALUE_TYPE);
+ast_node!(StateVarDef, STATE_VAR_DEF);
+
+// A top-level item of a source file. Mirrors `grammar.rs::item`'s dispatch: a
+// file-level constant is a `STATE_VAR_DEF` (the `IDENT | MAPPING_KW` arm), and a
+// free function is a `FUNCTION_DEF`. `MODIFIER_DEF`/`CONSTRUCTOR_DEF` are NOT here
+// — they are contract-body-only members.
+ast_enum!(Item {
+    Pragma(PragmaDirective) = PRAGMA_DIRECTIVE,
+    Import(ImportDirective) = IMPORT_DIRECTIVE,
+    Using(UsingDirective) = USING_DIRECTIVE,
+    Contract(ContractDef) = CONTRACT_DEF,
+    Function(FunctionDef) = FUNCTION_DEF,
+    Struct(StructDef) = STRUCT_DEF,
+    Enum(EnumDef) = ENUM_DEF,
+    Event(EventDef) = EVENT_DEF,
+    Error(ErrorDef) = ERROR_DEF,
+    Udvt(UserDefinedValueType) = USER_DEFINED_VALUE_TYPE,
+    StateVar(StateVarDef) = STATE_VAR_DEF,
+});
+
+impl SourceFile {
+    /// The file's top-level items, in source order (direct `Item`-castable children
+    /// of `SOURCE_FILE`).
+    pub fn items(&self) -> impl Iterator<Item = Item> {
+        support::children(self.syntax())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -110,5 +187,24 @@ mod tests {
             .expect("the contract has a NAME node");
         assert_eq!(name.text().as_deref(), Some("C"));
         assert_eq!(name.syntax().kind(), SyntaxKind::NAME);
+    }
+
+    #[test]
+    fn walks_file_level_items() {
+        // pragma, a contract, and a file-level struct — the order the grammar emits.
+        let src = "pragma solidity ^0.8.20;\ncontract C {}\nstruct S { uint x; }\n";
+        let p = parse(src);
+        let file = SourceFile::cast(p.syntax()).unwrap();
+        let kinds: Vec<SyntaxKind> = file.items().map(|it| it.syntax().kind()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                SyntaxKind::PRAGMA_DIRECTIVE,
+                SyntaxKind::CONTRACT_DEF,
+                SyntaxKind::STRUCT_DEF,
+            ]
+        );
+        // the enum discriminates the contract variant
+        assert!(matches!(file.items().nth(1), Some(Item::Contract(_))));
     }
 }
