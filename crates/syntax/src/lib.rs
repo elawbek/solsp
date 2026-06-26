@@ -527,4 +527,112 @@ contract Vault is Ownable {\n\
         }
         assert_eq!(p.syntax().text().to_string(), src);
     }
+
+    #[test]
+    fn parses_realistic_contract_with_bodies_losslessly() {
+        // The Plan-3 Vault, now with real statement bodies in every function.
+        let src = "// SPDX-License-Identifier: MIT\n\
+pragma solidity ^0.8.20;\n\
+\n\
+import {Ownable} from \"@openzeppelin/contracts/access/Ownable.sol\";\n\
+\n\
+contract Vault is Ownable {\n\
+    mapping(address => uint256) public balances;\n\
+    uint256 public constant FEE = 1_000;\n\
+    uint256 public total = 0;\n\
+\n\
+    event Deposit(address indexed who, uint256 amount);\n\
+    error InsufficientBalance(uint256 have, uint256 want);\n\
+\n\
+    modifier onlyPositive(uint256 v) {\n\
+        require(v > 0, \"non-positive\");\n\
+        _;\n\
+    }\n\
+\n\
+    constructor() Ownable(msg.sender) {}\n\
+\n\
+    function deposit() external payable onlyPositive(msg.value) {\n\
+        balances[msg.sender] += msg.value;\n\
+        total += msg.value;\n\
+        emit Deposit(msg.sender, msg.value);\n\
+    }\n\
+\n\
+    function withdraw(uint256 amount) external {\n\
+        uint256 bal = balances[msg.sender];\n\
+        if (bal < amount) {\n\
+            revert InsufficientBalance(bal, amount);\n\
+        }\n\
+        unchecked { balances[msg.sender] = bal - amount; }\n\
+        for (uint256 i = 0; i < amount; i++) {\n\
+            total = total - 1;\n\
+        }\n\
+        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n\
+        require(ok, \"transfer failed\");\n\
+    }\n\
+\n\
+    function balanceOf(address a) external view returns (uint256) {\n\
+        return balances[a];\n\
+    }\n\
+}\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        // Lossless on a full, realistic contract WITH bodies.
+        assert_eq!(p.syntax().text().to_string(), src);
+        let dump = debug_tree(src);
+        for kind in [
+            "CONTRACT_DEF@",
+            "FUNCTION_DEF@",
+            "BLOCK@",
+            "VAR_DECL_STMT@",
+            "VAR_DECL@",
+            "EXPR_STMT@",
+            "IF_STMT@",
+            "FOR_STMT@",
+            "RETURN_STMT@",
+            "EMIT_STMT@",
+            "REVERT_STMT@",
+            "UNCHECKED_BLOCK@",
+            "ASSIGN_EXPR@",
+            "CALL_EXPR@",
+            "CALL_OPTIONS@",
+            "INDEX_EXPR@",
+            "MEMBER_EXPR@",
+            "BIN_EXPR@",
+        ] {
+            assert!(dump.contains(kind), "missing {kind} in:\n{dump}");
+        }
+    }
+
+    #[test]
+    fn statement_bodies_are_total() {
+        // Adversarial bodies must never panic and must round-trip losslessly.
+        for body in [
+            "",                               // empty body
+            "if (x) {",                       // unterminated if + block
+            "for (;;) {}",                    // empty for header
+            "return",                         // return, no expr, no `;`
+            "x = ;",                          // assignment missing rhs
+            "uint",                           // dangling type, no name/`;`
+            "{ { { { } } }",                  // deeply nested, one `}` short
+            "a.b.c.d.e.f.g;",                 // long member chain
+            "x = a ? b ? c : d : e;",         // nested ternary
+            "1 + + + + 2;",                   // operator pile-up
+            "delete delete x;",               // stacked prefix
+            "assembly { let x := add(1, 2) ", // unterminated assembly
+            "try f() {",                      // try with no catch + unterminated
+            "[1,2,3",                         // unterminated array literal
+            "f({a: 1, b: });",                // named arg missing value
+            "(uint a, , bool b) = t;",        // tuple var-decl with a hole
+            "_;",                             // modifier placeholder ⇒ EXPR_STMT
+        ] {
+            let src = format!("contract C {{ function f() public {{ {body} }} }}");
+            let p = parse(&src);
+            // Totality + losslessness; errors are allowed (these are malformed).
+            assert_eq!(
+                p.syntax().text().to_string(),
+                src,
+                "lossy on body: {body:?}"
+            );
+        }
+    }
 }
