@@ -648,6 +648,96 @@ mod tests {
         assert!(f.return_param_list().is_some());
     }
 
+    #[test]
+    fn walks_realistic_contract_via_typed_ast() {
+        let src = "// SPDX-License-Identifier: MIT\n\
+pragma solidity ^0.8.20;\n\
+\n\
+import {Ownable} from \"@openzeppelin/contracts/access/Ownable.sol\";\n\
+\n\
+contract Vault is Ownable {\n\
+    mapping(address => uint256) public balances;\n\
+    uint256 public constant FEE = 1_000;\n\
+    address immutable owner;\n\
+\n\
+    event Deposit(address indexed who, uint256 amount);\n\
+    error InsufficientBalance(uint256 have, uint256 want);\n\
+\n\
+    struct Account { uint256 balance; bool frozen; }\n\
+    enum Status { Open, Closed }\n\
+\n\
+    modifier onlyPositive(uint256 v) { _; }\n\
+\n\
+    constructor() Ownable(msg.sender) {}\n\
+\n\
+    function deposit() external payable onlyPositive(msg.value) {}\n\
+    function balanceOf(address a) external view returns (uint256) {}\n\
+}\n";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let file = SourceFile::cast(p.syntax()).unwrap();
+
+        // file-level items: pragma, import, contract (SPDX is a leading comment/trivia).
+        let item_kinds: Vec<SyntaxKind> = file.items().map(|i| i.syntax().kind()).collect();
+        assert!(item_kinds.contains(&SyntaxKind::PRAGMA_DIRECTIVE));
+        assert!(item_kinds.contains(&SyntaxKind::IMPORT_DIRECTIVE));
+        assert!(item_kinds.contains(&SyntaxKind::CONTRACT_DEF));
+
+        let c = file
+            .items()
+            .find_map(|i| match i {
+                Item::Contract(c) => Some(c),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(c.name().and_then(|n| n.text()).as_deref(), Some("Vault"));
+        assert!(matches!(c.kind(), ContractKind::Contract));
+        assert!(!c.is_abstract());
+        assert_eq!(c.inheritance_specifiers().count(), 1);
+
+        // functions are FUNCTION_DEF members; the constructor is separate.
+        let fn_names: Vec<String> = c
+            .functions()
+            .iter()
+            .filter_map(|f| f.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(
+            fn_names,
+            vec!["deposit".to_string(), "balanceOf".to_string()]
+        );
+        assert_eq!(c.constructors().len(), 1);
+
+        // every other member-kind collection.
+        let sv_names: Vec<String> = c
+            .state_vars()
+            .iter()
+            .filter_map(|v| v.name().and_then(|n| n.text()))
+            .collect();
+        assert_eq!(
+            sv_names,
+            vec![
+                "balances".to_string(),
+                "FEE".to_string(),
+                "owner".to_string()
+            ]
+        );
+        assert_eq!(c.events().len(), 1);
+        assert_eq!(c.errors().len(), 1);
+        assert_eq!(c.structs().len(), 1);
+        assert_eq!(c.enums().len(), 1);
+        assert_eq!(c.modifiers().len(), 1);
+
+        // a base specifier path resolves to its name text.
+        let base = c.inheritance_specifiers().next().unwrap();
+        assert_eq!(
+            base.path_type()
+                .and_then(|pt| pt.syntax().first_child().and_then(NameRef::cast))
+                .and_then(|nr| nr.text())
+                .as_deref(),
+            Some("Ownable")
+        );
+    }
+
     fn first_function(src: &str) -> FunctionDef {
         let p = parse(src);
         SourceFile::cast(p.syntax())
