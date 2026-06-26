@@ -5,7 +5,7 @@
 //! initializers are span-skipped to `;`.
 
 use crate::parser::{CompletedMarker, Parser};
-use crate::SyntaxKind::*;
+use crate::SyntaxKind::{self, *};
 
 pub(crate) fn source_file(p: &mut Parser) {
     let m = p.start();
@@ -140,7 +140,7 @@ fn member(p: &mut Parser) {
 }
 
 /// `type_name (visibility|'constant'|'immutable'|override_spec)* NAME? ('=' init)? ';'`
-/// The initializer is an expression — span-skipped to `;`/`}` until a later plan.
+/// The initializer is a real (Plan 4) expression parsed by `expr`.
 fn state_var_def(p: &mut Parser) {
     let m = p.start();
     type_name(p);
@@ -155,10 +155,7 @@ fn state_var_def(p: &mut Parser) {
         name(p);
     }
     if p.eat(EQ) {
-        // initializer expression: skipped here (expressions land in a later plan).
-        while !p.at(SEMICOLON) && !p.at(R_BRACE) && !p.at(EOF) {
-            p.bump_any();
-        }
+        expr(p); // initializer is a real expression (Plan 4)
     }
     p.expect(SEMICOLON);
     m.complete(p, STATE_VAR_DEF);
@@ -398,6 +395,158 @@ fn user_defined_value_type(p: &mut Parser) {
     type_name(p);
     p.expect(SEMICOLON);
     m.complete(p, USER_DEFINED_VALUE_TYPE);
+}
+
+// ---- expressions -------------------------------------------------------------
+
+/// Associativity of a binary operator level.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Assoc {
+    Left,
+    Right,
+}
+
+/// Binary-operator precedence level (1..=13) + associativity, per the Solidity
+/// "Order of Precedence of Operators". `None` ⇒ the token is not a binary
+/// operator and ends the operand. Assignment (level 1) and ternary (level 2) are
+/// handled as special infixes in `expr_bp`, but they appear here too so the bp
+/// comparison that decides whether to continue the loop is uniform.
+fn bin_bp(kind: SyntaxKind) -> Option<(u8, Assoc)> {
+    let r = match kind {
+        EQ | PIPE_EQ | CARET_EQ | AMP_EQ | SHL_EQ | SHR_EQ | PLUS_EQ | MINUS_EQ | STAR_EQ
+        | SLASH_EQ | PERCENT_EQ => (1, Assoc::Right),
+        QUESTION => (2, Assoc::Right),
+        PIPE2 => (3, Assoc::Left),
+        AMP2 => (4, Assoc::Left),
+        EQ2 | NEQ => (5, Assoc::Left),
+        LT | GT | LT_EQ | GT_EQ => (6, Assoc::Left),
+        PIPE => (7, Assoc::Left),
+        CARET => (8, Assoc::Left),
+        AMP => (9, Assoc::Left),
+        SHL | SHR => (10, Assoc::Left),
+        PLUS | MINUS => (11, Assoc::Left),
+        STAR | SLASH | PERCENT => (12, Assoc::Left),
+        STAR2 => (13, Assoc::Right),
+        _ => return None,
+    };
+    Some(r)
+}
+
+/// Parse an expression. Entry point used by statements, initializers, args, etc.
+fn expr(p: &mut Parser) {
+    expr_bp(p, 0);
+}
+
+/// Precedence-climbing core. Parses an operand via `lhs`, then folds binary,
+/// ternary and assignment operators whose binding power exceeds `min_bp`.
+/// Returns the completed top expression, or `None` if nothing could start here
+/// (the caller recovers). Never panics; always consumes ≥1 token when it returns
+/// `Some` (via `lhs`), and breaks immediately on a non-operator.
+fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<CompletedMarker> {
+    let mut lhs = lhs(p)?;
+    loop {
+        let Some((level, assoc)) = bin_bp(p.current()) else {
+            break;
+        };
+        // Left binding power of this operator level. If it does not exceed the
+        // caller's threshold, stop and let the caller fold it.
+        let left_bp = level * 2;
+        if left_bp <= min_bp {
+            break;
+        }
+        match p.current() {
+            QUESTION => {
+                // ternary: `cond ? then : else` — right-assoc (level 2).
+                let m = lhs.precede(p);
+                p.bump(QUESTION);
+                expr_bp(p, left_bp - 1); // then-branch
+                p.expect(COLON);
+                expr_bp(p, left_bp - 1); // else-branch
+                lhs = m.complete(p, TERNARY_EXPR);
+            }
+            _ => {
+                let node = if level == 1 { ASSIGN_EXPR } else { BIN_EXPR };
+                let m = lhs.precede(p);
+                p.bump_any(); // the operator token
+                let rhs_min = if assoc == Assoc::Left {
+                    left_bp
+                } else {
+                    left_bp - 1
+                };
+                expr_bp(p, rhs_min);
+                lhs = m.complete(p, node);
+            }
+        }
+    }
+    Some(lhs)
+}
+
+/// Parse a unary-prefix-and-postfix operand: `prefix_op* primary postfix*`.
+/// Returns `None` if no primary can start at `current()` (the caller recovers);
+/// prefix and postfix handling come in Task 3 — for now `lhs` is just `primary`.
+fn lhs(p: &mut Parser) -> Option<CompletedMarker> {
+    primary(p)
+}
+
+/// Parse a primary expression. Returns `None` when `current()` cannot start one.
+/// Task 3 extends this with `new`, `type(...)`, prefix ops and array literals.
+fn primary(p: &mut Parser) -> Option<CompletedMarker> {
+    let cm = match p.current() {
+        NUMBER | STRING | TRUE_KW | FALSE_KW => {
+            let m = p.start();
+            p.bump_any();
+            m.complete(p, LITERAL_EXPR)
+        }
+        IDENT => {
+            let m = p.start();
+            name_ref(p);
+            m.complete(p, PATH_EXPR)
+        }
+        L_PAREN => paren_or_tuple_expr(p),
+        _ => return None,
+    };
+    Some(cm)
+}
+
+/// `'(' expr ')'` ⇒ PAREN_EXPR; anything with a comma or a hole ⇒ TUPLE_EXPR.
+/// Supports `()`, `(x)`, `(a, b)`, and holes like `(, x)` / `(a, , b)`.
+fn paren_or_tuple_expr(p: &mut Parser) -> CompletedMarker {
+    let m = p.start();
+    p.bump(L_PAREN);
+    let mut count = 0usize;
+    let mut is_tuple = false;
+    // Parse a comma-separated list where each element is optional (a hole).
+    loop {
+        if p.at(R_PAREN) || p.at(EOF) {
+            break;
+        }
+        if p.at(COMMA) {
+            // a hole: no element before this comma.
+            is_tuple = true;
+            p.bump(COMMA);
+            continue;
+        }
+        if expr_bp(p, 0).is_none() {
+            // not an expression and not `)`/`,` — recover one token to progress.
+            p.err_and_bump("expected an expression");
+            continue;
+        }
+        count += 1;
+        if p.eat(COMMA) {
+            is_tuple = true;
+        } else {
+            break;
+        }
+    }
+    p.expect(R_PAREN);
+    // `(x)` with exactly one element and no comma is a parenthesized expr;
+    // everything else (commas, holes, `()`, multiple elems) is a tuple.
+    let kind = if is_tuple || count != 1 {
+        TUPLE_EXPR
+    } else {
+        PAREN_EXPR
+    };
+    m.complete(p, kind)
 }
 
 // ---- types -------------------------------------------------------------------

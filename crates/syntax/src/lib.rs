@@ -348,4 +348,30 @@ contract Vault is Ownable {\n\
         assert!(dump.contains("CONTRACT_DEF@"));
         assert_eq!(p.syntax().text().to_string(), src); // still lossless
     }
+
+    #[test]
+    fn parses_expression_precedence_in_initializer() {
+        // Precedence: `*` binds tighter than `+`; `**` is right-assoc and binds
+        // tightest; parentheses group. Wired through a state-var initializer.
+        let src = "contract C { uint x = 1 + 2 * 3 ** 4 - (a || b); }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("STATE_VAR_DEF@"));
+        assert!(dump.contains("BIN_EXPR@"));
+        assert!(dump.contains("LITERAL_EXPR@")); // the numeric literals
+        assert!(dump.contains("PATH_EXPR@")); // `a`, `b`
+        assert!(dump.contains("PAREN_EXPR@")); // `( … )`
+        assert_eq!(p.syntax().text().to_string(), src); // lossless
+    }
+
+    #[test]
+    fn parses_tuple_expression_initializer() {
+        let src = "contract C { uint x = (1, 2, foo); }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        let dump = debug_tree(src);
+        assert!(dump.contains("TUPLE_EXPR@"));
+        assert_eq!(p.syntax().text().to_string(), src);
+    }
 }
