@@ -45,6 +45,20 @@ impl ServerState {
         self.files.remove(uri.as_str());
     }
 
+    /// On `didClose`, refresh the file from disk rather than dropping it: it may still
+    /// be imported by open files, so cross-file resolution must keep seeing it (with
+    /// the saved-on-disk content, discarding any unsaved editor edits). If it no longer
+    /// exists on disk, drop it.
+    pub fn reload_or_drop(&mut self, uri: &Url) {
+        if let Ok(path) = uri.to_file_path() {
+            if let Ok(text) = fs::read_to_string(&path) {
+                self.set(uri, text);
+                return;
+            }
+        }
+        self.remove(uri);
+    }
+
     /// The salsa database (read-only access for queries).
     pub fn db(&self) -> &RootDatabase {
         &self.db

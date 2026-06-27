@@ -61,7 +61,20 @@ pub fn run(connection: &Connection) -> Result<()> {
                 if connection.handle_shutdown(&req)? {
                     return Ok(());
                 }
-                let resp = handle_request(&state, req);
+                // A panicking handler must not take the whole server down: catch it and
+                // reply with an error so the session keeps working.
+                let id = req.id.clone();
+                let resp = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    handle_request(&state, req)
+                }))
+                .unwrap_or_else(|_| {
+                    eprintln!("solsp: request handler panicked (id={id})");
+                    Response::new_err(
+                        id,
+                        ErrorCode::InternalError as i32,
+                        "internal error (handler panicked)".to_string(),
+                    )
+                });
                 connection.sender.send(Message::Response(resp))?;
             }
             Message::Notification(not) => {
@@ -305,8 +318,9 @@ fn handle_notification(
                 return Ok(());
             };
             let uri = params.text_document.uri;
-            state.remove(&uri);
-            // Clear the squiggles for a file we no longer track.
+            // Keep the file loaded (it may be imported by open files) but refresh it
+            // from disk; just stop showing its diagnostics.
+            state.reload_or_drop(&uri);
             send_diagnostics(connection, uri, Vec::new())?;
         }
         _ => {}

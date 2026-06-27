@@ -451,6 +451,26 @@ fn cross_file_goto_definition() {
         }
     );
 
+    // 4. the editor opens Token.sol (from the jump) then the user closes it: a
+    // didClose must NOT unload it — cross-file resolution must still work afterwards.
+    let token_src = fs::read_to_string(&token).unwrap();
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&token_uri, &token_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+    send_notification(
+        &client,
+        "textDocument/didClose",
+        lsp_types::DidCloseTextDocumentParams {
+            text_document: doc_id(&token_uri),
+        },
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+    let loc = definition(5, 1, use_ch + 1);
+    assert_eq!(loc.uri, token_uri, "still resolves after target closed");
+
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
     send_notification(&client, "exit", serde_json::Value::Null);
