@@ -140,6 +140,96 @@ pub fn member_in_type(
     }
 }
 
+/// All definitions visible at `node`, walking enclosing scopes outward: locals, params,
+/// same-file contract C3 members, file top-level, and Yul bindings. Inner scopes come
+/// first (so they shadow). For scope-based completion — the server augments this with
+/// cross-file inherited and imported names.
+pub fn scope_definitions(node: &SyntaxNode) -> Vec<Definition> {
+    let mut out = Vec::new();
+    for scope in node.ancestors() {
+        collect_scope(&scope, &mut out);
+    }
+    out
+}
+
+fn collect_scope(scope: &SyntaxNode, out: &mut Vec<Definition>) {
+    use SyntaxKind::*;
+    match scope.kind() {
+        SOURCE_FILE => out.extend(scope.children().filter_map(|n| def_for_decl(&n))),
+        CONTRACT_DEF => {
+            if let Some(root) = scope.ancestors().last() {
+                for c in c3_linearize(scope, &root) {
+                    out.extend(contract_members(&c));
+                }
+            }
+        }
+        FUNCTION_DEF | MODIFIER_DEF | CONSTRUCTOR_DEF => out.extend(
+            scope
+                .descendants()
+                .filter(|n| n.kind() == PARAM)
+                .filter_map(|p| make_def(&p, DefKind::Parameter)),
+        ),
+        BLOCK | FOR_STMT => out.extend(
+            scope
+                .children()
+                .filter(|n| n.kind() == VAR_DECL_STMT)
+                .filter_map(|stmt| stmt.children().find(|n| n.kind() == VAR_DECL))
+                .filter_map(|v| make_def(&v, DefKind::Local)),
+        ),
+        YUL_BLOCK | YUL_FUNCTION_DEF => out.extend(
+            yul_candidates(scope)
+                .into_iter()
+                .filter_map(|(nm, full, kind)| make_yul_def(&nm, &full, kind)),
+        ),
+        _ => {}
+    }
+}
+
+/// Every member exposed directly by a type: contract/interface/library members (incl.
+/// same-file C3 bases), struct fields, or enum variants. For member completion — the
+/// server adds cross-file inherited members for a contract.
+pub fn type_members(type_def: &SyntaxNode) -> Vec<Definition> {
+    use SyntaxKind::*;
+    match type_def.kind() {
+        CONTRACT_DEF => match type_def.ancestors().last() {
+            Some(root) => c3_linearize(type_def, &root)
+                .iter()
+                .flat_map(contract_members)
+                .collect(),
+            None => contract_members(type_def),
+        },
+        STRUCT_DEF | ENUM_DEF => type_def
+            .descendants()
+            .filter(|n| matches!(n.kind(), STRUCT_FIELD | ENUM_VARIANT))
+            .filter_map(|n| {
+                let name_node = n.children().find(|c| c.kind() == NAME)?;
+                Some(Definition {
+                    name: ident_text(&name_node)?,
+                    kind: if n.kind() == STRUCT_FIELD {
+                        DefKind::Field
+                    } else {
+                        DefKind::Variant
+                    },
+                    name_ptr: AstPtr::new(&name_node),
+                    full_ptr: AstPtr::new(&n),
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every member declared directly in a contract's own body (no inheritance).
+pub fn contract_members(contract: &SyntaxNode) -> Vec<Definition> {
+    contract
+        .children()
+        .find(|n| n.kind() == SyntaxKind::CONTRACT_BODY)
+        .into_iter()
+        .flat_map(|body| body.children())
+        .filter_map(|n| def_for_decl(&n))
+        .collect()
+}
+
 /// Resolve a `NAME_REF` (or `NAME`) node to its definition within the same file.
 /// Returns `None` for builtins/unknowns (and anything needing imports/inheritance).
 pub fn resolve(reference: &SyntaxNode) -> Option<Definition> {
@@ -605,6 +695,47 @@ mod tests {
         // `stored` (lhs) → the state variable (contract member)
         let d = resolve_at(src, "stored =").unwrap();
         assert_eq!(d.kind, DefKind::StateVariable);
+    }
+
+    #[test]
+    fn scope_definitions_and_type_members() {
+        let src = "contract Base { function inherited() internal {} }\n\
+                   contract C is Base { uint256 stateVar; function f(uint256 p) public { uint256 lokal; } }";
+        let root = parse(src).syntax();
+
+        // scope at the `lokal` declaration sees locals, params, same-file C3 members,
+        // and file top-level.
+        let lokal = root
+            .descendants()
+            .find(|n| {
+                n.kind() == SyntaxKind::VAR_DECL
+                    && n.descendants().any(|d| {
+                        d.kind() == SyntaxKind::NAME && ident_text(&d).as_deref() == Some("lokal")
+                    })
+            })
+            .unwrap();
+        let names: Vec<String> = scope_definitions(&lokal)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        for want in ["lokal", "p", "stateVar", "f", "inherited", "Base", "C"] {
+            assert!(
+                names.contains(&want.to_string()),
+                "scope missing {want}: {names:?}"
+            );
+        }
+
+        // type_members(C) = own members + same-file C3 base members.
+        let c = root
+            .descendants()
+            .find(|n| {
+                n.kind() == SyntaxKind::CONTRACT_DEF && contract_name(n).as_deref() == Some("C")
+            })
+            .unwrap();
+        let members: Vec<String> = type_members(&c).into_iter().map(|d| d.name).collect();
+        assert!(members.contains(&"stateVar".to_string()));
+        assert!(members.contains(&"f".to_string()));
+        assert!(members.contains(&"inherited".to_string()));
     }
 
     #[test]

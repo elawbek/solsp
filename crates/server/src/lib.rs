@@ -12,9 +12,11 @@ use lsp_types::notification::{
     PublishDiagnostics,
 };
 use lsp_types::request::{
-    DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _, SemanticTokensFullRequest,
+    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
+    SemanticTokensFullRequest,
 };
 use lsp_types::{
+    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
     Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
     MarkupKind, OneOf, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
@@ -39,6 +41,11 @@ pub fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        completion_provider: Some(CompletionOptions {
+            // `.` triggers member completion; bare-identifier completion is implicit.
+            trigger_characters: Some(vec![".".to_string()]),
+            ..Default::default()
+        }),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -112,6 +119,10 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
         },
         HoverRequest::METHOD => match req.extract::<HoverParams>(HoverRequest::METHOD) {
             Ok((id, params)) => Response::new_ok(id, hover(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
+        Completion::METHOD => match req.extract::<CompletionParams>(Completion::METHOD) {
+            Ok((id, params)) => Response::new_ok(id, completion(state, params)),
             Err(e) => extract_err_response(id, e),
         },
         _ => Response::new_err(
@@ -255,6 +266,177 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
         ));
     }
     None
+}
+
+/// `textDocument/completion` → member completion after a `.`, else scope completion
+/// (names visible at the cursor). The client filters by the typed prefix.
+fn completion(state: &ServerState, params: CompletionParams) -> CompletionResponse {
+    CompletionResponse::Array(completion_items(state, &params).unwrap_or_default())
+}
+
+fn completion_items(state: &ServerState, params: &CompletionParams) -> Option<Vec<CompletionItem>> {
+    let pos = &params.text_document_position;
+    let uri = pos.text_document.uri.clone();
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let offset = to_proto::offset(li, pos.position)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+    // member completion takes priority whenever the cursor sits after a `.`.
+    if let Some(items) = member_completion(state, &uri, &root, offset) {
+        return Some(items);
+    }
+    Some(scope_completion(state, &uri, &root, offset))
+}
+
+/// Completion for `receiver.<here>`: the members of the receiver's type (incl. cross-file
+/// inherited members). `None` when the cursor is not after a `.`.
+fn member_completion(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<Vec<CompletionItem>> {
+    let receiver = dotted_receiver(root, offset)?;
+    let defs = resolve_receiver_type(state, uri, root, &receiver)
+        .map(|(turi, tdef)| {
+            let mut defs = solsp_hir::resolve::type_members(&tdef);
+            if tdef.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF {
+                if let Some(troot) = parse_root(state, &turi) {
+                    defs.extend(collect_inherited_members(state, &turi, &troot, &tdef));
+                }
+            }
+            defs
+        })
+        .unwrap_or_default();
+    Some(completion_items_from(defs))
+}
+
+/// Completion for a bare identifier: every name visible at the cursor — locals, params,
+/// the enclosing contract's members (incl. cross-file inherited), and file top-level.
+fn scope_completion(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Vec<CompletionItem> {
+    let node = root
+        .token_at_offset(offset)
+        .left_biased()
+        .and_then(|t| t.parent())
+        .unwrap_or_else(|| root.clone());
+    let mut defs = solsp_hir::resolve::scope_definitions(&node);
+    if let Some(contract) = enclosing_contract(&node) {
+        defs.extend(collect_inherited_members(state, uri, root, &contract));
+    }
+    completion_items_from(defs)
+}
+
+/// The receiver expression of a `receiver.member` access at `offset`, when the cursor is
+/// on the member side (after the `.`). `None` otherwise.
+fn dotted_receiver(
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::{DOT, MEMBER_EXPR};
+    let tok = root.token_at_offset(offset).left_biased()?;
+    let member_expr = tok
+        .parent()?
+        .ancestors()
+        .find(|n| n.kind() == MEMBER_EXPR)?;
+    let dot = member_expr
+        .children_with_tokens()
+        .find(|e| e.kind() == DOT)?;
+    if offset < dot.text_range().end() {
+        return None; // cursor is in the receiver, not after the dot
+    }
+    member_expr.first_child()
+}
+
+/// All members inherited by `contract` from its base contracts across files (BFS,
+/// diamond-safe). Each contract contributes its own direct members.
+fn collect_inherited_members(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+) -> Vec<solsp_hir::resolve::Definition> {
+    use std::collections::{HashSet, VecDeque};
+    let mut visited: HashSet<(Url, String)> = HashSet::new();
+    let mut queue: VecDeque<(Url, solsp_syntax::SyntaxNode, solsp_syntax::SyntaxNode)> =
+        VecDeque::new();
+    let mut out = Vec::new();
+    queue.push_back((uri.clone(), root.clone(), contract.clone()));
+    while let Some((u, r, c)) = queue.pop_front() {
+        let key = (
+            u.clone(),
+            solsp_hir::resolve::contract_def_name(&c).unwrap_or_default(),
+        );
+        if !visited.insert(key) {
+            continue;
+        }
+        out.extend(solsp_hir::resolve::contract_members(&c));
+        for base in solsp_hir::resolve::base_names(&c) {
+            if let Some(b) = resolve_base(state, &u, &r, &base) {
+                queue.push_back(b);
+            }
+        }
+    }
+    out
+}
+
+/// Build completion items from definitions, keeping the first of each name (inner scopes
+/// come first, so a local shadows an inherited member of the same name).
+fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<CompletionItem> {
+    let mut seen = std::collections::HashSet::new();
+    defs.into_iter()
+        .filter(|d| seen.insert(d.name.clone()))
+        .map(|d| CompletionItem {
+            kind: Some(completion_kind(d.kind)),
+            detail: Some(def_detail(d.kind).to_string()),
+            label: d.name,
+            ..Default::default()
+        })
+        .collect()
+}
+
+fn completion_kind(k: solsp_hir::resolve::DefKind) -> CompletionItemKind {
+    use solsp_hir::resolve::DefKind::*;
+    match k {
+        Function => CompletionItemKind::FUNCTION,
+        Modifier => CompletionItemKind::FUNCTION,
+        StateVariable | Local | Parameter => CompletionItemKind::VARIABLE,
+        Field => CompletionItemKind::FIELD,
+        Variant => CompletionItemKind::ENUM_MEMBER,
+        Contract => CompletionItemKind::CLASS,
+        Interface => CompletionItemKind::INTERFACE,
+        Library => CompletionItemKind::MODULE,
+        Struct => CompletionItemKind::STRUCT,
+        Enum => CompletionItemKind::ENUM,
+        Event => CompletionItemKind::EVENT,
+        Error => CompletionItemKind::CONSTRUCTOR,
+        UserType => CompletionItemKind::TYPE_PARAMETER,
+    }
+}
+
+fn def_detail(k: solsp_hir::resolve::DefKind) -> &'static str {
+    use solsp_hir::resolve::DefKind::*;
+    match k {
+        Function => "function",
+        Modifier => "modifier",
+        StateVariable => "state variable",
+        Local => "local",
+        Parameter => "parameter",
+        Field => "field",
+        Variant => "enum variant",
+        Contract => "contract",
+        Interface => "interface",
+        Library => "library",
+        Struct => "struct",
+        Enum => "enum",
+        Event => "event",
+        Error => "error",
+        UserType => "type",
+    }
 }
 
 /// The argument count of the call whose callee is the identifier at `offset` (for
