@@ -6,7 +6,7 @@
 # The editor client lives in editors/vscode (TypeScript, not a cargo crate).
 [workspace]
 resolver = "2"
-members = ["crates/syntax", "crates/ide", "crates/server"]
+members = ["crates/syntax", "crates/ide", "crates/base-db", "crates/server"]
 
 [workspace.package]
 version = "0.0.1"
