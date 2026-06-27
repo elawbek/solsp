@@ -219,6 +219,12 @@ pub fn type_members(type_def: &SyntaxNode) -> Vec<Definition> {
     }
 }
 
+/// Every top-level declaration of a file (contracts, free functions, structs, enums,
+/// errors, events, user types). For imported-symbol completion.
+pub fn file_definitions(root: &SyntaxNode) -> Vec<Definition> {
+    root.children().filter_map(|n| def_for_decl(&n)).collect()
+}
+
 /// Every member declared directly in a contract's own body (no inheritance).
 pub fn contract_members(contract: &SyntaxNode) -> Vec<Definition> {
     contract

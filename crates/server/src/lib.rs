@@ -281,7 +281,11 @@ fn completion_items(state: &ServerState, params: &CompletionParams) -> Option<Ve
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
-    // member completion takes priority whenever the cursor sits after a `.`.
+    // named-argument keys (`f({ <here>: … })`) are the most specific context.
+    if let Some(items) = named_arg_completion(state, &uri, &root, offset) {
+        return Some(items);
+    }
+    // member completion whenever the cursor sits after a `.`.
     if let Some(items) = member_completion(state, &uri, &root, offset) {
         return Some(items);
     }
@@ -328,7 +332,190 @@ fn scope_completion(
     if let Some(contract) = enclosing_contract(&node) {
         defs.extend(collect_inherited_members(state, uri, root, &contract));
     }
+    defs.extend(imported_symbols(state, uri, root));
     completion_items_from(defs)
+}
+
+/// Every symbol the file's imports bring into scope (so `new Roles(` offers `Roles`):
+/// named imports under their local name, and glob imports' transitively re-exported
+/// top-level declarations.
+fn imported_symbols(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+) -> Vec<solsp_hir::resolve::Definition> {
+    use solsp_hir::imports::ImportKind;
+    let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    for imp in solsp_hir::imports::imports(root) {
+        let Some(turi) = state::resolve_import_uri(uri, &imp.path) else {
+            continue;
+        };
+        let Some(tfile) = state.file(&turi) else {
+            continue;
+        };
+        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        match &imp.kind {
+            ImportKind::Named(list) => {
+                for n in list {
+                    if let Some((_, mut def)) =
+                        solsp_hir::resolve::top_level_definition(&troot, &n.name, None)
+                            .map(|d| (turi.clone(), d))
+                            .or_else(|| cross_file_definition(state, &turi, &troot, &n.name, None))
+                    {
+                        def.name = n.local().to_string(); // the label is the local alias
+                        out.push(def);
+                    }
+                }
+            }
+            ImportKind::Glob => collect_file_exports(state, &turi, &troot, &mut visited, &mut out),
+            // `* as N` — `N.member` is member completion, not a bare name.
+            ImportKind::Namespace(_) => {}
+        }
+    }
+    out
+}
+
+/// Collect a file's top-level declarations plus everything it re-exports transitively
+/// (a glob import re-exports its own imports). Cycle-safe via `visited`.
+fn collect_file_exports(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    visited: &mut std::collections::HashSet<Url>,
+    out: &mut Vec<solsp_hir::resolve::Definition>,
+) {
+    use solsp_hir::imports::ImportKind;
+    if !visited.insert(uri.clone()) {
+        return;
+    }
+    out.extend(solsp_hir::resolve::file_definitions(root));
+    for imp in solsp_hir::imports::imports(root) {
+        let Some(turi) = state::resolve_import_uri(uri, &imp.path) else {
+            continue;
+        };
+        let Some(tfile) = state.file(&turi) else {
+            continue;
+        };
+        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        match &imp.kind {
+            ImportKind::Glob => collect_file_exports(state, &turi, &troot, visited, out),
+            ImportKind::Named(list) => {
+                for n in list {
+                    if let Some((_, mut def)) =
+                        solsp_hir::resolve::top_level_definition(&troot, &n.name, None)
+                            .map(|d| (turi.clone(), d))
+                            .or_else(|| cross_file_definition(state, &turi, &troot, &n.name, None))
+                    {
+                        def.name = n.local().to_string();
+                        out.push(def);
+                    }
+                }
+            }
+            ImportKind::Namespace(_) => {}
+        }
+    }
+}
+
+/// Completion for the key side of a named-argument list (`f({ <here>: … })`): the
+/// parameter names of the callee function, the field names of a struct, or a contract's
+/// constructor parameters. `None` when not at a named-argument key.
+fn named_arg_completion(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<Vec<CompletionItem>> {
+    use solsp_syntax::SyntaxKind::*;
+    let node = root
+        .token_at_offset(offset)
+        .left_biased()
+        .and_then(|t| t.parent())?;
+    let nal = node.ancestors().find(|n| n.kind() == NAMED_ARG_LIST)?;
+    // bail in the value position (after a `:` on the current argument).
+    let mut last_delim = None;
+    for t in nal.children_with_tokens().filter_map(|e| e.into_token()) {
+        if t.text_range().start() >= offset {
+            break;
+        }
+        match t.kind() {
+            COLON => last_delim = Some(COLON),
+            COMMA | L_BRACE | L_PAREN => last_delim = Some(t.kind()),
+            _ => {}
+        }
+    }
+    if last_delim == Some(COLON) {
+        return None; // value position — let scope/member completion handle it
+    }
+    let call = nal.parent()?;
+    let callee = call.first_child()?;
+    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    let droot = parse_root(state, &def_uri)?;
+    let node = def.full_ptr.to_node(&droot);
+    use solsp_hir::resolve::DefKind;
+    let names: Vec<String> = match def.kind {
+        DefKind::Function | DefKind::Modifier | DefKind::Event | DefKind::Error => {
+            param_names(&node)
+        }
+        DefKind::Struct => solsp_hir::resolve::type_members(&node)
+            .into_iter()
+            .map(|d| d.name)
+            .collect(),
+        DefKind::Contract => node
+            .descendants()
+            .find(|n| n.kind() == CONSTRUCTOR_DEF)
+            .map(|c| param_names(&c))
+            .unwrap_or_default(),
+        _ => return None,
+    };
+    Some(
+        names
+            .into_iter()
+            .map(|name| CompletionItem {
+                kind: Some(CompletionItemKind::FIELD),
+                detail: Some("named argument".to_string()),
+                label: name,
+                ..Default::default()
+            })
+            .collect(),
+    )
+}
+
+/// Resolve a named-call callee to its declaration: `new T(...)` → the type `T`, else a
+/// function/struct/contract name or `obj.method`.
+fn resolve_named_callee(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    callee: &solsp_syntax::SyntaxNode,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use solsp_syntax::SyntaxKind::{NAME_REF, NEW_EXPR};
+    if callee.kind() == NEW_EXPR {
+        let nr = callee.descendants().find(|n| n.kind() == NAME_REF)?;
+        let name = solsp_hir::resolve::receiver_name(&nr)?;
+        return solsp_hir::resolve::resolve(&nr)
+            .map(|d| (uri.clone(), d))
+            .or_else(|| cross_file_definition(state, uri, root, &name, None));
+    }
+    resolve_callee(state, uri, root, callee, None)
+}
+
+/// The parameter names of a function/constructor (its first `PARAM_LIST`).
+fn param_names(decl: &solsp_syntax::SyntaxNode) -> Vec<String> {
+    use solsp_syntax::SyntaxKind::{IDENT, NAME, PARAM, PARAM_LIST};
+    decl.children()
+        .find(|n| n.kind() == PARAM_LIST)
+        .into_iter()
+        .flat_map(|pl| pl.children())
+        .filter(|n| n.kind() == PARAM)
+        .filter_map(|p| p.children().find(|c| c.kind() == NAME))
+        .filter_map(|nm| {
+            nm.children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| t.kind() == IDENT)
+                .map(|t| t.text().to_string())
+        })
+        .collect()
 }
 
 /// The receiver expression of a `receiver.member` access at `offset`, when the cursor is
