@@ -431,6 +431,8 @@ dependencies = [
  "dashmap",
  "lsp-server",
  "lsp-types",
+ "rowan",
+ "serde",
  "serde_json",
  "solsp-ide",
  "solsp-syntax",
