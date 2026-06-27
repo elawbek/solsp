@@ -1164,14 +1164,23 @@ fn resolve_callee(
                 return Some((uri.clone(), def));
             }
             let name = solsp_hir::resolve::receiver_name(callee)?;
-            cross_file_definition(state, uri, root, &name, arity)
+            if let Some(found) = cross_file_definition(state, uri, root, &name, arity) {
+                return Some(found);
+            }
+            // a bare call to an internal/private method inherited from a cross-file base.
+            let contract = enclosing_contract(callee)?;
+            inherited_member(state, uri, root, &contract, &name, arity)
         }
         MEMBER_EXPR => {
             let recv = callee.first_child()?;
             let member = member_name(callee)?;
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
-            let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, arity)?;
-            Some((turi, mdef))
+            // same-file C3 first, then cross-file inheritance.
+            if let Some(mdef) = solsp_hir::resolve::member_in_type(&tdef, &member, arity) {
+                return Some((turi, mdef));
+            }
+            let troot = parse_root(state, &turi)?;
+            inherited_member(state, &turi, &troot, &tdef, &member, arity)
         }
         _ => None,
     }
