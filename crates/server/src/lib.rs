@@ -325,20 +325,157 @@ fn member_resolve(
 }
 
 /// Resolve the receiver of a member access to its type definition node and the file
-/// that node lives in. A type name resolves to itself; a variable follows its declared
-/// type; `arr[i]` follows the array's element type.
+/// that node lives in.
 fn resolve_receiver_type(
     state: &ServerState,
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
-    // `arr[i].member` — resolve the array's *element* type.
-    if receiver.kind() == solsp_syntax::SyntaxKind::INDEX_EXPR {
-        let base = receiver.first_child()?;
-        return resolve_value_type(state, uri, root, &base, true);
+    receiver_type(state, uri, root, receiver, false)
+}
+
+/// The type definition of an expression (structural, recursive). With `element`, the
+/// array element type (for an indexed expression). Handles names, member access, calls
+/// (→ the function's return type), indexing, and parentheses — so a chain like
+/// `a.b().c[d].e` resolves segment by segment.
+fn receiver_type(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    expr: &solsp_syntax::SyntaxNode,
+    element: bool,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    use solsp_syntax::SyntaxKind::*;
+    match expr.kind() {
+        PAREN_EXPR | TUPLE_EXPR => receiver_type(state, uri, root, &expr.first_child()?, element),
+        INDEX_EXPR => receiver_type(state, uri, root, &expr.first_child()?, true),
+        CALL_EXPR => call_result_type(state, uri, root, expr, element),
+        MEMBER_EXPR => {
+            let recv = expr.first_child()?;
+            let member = member_name(expr)?;
+            let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
+            let troot = parse_root(state, &turi)?;
+            let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, None)?;
+            member_value_type(state, &turi, &troot, &mdef, element)
+        }
+        PATH_EXPR | NAME_REF => resolve_value_type(state, uri, root, expr, element),
+        _ => None,
     }
-    resolve_value_type(state, uri, root, receiver, false)
+}
+
+/// The result type of a call expression: the callee's return type, or — for a cast /
+/// constructor `Type(x)` — the type itself.
+fn call_result_type(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    call: &solsp_syntax::SyntaxNode,
+    element: bool,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    use solsp_hir::resolve::DefKind;
+    let callee = call.first_child()?;
+    let arity = arg_count(call);
+    let (def_uri, def) = resolve_callee(state, uri, root, &callee, arity)?;
+    let def_root = parse_root(state, &def_uri)?;
+    let def_node = def.full_ptr.to_node(&def_root);
+    match def.kind {
+        DefKind::Function => {
+            let ret = function_return_param(&def_node)?;
+            let path_type = solsp_hir::resolve::decl_type_path(&ret, element)?;
+            resolve_path_type(state, &def_uri, &def_root, &path_type)
+        }
+        _ if is_type_kind(def.kind) && !element => Some((def_uri, def_node)),
+        _ => None,
+    }
+}
+
+/// Resolve a call's callee to its declaration: a plain name (function, or a type for a
+/// cast/constructor), or a member `obj.method`.
+fn resolve_callee(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    callee: &solsp_syntax::SyntaxNode,
+    arity: Option<usize>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use solsp_syntax::SyntaxKind::*;
+    match callee.kind() {
+        PATH_EXPR | NAME_REF => {
+            let nr = receiver_name_ref(callee)?;
+            if let Some(def) = solsp_hir::resolve::resolve(&nr) {
+                return Some((uri.clone(), def));
+            }
+            let name = solsp_hir::resolve::receiver_name(callee)?;
+            cross_file_definition(state, uri, root, &name, arity)
+        }
+        MEMBER_EXPR => {
+            let recv = callee.first_child()?;
+            let member = member_name(callee)?;
+            let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
+            let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, arity)?;
+            Some((turi, mdef))
+        }
+        _ => None,
+    }
+}
+
+/// The type of a member (`a.b` as a value): a field/variable follows its declared type;
+/// a nested type is itself. With `element`, the array element type.
+fn member_value_type(
+    state: &ServerState,
+    member_uri: &Url,
+    member_root: &solsp_syntax::SyntaxNode,
+    mdef: &solsp_hir::resolve::Definition,
+    element: bool,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    use solsp_hir::resolve::DefKind;
+    let node = mdef.full_ptr.to_node(member_root);
+    match mdef.kind {
+        DefKind::Contract
+        | DefKind::Interface
+        | DefKind::Library
+        | DefKind::Struct
+        | DefKind::Enum
+            if !element =>
+        {
+            Some((member_uri.clone(), node))
+        }
+        DefKind::StateVariable | DefKind::Field | DefKind::Local | DefKind::Parameter => {
+            let path_type = solsp_hir::resolve::decl_type_path(&node, element)?;
+            resolve_path_type(state, member_uri, member_root, &path_type)
+        }
+        _ => None,
+    }
+}
+
+/// The member name of a `MEMBER_EXPR` (`b` in `a.b`).
+fn member_name(member_expr: &solsp_syntax::SyntaxNode) -> Option<String> {
+    use solsp_syntax::SyntaxKind::{IDENT, NAME_REF};
+    let nr = member_expr.children().nth(1)?; // [receiver, member]
+    if nr.kind() != NAME_REF {
+        return None;
+    }
+    nr.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == IDENT)
+        .map(|t| t.text().to_string())
+}
+
+/// The argument count of a call's `ARG_LIST` / `NAMED_ARG_LIST`.
+fn arg_count(call: &solsp_syntax::SyntaxNode) -> Option<usize> {
+    use solsp_syntax::SyntaxKind::{ARG_LIST, NAMED_ARG_LIST};
+    let args = call
+        .children()
+        .find(|n| matches!(n.kind(), ARG_LIST | NAMED_ARG_LIST))?;
+    Some(args.children().count())
+}
+
+/// The first `PARAM` of a function's return list (its second `PARAM_LIST`).
+fn function_return_param(func: &solsp_syntax::SyntaxNode) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::{PARAM, PARAM_LIST};
+    let returns = func.children().filter(|n| n.kind() == PARAM_LIST).nth(1)?;
+    returns.children().find(|n| n.kind() == PARAM)
 }
 
 /// Resolve a receiver to a type def. With `element`, take the array element type
@@ -357,7 +494,7 @@ fn resolve_value_type(
 
     let (def_uri, def) = match solsp_hir::resolve::resolve(&recv_ref) {
         Some(def) => (uri.clone(), def),
-        None => cross_file_definition(state, uri, root, &name)?,
+        None => cross_file_definition(state, uri, root, &name, None)?,
     };
     let def_root = parse_root(state, &def_uri)?;
     let def_node = def.full_ptr.to_node(&def_root);
@@ -418,7 +555,7 @@ fn resolve_type_by_name(
             return Some((uri.clone(), def.full_ptr.to_node(root)));
         }
     }
-    let (turi, def) = cross_file_definition(state, uri, root, type_name)?;
+    let (turi, def) = cross_file_definition(state, uri, root, type_name, None)?;
     if is_type_kind(def.kind) {
         let troot = parse_root(state, &turi)?;
         return Some((turi, def.full_ptr.to_node(&troot)));
@@ -441,6 +578,7 @@ fn cross_file_definition(
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     name: &str,
+    arity: Option<usize>,
 ) -> Option<(Url, solsp_hir::resolve::Definition)> {
     for imp in solsp_hir::imports::imports(root) {
         let Some(export) = exported_name(&imp.kind, name) else {
@@ -453,8 +591,7 @@ fn cross_file_definition(
             continue;
         };
         let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        // only used for receiver/type resolution (not a direct call) → no arity.
-        if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export, None) {
+        if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export, arity) {
             return Some((target_uri, def));
         }
     }

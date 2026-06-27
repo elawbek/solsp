@@ -788,6 +788,83 @@ fn overload_resolution_picks_matching_arity() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn chained_member_access_resolves_through_call_return_type() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_chain");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let other = dir.join("Other.sol");
+    let main = dir.join("Main.sol");
+    fs::write(
+        &other,
+        "interface IT { struct Data { uint256 amount; } }\n\
+         library Lib { function get() internal pure returns (IT.Data storage d) {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        "import {Lib, IT} from \"Other.sol\";\n\
+         contract C { function f() public { uint256 x = Lib.get().amount; } }\n",
+    )
+    .unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let other_uri = Url::from_file_path(fs::canonicalize(&other).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    // `Lib.get().amount` — receiver is the call `Lib.get()`; its type is the function's
+    // return type `IT.Data`; `amount` is that struct's field in Other.sol.
+    let line1 = main_src.lines().nth(1).unwrap();
+    let ch = line1.find("amount").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&main_uri),
+                position: Position {
+                    line: 1,
+                    character: ch + 1,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = def else {
+        panic!("expected a definition location");
+    };
+    assert_eq!(loc.uri, other_uri);
+    assert_eq!(loc.range.start.line, 0); // `amount` is on Other.sol line 0
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
