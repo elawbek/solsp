@@ -629,6 +629,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "solsp-hir"
+version = "0.0.1"
+dependencies = [
+ "rowan",
+ "salsa",
+ "solsp-base-db",
+ "solsp-syntax",
+]
+
+[[package]]
 name = "solsp-ide"
 version = "0.0.1"
 dependencies = [
