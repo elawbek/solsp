@@ -43,6 +43,8 @@ pub enum Ty {
     Array(Box<Ty>),
     /// `T[N]` — fixed-size array (the size isn't tracked).
     FixedArray(Box<Ty>),
+    /// `mapping(K => V)` — only assignable to a mapping (key/value not tracked).
+    Mapping,
     /// A user-defined type by name (contract / interface / struct / enum / user value
     /// type), possibly qualified (`A.B`) — the last segment is kept.
     User(String),
@@ -63,6 +65,9 @@ pub fn parse_ty(text: &str) -> Ty {
         .trim_end_matches(" storage")
         .trim_end_matches(" calldata")
         .trim();
+    if t.starts_with("mapping") && t.contains("=>") {
+        return Ty::Mapping;
+    }
     if let Some(inner) = t.strip_suffix("[]") {
         return Ty::Array(Box::new(parse_ty(inner)));
     }
@@ -127,6 +132,9 @@ pub fn implicitly_convertible(from: &Ty, to: &Ty, is_base: &dyn Fn(&str, &str) -
         (NumberLiteral, BytesN(_) | Bytes) => true, // `0`/hex literal, fit untracked
         (StringLiteral, StringT | Bytes | BytesN(_)) => true,
         (BoolLiteral, Bool) => true,
+
+        // a mapping is only a mapping (storage references); never another category.
+        (Mapping, Mapping) => true,
 
         // arrays / bytes / string convert only by exact identity (handled by `from == to`).
         _ => false,

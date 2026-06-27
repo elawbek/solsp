@@ -519,10 +519,11 @@ fn receiver_value_info(
     if receiver.kind() == INDEX_EXPR {
         // `base[i]` → the array element / mapping value type; storage follows the base.
         let base = receiver.first_child()?;
-        // a declared array/mapping → its element/value type (handles mapping values).
+        // a declared array/mapping → its element/value type (a nested mapping value stays
+        // a mapping, which is reportable when a struct is expected).
         if let Some(base_decl) = receiver_decl(state, uri, root, &base) {
-            if let Some(elem) = solsp_hir::resolve::decl_type_path(&base_decl, true) {
-                return Some((node_type_text(&elem), is_storage_decl(&base_decl)));
+            if let Some(t) = indexed_type_text(&base_decl) {
+                return Some((t, is_storage_decl(&base_decl)));
             }
         }
         // a nested index / call base → strip one array level from its type text.
@@ -1309,6 +1310,27 @@ fn type_text(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
         .children()
         .find(|n| n.kind() != solsp_syntax::SyntaxKind::NAME)?;
     Some(node_type_text(&ty))
+}
+
+/// The element/value type text of an array or mapping declaration (`T[]` → `T`,
+/// `mapping(K => V)` → `V`, including when `V` is itself a mapping). `None` for other types.
+fn indexed_type_text(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
+    use solsp_syntax::SyntaxKind::{ARRAY_TYPE, MAPPING_TYPE, NAME, PATH_TYPE};
+    let is_type = |k| matches!(k, PATH_TYPE | ARRAY_TYPE | MAPPING_TYPE);
+    let ty = decl.children().find(|n| n.kind() != NAME)?;
+    match ty.kind() {
+        ARRAY_TYPE => ty
+            .children()
+            .find(|n| is_type(n.kind()))
+            .map(|n| node_type_text(&n)),
+        // a mapping's value is its last type child (`=> V`).
+        MAPPING_TYPE => ty
+            .children()
+            .filter(|n| is_type(n.kind()))
+            .last()
+            .map(|n| node_type_text(&n)),
+        _ => None,
+    }
 }
 
 /// The text of a type node with comment trivia dropped and whitespace normalized, so a
