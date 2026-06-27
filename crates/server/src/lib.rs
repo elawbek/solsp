@@ -180,7 +180,8 @@ fn goto_definition(
     // 3. an imported top-level symbol (a use site, or a name inside `{ ... }`) → jump
     //    into the target file.
     if let Some(name) = solsp_ide::navigation::name_at(&root, offset) {
-        if let Some((target_uri, range)) = cross_file_target(state, &uri, &root, &name) {
+        let arity = arity_at(&root, offset);
+        if let Some((target_uri, range)) = cross_file_target(state, &uri, &root, &name, arity) {
             let tli = state.line_index(&target_uri)?;
             return Some(GotoDefinitionResponse::Scalar(Location {
                 uri: target_uri,
@@ -235,7 +236,8 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
             continue;
         };
         let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        if let Some(info) = solsp_ide::navigation::hover_top_level(&troot, &export) {
+        let arity = arity_at(&root, offset);
+        if let Some(info) = solsp_ide::navigation::hover_top_level(&troot, &export, arity) {
             // The hovered identifier is in *this* file; report no range (the target
             // range would be in the wrong document) and let the client highlight it.
             return Some(markup_hover(info.contents, None));
@@ -244,13 +246,25 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     None
 }
 
+/// The argument count of the call whose callee is the identifier at `offset` (for
+/// overload resolution), or `None` if the cursor is not on a callee.
+fn arity_at(root: &solsp_syntax::SyntaxNode, offset: rowan::TextSize) -> Option<usize> {
+    let token = root
+        .token_at_offset(offset)
+        .find(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)?;
+    let name_ref = token.parent()?;
+    solsp_hir::resolve::call_arity(&name_ref)
+}
+
 /// Find an imported top-level symbol `name` referenced in `root`: returns the target
-/// file URI and the byte range (in that file) of the declaration's name.
+/// file URI and the byte range (in that file) of the declaration's name. `arity` picks
+/// a matching function overload.
 fn cross_file_target(
     state: &ServerState,
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     name: &str,
+    arity: Option<usize>,
 ) -> Option<(Url, rowan::TextRange)> {
     for imp in solsp_hir::imports::imports(root) {
         let Some(export) = exported_name(&imp.kind, name) else {
@@ -263,7 +277,7 @@ fn cross_file_target(
             continue;
         };
         let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        if let Some(range) = solsp_ide::navigation::goto_top_level(&troot, &export) {
+        if let Some(range) = solsp_ide::navigation::goto_top_level(&troot, &export, arity) {
             return Some((target_uri, range));
         }
     }
@@ -304,7 +318,9 @@ fn member_resolve(
     let (receiver, member) = solsp_hir::resolve::member_access(&member_ref)?;
 
     let (type_uri, type_def) = resolve_receiver_type(state, uri, root, &receiver)?;
-    let member_def = solsp_hir::resolve::member_in_type(&type_def, &member)?;
+    // `obj.method(args)` — pick the overload matching the call's argument count.
+    let arity = solsp_hir::resolve::call_arity(&member_ref);
+    let member_def = solsp_hir::resolve::member_in_type(&type_def, &member, arity)?;
     Some((type_uri, member_def))
 }
 
@@ -379,7 +395,7 @@ fn resolve_path_type(
     let (first, rest) = segments.split_first()?;
     let (turi, mut type_def) = resolve_type_by_name(state, uri, root, first)?;
     for seg in rest {
-        let member = solsp_hir::resolve::member_in_type(&type_def, seg)?;
+        let member = solsp_hir::resolve::member_in_type(&type_def, seg, None)?;
         if !is_type_kind(member.kind) {
             return None;
         }
@@ -397,7 +413,7 @@ fn resolve_type_by_name(
     root: &solsp_syntax::SyntaxNode,
     type_name: &str,
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
-    if let Some(def) = solsp_hir::resolve::top_level_definition(root, type_name) {
+    if let Some(def) = solsp_hir::resolve::top_level_definition(root, type_name, None) {
         if is_type_kind(def.kind) {
             return Some((uri.clone(), def.full_ptr.to_node(root)));
         }
@@ -437,7 +453,8 @@ fn cross_file_definition(
             continue;
         };
         let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export) {
+        // only used for receiver/type resolution (not a direct call) → no arity.
+        if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export, None) {
             return Some((target_uri, def));
         }
     }

@@ -44,9 +44,14 @@ pub struct Definition {
 }
 
 /// A top-level declaration of `root` named `name` (contract/function/struct/etc.).
-/// Used to resolve an imported symbol against the target file's tree (M2 P7).
-pub fn top_level_definition(root: &SyntaxNode, name: &str) -> Option<Definition> {
-    find_named_decl(root.children(), name)
+/// `arity` (when set) picks the matching function overload. Used to resolve an imported
+/// symbol against the target file's tree (M2 P7).
+pub fn top_level_definition(
+    root: &SyntaxNode,
+    name: &str,
+    arity: Option<usize>,
+) -> Option<Definition> {
+    find_named_decl(root.children(), name, arity)
 }
 
 /// If `reference` (a `NAME_REF`) is the member side of a qualified access, return the
@@ -105,11 +110,16 @@ pub fn declared_type_name(decl: &SyntaxNode) -> Option<String> {
 }
 
 /// Look up `member` inside a type definition's body: contract/interface/library
-/// members (incl. same-file C3 bases), struct fields, or enum variants.
-pub fn member_in_type(type_def: &SyntaxNode, member: &str) -> Option<Definition> {
+/// members (incl. same-file C3 bases), struct fields, or enum variants. `arity` (when
+/// set) picks the matching method overload.
+pub fn member_in_type(
+    type_def: &SyntaxNode,
+    member: &str,
+    arity: Option<usize>,
+) -> Option<Definition> {
     use SyntaxKind::*;
     match type_def.kind() {
-        CONTRACT_DEF => lookup_member(type_def, member),
+        CONTRACT_DEF => lookup_member(type_def, member, arity),
         STRUCT_DEF | ENUM_DEF => type_def
             .descendants()
             .filter(|n| matches!(n.kind(), STRUCT_FIELD | ENUM_VARIANT))
@@ -134,13 +144,43 @@ pub fn member_in_type(type_def: &SyntaxNode, member: &str) -> Option<Definition>
 /// Returns `None` for builtins/unknowns (and anything needing imports/inheritance).
 pub fn resolve(reference: &SyntaxNode) -> Option<Definition> {
     let target = ident_text(reference)?;
+    // when the reference is a call's callee, prefer the overload with matching arity.
+    let arity = call_arity(reference);
     // `ancestors()` yields the node itself first, then each parent up to SOURCE_FILE.
     for scope in reference.ancestors() {
-        if let Some(def) = lookup_in_scope(&scope, &target) {
+        if let Some(def) = lookup_in_scope(&scope, &target, arity) {
             return Some(def);
         }
     }
     None
+}
+
+/// If `reference` (a `NAME_REF`) is the callee of a call, the number of arguments in
+/// that call (for overload resolution). `None` if it is not a callee.
+pub fn call_arity(reference: &SyntaxNode) -> Option<usize> {
+    use SyntaxKind::*;
+    let callee = reference.parent()?; // PATH_EXPR or MEMBER_EXPR
+    let call = callee.parent()?;
+    if call.kind() != CALL_EXPR || call.first_child().as_ref() != Some(&callee) {
+        return None; // not the callee position
+    }
+    let args = call
+        .children()
+        .find(|n| matches!(n.kind(), ARG_LIST | NAMED_ARG_LIST))?;
+    Some(args.children().count()) // each child node is one argument
+}
+
+/// The parameter count of a function-like declaration (its first `PARAM_LIST`).
+fn param_count(decl: &SyntaxNode) -> Option<usize> {
+    let plist = decl
+        .children()
+        .find(|n| n.kind() == SyntaxKind::PARAM_LIST)?;
+    Some(
+        plist
+            .children()
+            .filter(|n| n.kind() == SyntaxKind::PARAM)
+            .count(),
+    )
 }
 
 /// Resolve whatever identifier sits at `offset` (e.g. the LSP cursor). A reference
@@ -159,15 +199,16 @@ pub fn definition_at(root: &SyntaxNode, offset: rowan::TextSize) -> Option<Defin
     }
 }
 
-/// Look for `name` declared directly in one scope node. Non-scope nodes yield `None`.
-fn lookup_in_scope(scope: &SyntaxNode, name: &str) -> Option<Definition> {
+/// Look for `name` declared directly in one scope node. `arity` (when set) disambiguates
+/// overloaded functions by parameter count. Non-scope nodes yield `None`.
+fn lookup_in_scope(scope: &SyntaxNode, name: &str, arity: Option<usize>) -> Option<Definition> {
     use SyntaxKind::*;
     match scope.kind() {
-        SOURCE_FILE => find_named_decl(scope.children(), name),
+        SOURCE_FILE => find_named_decl(scope.children(), name, arity),
         // Member lookup is inheritance-aware: search the contract and its bases in C3
         // order. Keyed on CONTRACT_DEF (an ancestor of the reference) rather than
         // CONTRACT_BODY so we can reach the inheritance list.
-        CONTRACT_DEF => lookup_member(scope, name),
+        CONTRACT_DEF => lookup_member(scope, name, arity),
         FUNCTION_DEF | MODIFIER_DEF | CONSTRUCTOR_DEF => find_param(scope, name),
         BLOCK => find_local(scope, name),
         // a `for (T i; …)` init declaration is a direct child of the FOR_STMT, not the
@@ -209,7 +250,7 @@ pub fn decl_type_path(decl: &SyntaxNode, element: bool) -> Option<SyntaxNode> {
 /// Look up `name` as a member of `contract`, searching the C3-linearized inheritance
 /// chain (the contract first, then bases) — so an inherited member resolves, with the
 /// most-derived override winning. Same-file bases only (cross-file imports: P-later).
-fn lookup_member(contract: &SyntaxNode, name: &str) -> Option<Definition> {
+fn lookup_member(contract: &SyntaxNode, name: &str, arity: Option<usize>) -> Option<Definition> {
     let root = contract.ancestors().last()?; // SOURCE_FILE
     for c in c3_linearize(contract, &root) {
         let members = c
@@ -217,7 +258,7 @@ fn lookup_member(contract: &SyntaxNode, name: &str) -> Option<Definition> {
             .find(|n| n.kind() == SyntaxKind::CONTRACT_BODY)
             .into_iter()
             .flat_map(|body| body.children());
-        if let Some(def) = find_named_decl(members, name) {
+        if let Some(def) = find_named_decl(members, name, arity) {
             return Some(def);
         }
     }
@@ -308,10 +349,32 @@ fn contract_name(contract: &SyntaxNode) -> Option<String> {
 }
 
 /// First child declaration named `name` (file items / contract members).
-fn find_named_decl(nodes: impl Iterator<Item = SyntaxNode>, name: &str) -> Option<Definition> {
-    nodes
-        .filter_map(|n| def_for_decl(&n))
-        .find(|d| d.name == name)
+/// First child declaration named `name`. When `arity` is set and several overloads
+/// share the name, prefer the function whose parameter count matches; otherwise return
+/// the first same-named declaration.
+fn find_named_decl(
+    nodes: impl Iterator<Item = SyntaxNode>,
+    name: &str,
+    arity: Option<usize>,
+) -> Option<Definition> {
+    let mut first: Option<Definition> = None;
+    for node in nodes {
+        let Some(def) = def_for_decl(&node) else {
+            continue;
+        };
+        if def.name != name {
+            continue;
+        }
+        if let Some(n) = arity {
+            if def.kind == DefKind::Function && param_count(&node) == Some(n) {
+                return Some(def); // exact overload match
+            }
+        }
+        if first.is_none() {
+            first = Some(def);
+        }
+    }
+    first
 }
 
 /// A parameter of this function/modifier/constructor named `name`. Params live in
@@ -425,6 +488,29 @@ mod tests {
         // `stored` (lhs) → the state variable (contract member)
         let d = resolve_at(src, "stored =").unwrap();
         assert_eq!(d.kind, DefKind::StateVariable);
+    }
+
+    #[test]
+    fn resolves_overload_by_argument_count() {
+        let src = "contract C {\n\
+            function f() internal {}\n\
+            function f(uint a) internal {}\n\
+            function f(uint a, uint b) internal {}\n\
+            function g() public { f(1, 2); f(1); f(); }\n\
+        }";
+        let root = parse(src).syntax();
+        let resolved = |needle: &str| {
+            resolve_at(src, needle)
+                .unwrap()
+                .full_ptr
+                .to_node(&root)
+                .text()
+                .to_string()
+        };
+        assert!(resolved("f(1, 2)").contains("uint a, uint b")); // 2-arg → 2-param
+        let one = resolved("f(1);");
+        assert!(one.contains("(uint a)") && !one.contains("uint b")); // 1-arg → 1-param
+        assert!(resolved("f(); }").trim_start().starts_with("function f()")); // 0 → 0
     }
 
     #[test]
@@ -564,7 +650,7 @@ mod tests {
             .descendants()
             .find(|n| n.kind() == SyntaxKind::CONTRACT_DEF)
             .unwrap();
-        let m = member_in_type(&lib_def, "s").unwrap();
+        let m = member_in_type(&lib_def, "s", None).unwrap();
         assert_eq!(m.kind, DefKind::Function);
         assert_eq!(m.name, "s");
 

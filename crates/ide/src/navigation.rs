@@ -21,16 +21,17 @@ pub fn name_at(root: &SyntaxNode, offset: TextSize) -> Option<String> {
 }
 
 /// Go-to-def target for a top-level symbol `name` in `root` (a possibly different
-/// file). Used to jump to an imported declaration (M2 P7).
-pub fn goto_top_level(root: &SyntaxNode, name: &str) -> Option<TextRange> {
-    let def = solsp_hir::resolve::top_level_definition(root, name)?;
+/// file). `arity` picks a matching function overload. Used to jump to an imported
+/// declaration (M2 P7).
+pub fn goto_top_level(root: &SyntaxNode, name: &str, arity: Option<usize>) -> Option<TextRange> {
+    let def = solsp_hir::resolve::top_level_definition(root, name, arity)?;
     Some(name_range(root, &def))
 }
 
 /// Hover for a top-level symbol `name` in `root` (a possibly different file). Like
 /// [`hover`], but addressed by name rather than cursor offset (cross-file, M2 P7).
-pub fn hover_top_level(root: &SyntaxNode, name: &str) -> Option<Hover> {
-    let def = solsp_hir::resolve::top_level_definition(root, name)?;
+pub fn hover_top_level(root: &SyntaxNode, name: &str, arity: Option<usize>) -> Option<Hover> {
+    let def = solsp_hir::resolve::top_level_definition(root, name, arity)?;
     let range = name_range(root, &def);
     Some(Hover {
         contents: hover_markdown(root, &def),

@@ -728,6 +728,66 @@ fn remapped_and_node_modules_imports_resolve() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn overload_resolution_picks_matching_arity() {
+    // a library with two `f` overloads, called via `Lib.f(...)` with 1 vs 2 args.
+    let uri = Url::parse("file:///O.sol").unwrap();
+    let src =
+        "library Lib { function f(uint a) internal {} function f(uint a, uint b) internal {} }\n\
+               contract C { function g() public { Lib.f(1); Lib.f(1, 2); } }\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line1 = src.lines().nth(1).unwrap();
+    let def = |id: i32, character: u32| {
+        send_request(
+            &client,
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position { line: 1, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        );
+        let resp = next_response(&client);
+        let d: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let GotoDefinitionResponse::Scalar(loc) = d else {
+            panic!("expected a location");
+        };
+        loc.range.start
+    };
+
+    // both overloads are declared on line 0; the 2-arg call must land on the *second*
+    // `f` (later column) and the 1-arg call on the first.
+    let one = def(2, (line1.find("f(1);").unwrap() + 1) as u32);
+    let two = def(3, (line1.find("f(1, 2)").unwrap() + 1) as u32);
+    assert_eq!(one.line, 0);
+    assert_eq!(two.line, 0);
+    assert!(
+        two.character > one.character,
+        "2-arg overload must be the later `f`"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
