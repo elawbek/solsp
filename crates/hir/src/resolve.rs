@@ -45,18 +45,34 @@ pub fn top_level_definition(root: &SyntaxNode, name: &str) -> Option<Definition>
     find_named_decl(root.children(), name)
 }
 
-/// If `reference` (a `NAME_REF`) is the member side of a `receiver.member` access,
-/// return the receiver expression node and the member name. `None` otherwise.
+/// If `reference` (a `NAME_REF`) is the member side of a qualified access, return the
+/// receiver node and the member name. Handles both an expression member access
+/// (`recv.member` ⇒ `MEMBER_EXPR`) and a qualified *type* path (`Iface.NestedType` ⇒
+/// `PATH_TYPE` with multiple `NAME_REF` segments). `None` for the base/receiver itself.
 pub fn member_access(reference: &SyntaxNode) -> Option<(SyntaxNode, String)> {
+    use SyntaxKind::*;
     let parent = reference.parent()?;
-    if parent.kind() != SyntaxKind::MEMBER_EXPR {
-        return None;
+    match parent.kind() {
+        MEMBER_EXPR => {
+            let receiver = parent.first_child()?; // the receiver expression
+            if &receiver == reference {
+                return None; // `reference` is the receiver, not the member
+            }
+            Some((receiver, ident_text(reference)?))
+        }
+        PATH_TYPE => {
+            // A qualified type `A.B` is `PATH_TYPE` with `NAME_REF` segments. The member
+            // is any segment after the first; the preceding segment is the receiver.
+            let segments: Vec<SyntaxNode> =
+                parent.children().filter(|n| n.kind() == NAME_REF).collect();
+            let idx = segments.iter().position(|n| n == reference)?;
+            if idx == 0 {
+                return None; // the base type, not a member
+            }
+            Some((segments[idx - 1].clone(), ident_text(reference)?))
+        }
+        _ => None,
     }
-    let receiver = parent.first_child()?; // the receiver expression
-    if &receiver == reference {
-        return None; // `reference` is the receiver, not the member
-    }
-    Some((receiver, ident_text(reference)?))
 }
 
 /// The simple name of a receiver expression — `X` in `X.member` — when it is a bare

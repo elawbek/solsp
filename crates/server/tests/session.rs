@@ -488,7 +488,7 @@ fn member_access_resolves_cross_file() {
     let main = dir.join("Main.sol");
     fs::write(
         &other,
-        "interface IThing { function ping() external; }\n\
+        "interface IThing { struct Data { uint256 x; } function ping() external; }\n\
          library Lib { function doThing() internal pure {} }\n",
     )
     .unwrap();
@@ -497,6 +497,7 @@ fn member_access_resolves_cross_file() {
         "import {Lib, IThing} from \"Other.sol\";\n\
          contract Main {\n\
              IThing thing;\n\
+             IThing.Data d;\n\
              function f() public { Lib.doThing(); thing.ping(); }\n\
          }\n",
     )
@@ -522,8 +523,9 @@ fn member_access_resolves_cross_file() {
     );
     let _ = next_notification(&client, "textDocument/publishDiagnostics");
 
-    let line3 = main_src.lines().nth(3).unwrap();
-    let definition = |id: i32, character: u32| {
+    let typed_line = main_src.lines().nth(3).unwrap(); // `IThing.Data d;`
+    let body_line = main_src.lines().nth(4).unwrap(); // the function body
+    let definition = |id: i32, line: u32, character: u32| {
         send_request(
             &client,
             id,
@@ -531,7 +533,7 @@ fn member_access_resolves_cross_file() {
             GotoDefinitionParams {
                 text_document_position_params: TextDocumentPositionParams {
                     text_document: doc_id(&main_uri),
-                    position: Position { line: 3, character },
+                    position: Position { line, character },
                 },
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
@@ -546,14 +548,20 @@ fn member_access_resolves_cross_file() {
     };
 
     // `Lib.doThing()` → the library method in Other.sol (line 1).
-    let ch = line3.find("doThing").unwrap() as u32;
-    let loc = definition(2, ch + 1);
+    let ch = body_line.find("doThing").unwrap() as u32;
+    let loc = definition(2, 4, ch + 1);
     assert_eq!(loc.uri, other_uri);
     assert_eq!(loc.range.start.line, 1);
 
     // `thing.ping()` → via the state var `IThing thing` → IThing.ping in Other.sol (line 0).
-    let ch = line3.find("ping").unwrap() as u32;
-    let loc = definition(3, ch + 1);
+    let ch = body_line.find("ping").unwrap() as u32;
+    let loc = definition(3, 4, ch + 1);
+    assert_eq!(loc.uri, other_uri);
+    assert_eq!(loc.range.start.line, 0);
+
+    // qualified type `IThing.Data` → the struct nested in the interface (Other.sol line 0).
+    let ch = typed_line.find("Data").unwrap() as u32;
+    let loc = definition(4, 3, ch + 1);
     assert_eq!(loc.uri, other_uri);
     assert_eq!(loc.range.start.line, 0);
 
