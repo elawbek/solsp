@@ -143,6 +143,11 @@ pub fn member_in_type(
 /// Resolve a `NAME_REF` (or `NAME`) node to its definition within the same file.
 /// Returns `None` for builtins/unknowns (and anything needing imports/inheritance).
 pub fn resolve(reference: &SyntaxNode) -> Option<Definition> {
+    // the `.member` of `receiver.member` must NOT resolve lexically — it belongs to the
+    // receiver's type (member resolution), even when a same-named local is in scope.
+    if is_member_position(reference) {
+        return None;
+    }
     let target = ident_text(reference)?;
     // when the reference is a call's callee, prefer the overload with matching arity.
     let arity = call_arity(reference);
@@ -153,6 +158,15 @@ pub fn resolve(reference: &SyntaxNode) -> Option<Definition> {
         }
     }
     None
+}
+
+/// Whether `reference` is the member side of a `MEMBER_EXPR` (`x` in `recv.x`) — i.e.
+/// not the receiver (its first child).
+fn is_member_position(reference: &SyntaxNode) -> bool {
+    reference
+        .parent()
+        .filter(|p| p.kind() == SyntaxKind::MEMBER_EXPR)
+        .is_some_and(|p| p.first_child().as_ref() != Some(reference))
 }
 
 /// If `reference` (a `NAME_REF`) is the callee of a call, the number of arguments in
@@ -565,6 +579,24 @@ mod tests {
         // `stored` (lhs) → the state variable (contract member)
         let d = resolve_at(src, "stored =").unwrap();
         assert_eq!(d.kind, DefKind::StateVariable);
+    }
+
+    #[test]
+    fn member_does_not_resolve_to_same_named_local() {
+        // `lib.s` — the member `s` must NOT bind to the local `s` in scope; it belongs
+        // to the receiver's type (member resolution handles it). Regression: clicking
+        // `s` in `CraftV2Lib.s()` jumped to a same-named local instead of the method.
+        let src = "contract C { function f() public { uint256 s = 1; uint256 y = lib.s; } }";
+        let root = parse(src).syntax();
+        let member = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::MEMBER_EXPR)
+            .and_then(|m| m.children().nth(1)) // [receiver, member]
+            .unwrap();
+        assert_eq!(member.kind(), SyntaxKind::NAME_REF);
+        assert!(resolve(&member).is_none());
+        // the receiver `lib` (first child) still resolves lexically — here unknown → None,
+        // but a real receiver would bind; the guard must not affect it.
     }
 
     #[test]
