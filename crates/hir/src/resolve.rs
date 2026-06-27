@@ -413,8 +413,34 @@ fn c3_merge(mut seqs: Vec<Vec<SyntaxNode>>) -> Vec<SyntaxNode> {
     }
 }
 
+/// Look up `name` among a single contract's *own* members (its `CONTRACT_BODY`, no
+/// inheritance). Used by the server to walk cross-file inheritance one contract at a
+/// time. `arity` picks a matching method overload.
+pub fn contract_member(
+    contract: &SyntaxNode,
+    name: &str,
+    arity: Option<usize>,
+) -> Option<Definition> {
+    let members = contract
+        .children()
+        .find(|n| n.kind() == SyntaxKind::CONTRACT_BODY)
+        .into_iter()
+        .flat_map(|body| body.children());
+    find_named_decl(members, name, arity)
+}
+
+/// The contract/interface/library named `name` declared at the top level of `root`.
+pub fn find_contract(root: &SyntaxNode, name: &str) -> Option<SyntaxNode> {
+    resolve_contract(root, name)
+}
+
+/// The declared name of a contract/interface/library definition node.
+pub fn contract_def_name(contract: &SyntaxNode) -> Option<String> {
+    contract_name(contract)
+}
+
 /// Names listed in a contract's `is A, B` clause (each base's identifier).
-fn base_names(contract: &SyntaxNode) -> Vec<String> {
+pub fn base_names(contract: &SyntaxNode) -> Vec<String> {
     let Some(c) = ContractDef::cast(contract.clone()) else {
         return Vec::new();
     };

@@ -177,6 +177,17 @@ fn goto_definition(
             range,
         }));
     }
+    // 2b. a bare name inherited from a cross-file base contract (e.g. a forge-std `Test`
+    //     helper or `vm`).
+    if let Some((target_uri, def)) = inherited_name_at(state, &uri, &root, offset) {
+        let troot = parse_root(state, &target_uri)?;
+        let tli = state.line_index(&target_uri)?;
+        let range = to_proto::range(tli, def_name_range(&troot, &def));
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
     // 3. an imported top-level symbol (a use site, or a name inside `{ ... }`) → jump
     //    into the target file.
     if let Some(name) = solsp_ide::navigation::name_at(&root, offset) {
@@ -217,6 +228,14 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     }
     // 2. member access `receiver.member` → hover from the member's declaration.
     if let Some((target_uri, def)) = member_resolve(state, &uri, &root, offset) {
+        let troot = parse_root(state, &target_uri)?;
+        return Some(markup_hover(
+            solsp_ide::navigation::hover_text(&troot, &def),
+            None,
+        ));
+    }
+    // 2b. a bare name inherited from a cross-file base contract.
+    if let Some((target_uri, def)) = inherited_name_at(state, &uri, &root, offset) {
         let troot = parse_root(state, &target_uri)?;
         return Some(markup_hover(
             solsp_ide::navigation::hover_text(&troot, &def),
@@ -320,8 +339,12 @@ fn member_resolve(
     let (type_uri, type_def) = resolve_receiver_type(state, uri, root, &receiver)?;
     // `obj.method(args)` — pick the overload matching the call's argument count.
     let arity = solsp_hir::resolve::call_arity(&member_ref);
-    let member_def = solsp_hir::resolve::member_in_type(&type_def, &member, arity)?;
-    Some((type_uri, member_def))
+    if let Some(def) = solsp_hir::resolve::member_in_type(&type_def, &member, arity) {
+        return Some((type_uri, def));
+    }
+    // the member may be inherited from a cross-file base of the receiver's type.
+    let troot = parse_root(state, &type_uri)?;
+    inherited_member(state, &type_uri, &troot, &type_def, &member, arity)
 }
 
 /// Resolve the receiver of a member access to its type definition node and the file
@@ -492,10 +515,14 @@ fn resolve_value_type(
     let name = solsp_hir::resolve::receiver_name(receiver)?;
     let recv_ref = receiver_name_ref(receiver)?;
 
-    let (def_uri, def) = match solsp_hir::resolve::resolve(&recv_ref) {
-        Some(def) => (uri.clone(), def),
-        None => cross_file_definition(state, uri, root, &name, None)?,
-    };
+    let (def_uri, def) = solsp_hir::resolve::resolve(&recv_ref)
+        .map(|d| (uri.clone(), d))
+        .or_else(|| cross_file_definition(state, uri, root, &name, None))
+        .or_else(|| {
+            // an inherited member from a cross-file base (e.g. forge-std's `vm`).
+            let contract = enclosing_contract(receiver)?;
+            inherited_member(state, uri, root, &contract, &name, None)
+        })?;
     let def_root = parse_root(state, &def_uri)?;
     let def_node = def.full_ptr.to_node(&def_root);
 
@@ -517,6 +544,93 @@ fn resolve_value_type(
         }
         _ => None,
     }
+}
+
+/// The nearest enclosing contract/interface/library definition of a node.
+fn enclosing_contract(node: &solsp_syntax::SyntaxNode) -> Option<solsp_syntax::SyntaxNode> {
+    node.ancestors()
+        .find(|n| n.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF)
+}
+
+/// Resolve a base contract name to its definition node and file — same-file first, then
+/// an imported base.
+fn resolve_base(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    base_name: &str,
+) -> Option<(Url, solsp_syntax::SyntaxNode, solsp_syntax::SyntaxNode)> {
+    if let Some(node) = solsp_hir::resolve::find_contract(root, base_name) {
+        return Some((uri.clone(), root.clone(), node));
+    }
+    let (buri, bdef) = cross_file_definition(state, uri, root, base_name, None)?;
+    if !is_type_kind(bdef.kind) {
+        return None;
+    }
+    let broot = parse_root(state, &buri)?;
+    let bnode = bdef.full_ptr.to_node(&broot);
+    Some((buri, broot, bnode))
+}
+
+/// Look up `name` as a member inherited by `contract`, walking its base contracts across
+/// files (BFS, diamond-safe). Returns the file + [`Definition`] of the first match.
+fn inherited_member(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+    name: &str,
+    arity: Option<usize>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use std::collections::{HashSet, VecDeque};
+    let mut visited: HashSet<(Url, String)> = HashSet::new();
+    let mut queue: VecDeque<(Url, solsp_syntax::SyntaxNode, solsp_syntax::SyntaxNode)> =
+        VecDeque::new();
+    queue.push_back((uri.clone(), root.clone(), contract.clone()));
+    while let Some((u, r, c)) = queue.pop_front() {
+        let key = (
+            u.clone(),
+            solsp_hir::resolve::contract_def_name(&c).unwrap_or_default(),
+        );
+        if !visited.insert(key) {
+            continue; // already searched this contract (diamond)
+        }
+        if let Some(def) = solsp_hir::resolve::contract_member(&c, name, arity) {
+            return Some((u, def));
+        }
+        for base in solsp_hir::resolve::base_names(&c) {
+            if let Some(b) = resolve_base(state, &u, &r, &base) {
+                queue.push_back(b);
+            }
+        }
+    }
+    None
+}
+
+/// Go-to-def target for a bare name used inside a contract that resolves to an inherited
+/// member from a cross-file base (e.g. a forge-std `Test` helper). Skips member-access
+/// positions (handled by member resolution).
+fn inherited_name_at(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use solsp_syntax::SyntaxKind::{IDENT, MEMBER_EXPR, NAME_REF};
+    let token = root.token_at_offset(offset).find(|t| t.kind() == IDENT)?;
+    let nr = token.parent()?;
+    if nr.kind() != NAME_REF {
+        return None;
+    }
+    // the `.member` of `recv.member` is member resolution's job, not inheritance.
+    if let Some(p) = nr.parent() {
+        if p.kind() == MEMBER_EXPR && p.first_child().as_ref() != Some(&nr) {
+            return None;
+        }
+    }
+    let contract = enclosing_contract(&nr)?;
+    let arity = solsp_hir::resolve::call_arity(&nr);
+    inherited_member(state, uri, root, &contract, token.text(), arity)
 }
 
 /// Resolve a type path node (`IRoles` or qualified `ICraftV2.TokenInput`) to its type
