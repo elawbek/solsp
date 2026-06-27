@@ -1397,6 +1397,71 @@ fn this_and_super_member_completion() {
 }
 
 #[test]
+fn address_and_array_builtins_by_location_and_form() {
+    let uri = Url::parse("file:///av.sol").unwrap();
+    let src = "contract C { uint256[] sarr; struct S { address who; } S s; \
+               function f(uint256[] memory marr) public { \
+               sarr.A1; marr.A2; msg.sender.A3; address(this).A4; s.who.A5; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let labels = |id: i32, marker: &str| -> Vec<String> {
+        let ch = src.find(marker).unwrap() as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position {
+                        line: 0,
+                        character: ch,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+        );
+        let r: CompletionResponse =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        match r {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+        .into_iter()
+        .map(|i| i.label)
+        .collect()
+    };
+    // storage array -> push/pop; memory array -> length only.
+    assert!(labels(2, "A1").contains(&"push".to_string()));
+    assert!(!labels(3, "A2").contains(&"push".to_string()));
+    // address from a builtin member, a cast, and a struct field.
+    for (id, m) in [(4, "A3"), (5, "A4"), (6, "A5")] {
+        assert!(
+            labels(id, m).contains(&"call".to_string()),
+            "{m} missing address members"
+        );
+    }
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn completion_builtin_type_members() {
     let uri = Url::parse("file:///bt.sol").unwrap();
     let src = "interface IFoo { function x() external; }\n\
@@ -1451,10 +1516,12 @@ fn completion_builtin_type_members() {
         addr.contains(&"balance".to_string()) && addr.contains(&"call".to_string()),
         "{addr:?}"
     );
+    // a memory array exposes `length` but not `push`/`pop` (those need storage).
     let arr = labels(3, "X2");
+    assert!(arr.contains(&"length".to_string()), "{arr:?}");
     assert!(
-        arr.contains(&"length".to_string()) && arr.contains(&"push".to_string()),
-        "{arr:?}"
+        !arr.contains(&"push".to_string()),
+        "memory array must not have push: {arr:?}"
     );
     let int_ty = labels(4, "X3");
     assert_eq!(int_ty, ["min", "max"]);

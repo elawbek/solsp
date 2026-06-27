@@ -381,7 +381,7 @@ fn member_completion(
         return Some(items);
     }
     // builtins on an `address` / array / `bytes` value (plus any `using` functions).
-    if let Some(mut items) = value_type_builtin_members(root, &receiver) {
+    if let Some(mut items) = value_type_builtin_members(state, uri, root, &receiver) {
         items.extend(using_items);
         return Some(items);
     }
@@ -457,10 +457,12 @@ fn type_expr_members(
 /// Builtin members of an `address` / array / `bytes` value, by the receiver's declared
 /// type. `None` for other types.
 fn value_type_builtin_members(
+    state: &ServerState,
+    uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
 ) -> Option<Vec<CompletionItem>> {
-    let ty = value_type_text(root, receiver)?;
+    let (ty, is_storage) = receiver_value_info(state, uri, root, receiver)?;
     let ty = ty.trim();
     if ty == "address" || ty == "address payable" {
         return Some(synthetic_members(&[
@@ -474,27 +476,93 @@ fn value_type_builtin_members(
             ("send", "", true),
         ]));
     }
+    // a dynamic array or `bytes` — `.length` always; `.push`/`.pop` only in storage.
     if ty.ends_with("[]") || ty == "bytes" {
-        return Some(synthetic_members(&[
-            ("length", "uint256", false),
-            ("push", "", true),
-            ("pop", "", true),
-        ]));
+        let mut m: Vec<(&str, &str, bool)> = vec![("length", "uint256", false)];
+        if is_storage {
+            m.push(("push", "", true));
+            m.push(("pop", "", true));
+        }
+        return Some(synthetic_members(&m));
     }
+    // a fixed-size array `T[N]` or `bytesN` — `.length` only.
     if ty.ends_with(']') || is_fixed_bytes(ty) {
         return Some(synthetic_members(&[("length", "uint256", false)]));
     }
     None
 }
 
-/// The declared type text of a simple same-file variable receiver.
-fn value_type_text(
+/// The `(type text, lives in storage)` of a receiver value: simple/cross-file variables,
+/// member accesses, address casts (`address(x)`/`payable(x)`), and the builtin
+/// address-returning members (`msg.sender`, `tx.origin`, `block.coinbase`).
+fn receiver_value_info(
+    state: &ServerState,
+    uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
-) -> Option<String> {
-    let nr = receiver_name_ref(receiver)?;
-    let def = solsp_hir::resolve::resolve(&nr)?;
-    type_text(&def.full_ptr.to_node(root))
+) -> Option<(String, bool)> {
+    use solsp_syntax::SyntaxKind::{CALL_EXPR, MEMBER_EXPR, STATE_VAR_DEF, STORAGE_KW};
+    if receiver.kind() == CALL_EXPR {
+        let callee = receiver.first_child()?;
+        return match callee_display_name(&callee)?.as_str() {
+            "address" => Some(("address".to_string(), false)),
+            "payable" => Some(("address payable".to_string(), false)),
+            _ => None,
+        };
+    }
+    if receiver.kind() == MEMBER_EXPR {
+        let recv_name = solsp_hir::resolve::receiver_name(&receiver.first_child()?);
+        let member = member_name(receiver)?;
+        if matches!(
+            (recv_name.as_deref(), member.as_str()),
+            (Some("msg"), "sender") | (Some("tx"), "origin") | (Some("block"), "coinbase")
+        ) {
+            return Some(("address".to_string(), false));
+        }
+    }
+    let decl = receiver_decl(state, uri, root, receiver)?;
+    let ty = type_text(&decl)?;
+    // state variables are storage; a local is storage only with the `storage` keyword.
+    let is_storage = decl.kind() == STATE_VAR_DEF
+        || decl
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == STORAGE_KW);
+    Some((ty, is_storage))
+}
+
+/// The declaration node a receiver value refers to: a simple/cross-file variable or a
+/// member access.
+fn receiver_decl(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::{MEMBER_EXPR, NAME_REF, PATH_EXPR};
+    match receiver.kind() {
+        PATH_EXPR | NAME_REF => {
+            let nr = receiver_name_ref(receiver)?;
+            if let Some(d) = solsp_hir::resolve::resolve(&nr) {
+                return Some(d.full_ptr.to_node(root));
+            }
+            // a cross-file inherited variable.
+            let name = solsp_hir::resolve::receiver_name(receiver)?;
+            let c = enclosing_contract(receiver)?;
+            let (duri, d) = inherited_member(state, uri, root, &c, &name, None)?;
+            let droot = parse_root(state, &duri)?;
+            Some(d.full_ptr.to_node(&droot))
+        }
+        MEMBER_EXPR => {
+            let recv = receiver.first_child()?;
+            let member = member_name(receiver)?;
+            let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
+            let troot = parse_root(state, &turi)?;
+            let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, None)?;
+            Some(mdef.full_ptr.to_node(&troot))
+        }
+        _ => None,
+    }
 }
 
 fn is_integer_type_name(n: &str) -> bool {
@@ -552,7 +620,7 @@ fn receiver_type_name(
     if let Some((_, tdef)) = resolve_receiver_type(state, uri, root, receiver) {
         return solsp_hir::resolve::contract_def_name(&tdef);
     }
-    value_type_text(root, receiver)
+    receiver_value_info(state, uri, root, receiver).map(|(t, _)| t)
 }
 
 /// Resolve `value.member` through a `using L for T` directive: the library function
