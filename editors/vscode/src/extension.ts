@@ -16,7 +16,7 @@ import {
 let client: LanguageClient | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
-  const command = resolveServerPath();
+  const command = resolveServerPath(context.extensionPath);
   const serverOptions: ServerOptions = {
     run: { command, transport: TransportKind.stdio },
     debug: { command, transport: TransportKind.stdio },
@@ -48,9 +48,10 @@ export function deactivate(): Thenable<void> | undefined {
 }
 
 /// Locate the `solsp-server` binary: an explicit setting wins; otherwise probe each
-/// workspace folder's Cargo output (`target/debug` then `target/release`); finally
-/// fall back to the bare name and let the OS resolve it on `PATH`.
-function resolveServerPath(): string {
+/// open workspace folder's Cargo output AND the repo's `target/` relative to this
+/// extension (`editors/vscode` → `../../target`), so F5 works no matter which folder
+/// the Extension Development Host opened. Finally fall back to the bare name on `PATH`.
+function resolveServerPath(extensionPath: string): string {
   const configured = vscode.workspace
     .getConfiguration("solsp")
     .get<string>("server.path");
@@ -59,9 +60,16 @@ function resolveServerPath(): string {
   }
 
   const exe = process.platform === "win32" ? "solsp-server.exe" : "solsp-server";
-  for (const folder of vscode.workspace.workspaceFolders ?? []) {
+
+  // Roots to probe for `target/{debug,release}/<exe>`: open folders first, then the
+  // repo root inferred from the extension's own location.
+  const roots = [
+    ...(vscode.workspace.workspaceFolders ?? []).map((f) => f.uri.fsPath),
+    path.resolve(extensionPath, "..", ".."),
+  ];
+  for (const root of roots) {
     for (const profile of ["debug", "release"]) {
-      const candidate = path.join(folder.uri.fsPath, "target", profile, exe);
+      const candidate = path.join(root, "target", profile, exe);
       if (fs.existsSync(candidate)) {
         return candidate;
       }
