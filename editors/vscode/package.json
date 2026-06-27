@@ -49,6 +49,14 @@
           "description": "Trace the JSON-RPC traffic between VS Code and solsp-server (for debugging)."
         }
       }
+    },
+    "configurationDefaults": {
+      "editor.semanticTokenColorCustomizations": {
+        "enabled": true,
+        "rules": {
+          "decorator:solidity": "#b22222"
+        }
+      }
     }
   },
   "scripts": {
