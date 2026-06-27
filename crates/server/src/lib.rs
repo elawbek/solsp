@@ -1485,6 +1485,202 @@ fn def_detail(k: solsp_hir::resolve::DefKind) -> &'static str {
     }
 }
 
+/// Type-check the positional call arguments in `root`: an argument whose inferred type is
+/// not implicitly convertible to the parameter type yields a diagnostic. Conservative —
+/// anything un-inferrable is left alone (see [`crate::typecheck`]).
+fn type_check_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR};
+    let mut out = Vec::new();
+    for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
+        let Some(arg_list) = call.children().find(|n| n.kind() == ARG_LIST) else {
+            continue; // named-argument calls are not positionally checked here
+        };
+        let args: Vec<_> = arg_list.children().collect();
+        let Some(callee) = call.first_child() else {
+            continue;
+        };
+        // resolve to a callable declaration; skip casts/types/builtins/unresolved.
+        let Some((def_uri, def)) = resolve_named_callee(state, uri, root, &callee) else {
+            continue;
+        };
+        if !matches!(
+            def.kind,
+            DefKind::Function | DefKind::Event | DefKind::Error
+        ) {
+            continue;
+        }
+        let Some(droot) = parse_root(state, &def_uri) else {
+            continue;
+        };
+        let def_node = def.full_ptr.to_node(&droot);
+        let name = callee_display_name(&callee).unwrap_or_default();
+        // every overload whose parameter count matches the call.
+        let overloads: Vec<Vec<(String, String)>> =
+            signature_candidates(&def, &def_node, &name, &droot)
+                .into_iter()
+                .map(|(_, n)| named_arg_fields(DefKind::Function, &n))
+                .filter(|params| params.len() == args.len())
+                .collect();
+        if overloads.is_empty() {
+            continue; // no overload of this arity — an arity issue, not a type one
+        }
+        // infer the argument types once; `Unknown` args never contribute a mismatch.
+        let arg_tys: Vec<typecheck::Ty> = args
+            .iter()
+            .map(|a| infer_arg_ty(state, uri, root, a))
+            .collect();
+        let is_base = |a: &str, b: &str| is_subtype(state, uri, root, a, b);
+        let accepts = |params: &[(String, String)]| {
+            params.iter().zip(&arg_tys).all(|((_, p), a)| {
+                typecheck::implicitly_convertible(a, &typecheck::parse_ty(p), &is_base)
+            })
+        };
+        // a call is valid if SOME overload accepts every argument (Solidity overload
+        // resolution is by argument type, which we approximate this way).
+        if overloads.iter().any(|p| accepts(p)) {
+            continue;
+        }
+        if overloads.len() == 1 {
+            // unambiguous: flag each argument that the single signature rejects.
+            for ((arg, aty), (_, ptype)) in args.iter().zip(&arg_tys).zip(&overloads[0]) {
+                if matches!(aty, typecheck::Ty::Unknown)
+                    || typecheck::implicitly_convertible(aty, &typecheck::parse_ty(ptype), &is_base)
+                {
+                    continue;
+                }
+                out.push(type_mismatch(li, arg, &format!(
+                    "argument of type `{}` is not implicitly convertible to expected type `{ptype}`",
+                    arg_text(arg),
+                )));
+            }
+        } else {
+            // overloaded and none matched → one diagnostic on the call.
+            out.push(type_mismatch(
+                li,
+                &arg_list,
+                &format!("no overload of `{name}` accepts these argument types",),
+            ));
+        }
+    }
+    out
+}
+
+fn arg_text(arg: &solsp_syntax::SyntaxNode) -> String {
+    arg.text()
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn type_mismatch(
+    li: &solsp_ide::LineIndex,
+    node: &solsp_syntax::SyntaxNode,
+    message: &str,
+) -> lsp_types::Diagnostic {
+    lsp_types::Diagnostic {
+        range: to_proto::range(li, node.text_range()),
+        severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+        source: Some("solsp".to_string()),
+        message: message.to_string(),
+        ..Default::default()
+    }
+}
+
+/// The inferred [`typecheck::Ty`] of a call argument: a literal, a cast, or a value whose
+/// declared/return type is read (`receiver_value_info`). `Unknown` when not inferrable.
+fn infer_arg_ty(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    arg: &solsp_syntax::SyntaxNode,
+) -> typecheck::Ty {
+    use solsp_syntax::SyntaxKind::*;
+    match arg.kind() {
+        LITERAL_EXPR => {
+            let tok = arg
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .find(|t| !matches!(t.kind(), WHITESPACE | COMMENT));
+            match tok.map(|t| t.kind()) {
+                Some(NUMBER) => typecheck::Ty::NumberLiteral,
+                Some(STRING) => typecheck::Ty::StringLiteral,
+                Some(TRUE_KW | FALSE_KW) => typecheck::Ty::BoolLiteral,
+                _ => typecheck::Ty::Unknown,
+            }
+        }
+        CALL_EXPR => {
+            let Some(callee) = arg.first_child() else {
+                return typecheck::Ty::Unknown;
+            };
+            let Some(cname) = callee_display_name(&callee) else {
+                return typecheck::Ty::Unknown;
+            };
+            let parsed = typecheck::parse_ty(&cname);
+            // an elementary cast: `uint8(x)`, `address(x)`, `bytes32(x)`.
+            if !matches!(parsed, typecheck::Ty::User(_)) {
+                return parsed;
+            }
+            // a user name: a contract/struct cast, or a function call (use its return type).
+            match resolve_named_callee(state, uri, root, &callee) {
+                Some((_, def)) if is_type_kind(def.kind) => typecheck::Ty::User(cname),
+                _ => receiver_value_info(state, uri, root, arg)
+                    .map(|(t, _)| typecheck::parse_ty(&t))
+                    .unwrap_or(typecheck::Ty::Unknown),
+            }
+        }
+        PATH_EXPR | NAME_REF | MEMBER_EXPR | INDEX_EXPR => {
+            receiver_value_info(state, uri, root, arg)
+                .map(|(t, _)| typecheck::parse_ty(&t))
+                .unwrap_or(typecheck::Ty::Unknown)
+        }
+        _ => typecheck::Ty::Unknown,
+    }
+}
+
+/// Whether user type `a` is `b` or has `b` somewhere in its inheritance (bases /
+/// implemented interfaces). Resolves `a` from the caller's file; `true` when `a` can't be
+/// resolved (conservative).
+fn is_subtype(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    a: &str,
+    b: &str,
+) -> bool {
+    use std::collections::{HashSet, VecDeque};
+    if a == b {
+        return true;
+    }
+    let Some((auri, anode)) = resolve_type_by_name(state, uri, root, a, None) else {
+        return true; // unknown type — never flag
+    };
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue = VecDeque::from([(auri, anode)]);
+    while let Some((u, c)) = queue.pop_front() {
+        let Some(cr) = parse_root(state, &u) else {
+            continue;
+        };
+        for base in solsp_hir::resolve::base_names(&c) {
+            if base == b {
+                return true;
+            }
+            if visited.insert(base.clone()) {
+                if let Some((buri, _, bnode)) = resolve_base(state, &u, &cr, &base) {
+                    queue.push_back((buri, bnode));
+                }
+            }
+        }
+    }
+    false
+}
+
 /// The argument count of the call whose callee is the identifier at `offset` (for
 /// overload resolution), or `None` if the cursor is not on a callee.
 fn arity_at(root: &solsp_syntax::SyntaxNode, offset: rowan::TextSize) -> Option<usize> {
@@ -2187,8 +2383,14 @@ fn publish_diagnostics(connection: &Connection, state: &ServerState, uri: &Url) 
     let diagnostics = match (state.file(uri), state.line_index(uri)) {
         (Some(file), Some(li)) => {
             let parse = solsp_base_db::parse(state.db(), file);
-            let bare = solsp_ide::diagnostics::diagnostics(parse.errors());
-            to_proto::diagnostics(&bare, li)
+            let mut diags =
+                to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
+            // semantic checks only on a syntactically clean file (a broken tree mid-edit
+            // would produce noise).
+            if parse.errors().is_empty() {
+                diags.extend(type_check_diagnostics(state, uri, &parse.syntax(), li));
+            }
+            diags
         }
         _ => Vec::new(),
     };
