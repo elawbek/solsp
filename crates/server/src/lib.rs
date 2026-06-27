@@ -329,13 +329,22 @@ fn member_completion(
     }
     // a receiver with a source type → its members (incl. cross-file inherited).
     if let Some((turi, tdef)) = resolve_receiver_type(state, uri, root, &receiver) {
-        let mut defs = solsp_hir::resolve::type_members(&tdef);
+        let Some(troot) = parse_root(state, &turi) else {
+            return Some(completion_items_from(solsp_hir::resolve::type_members(
+                &tdef,
+            )));
+        };
+        // same-file members (struct fields, same-file C3) carry their declared type.
+        let mut items = typed_items(solsp_hir::resolve::type_members(&tdef), &troot);
         if tdef.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF {
-            if let Some(troot) = parse_root(state, &turi) {
-                defs.extend(collect_inherited_members(state, &turi, &troot, &tdef));
-            }
+            // cross-file inherited members live in other files → kind-only detail.
+            items.extend(completion_items_from(collect_inherited_members(
+                state, &turi, &troot, &tdef,
+            )));
         }
-        return Some(completion_items_from(defs));
+        let mut seen = std::collections::HashSet::new();
+        items.retain(|i| seen.insert(i.label.clone()));
+        return Some(items);
     }
     // a builtin global (`block.`, `tx.`, `msg.`, `abi.`) has no source type.
     if let Some(items) = builtin_member_items(&receiver) {
@@ -942,6 +951,36 @@ fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<Compl
             ..Default::default()
         })
         .collect()
+}
+
+/// Completion items whose `detail` carries the member's declared type (for fields and
+/// variables), resolved against `root` — the file the members live in. Functions and
+/// types keep their kind label.
+fn typed_items(
+    defs: Vec<solsp_hir::resolve::Definition>,
+    root: &solsp_syntax::SyntaxNode,
+) -> Vec<CompletionItem> {
+    defs.into_iter()
+        .map(|d| {
+            let detail = member_detail(&d, root);
+            CompletionItem {
+                kind: Some(completion_kind(d.kind)),
+                detail: Some(detail),
+                label: d.name,
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// The `detail` for a member: its declared type (field/variable) or its kind label.
+fn member_detail(def: &solsp_hir::resolve::Definition, root: &solsp_syntax::SyntaxNode) -> String {
+    use solsp_hir::resolve::DefKind::*;
+    match def.kind {
+        StateVariable | Parameter | Local | Field => type_text(&def.full_ptr.to_node(root))
+            .unwrap_or_else(|| def_detail(def.kind).to_string()),
+        _ => def_detail(def.kind).to_string(),
+    }
 }
 
 fn completion_kind(k: solsp_hir::resolve::DefKind) -> CompletionItemKind {
