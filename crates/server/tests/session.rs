@@ -647,6 +647,87 @@ fn struct_field_via_index_cross_file() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn remapped_and_node_modules_imports_resolve() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_remap");
+    let _ = fs::remove_dir_all(&dir);
+    let mk = |rel: &str, content: &str| {
+        let p = dir.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(&p, content).unwrap();
+        p
+    };
+    // project root marker + a remapping; a remapped package and a node_modules package.
+    mk("remappings.txt", "@lib/=packages/mylib/\n");
+    let thing = mk("packages/mylib/Thing.sol", "contract Thing {}\n");
+    let modd = mk("node_modules/pkg/Mod.sol", "contract Mod {}\n");
+    let main = mk(
+        "src/Main.sol",
+        "import {Thing} from \"@lib/Thing.sol\";\n\
+         import {Mod} from \"pkg/Mod.sol\";\n\
+         contract Main { Thing t; Mod m; }\n",
+    );
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let thing_uri = Url::from_file_path(fs::canonicalize(&thing).unwrap()).unwrap();
+    let mod_uri = Url::from_file_path(fs::canonicalize(&modd).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line2 = main_src.lines().nth(2).unwrap(); // `contract Main { Thing t; Mod m; }`
+    let definition = |id: i32, character: u32| {
+        send_request(
+            &client,
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&main_uri),
+                    position: Position { line: 2, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        );
+        let resp = next_response(&client);
+        let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let GotoDefinitionResponse::Scalar(loc) = def else {
+            panic!("expected a definition location");
+        };
+        loc
+    };
+
+    // `Thing` (remapped @lib/) → packages/mylib/Thing.sol
+    let ch = line2.find("Thing t").unwrap() as u32;
+    assert_eq!(definition(2, ch + 1).uri, thing_uri);
+    // `Mod` (node_modules/pkg) → node_modules/pkg/Mod.sol
+    let ch = line2.find("Mod m").unwrap() as u32;
+    assert_eq!(definition(3, ch + 1).uri, mod_uri);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]

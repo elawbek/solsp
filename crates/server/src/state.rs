@@ -5,6 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::path::{Path, PathBuf};
 
 use lsp_types::Url;
 use salsa::Setter;
@@ -124,17 +125,86 @@ impl ServerState {
     }
 }
 
-/// Resolve an import path against the importing file's URI into the target file URI.
-/// Tries the path relative to the importing file's directory — covering `./X.sol`,
-/// `../lib/Y.sol`, and bare `X.sol`. Returns `None` if that does not exist on disk
-/// (remapped / package specifiers like `@openzeppelin/...` need a configured resolver,
-/// a later step; they simply won't canonicalize here).
+/// Resolve an import path against the importing file's URI into the target file URI,
+/// trying in order: relative to the importing file (`./X.sol`, `../Y.sol`, bare
+/// `X.sol`); remappings (`remappings.txt` + `foundry.toml`) from the project root; then
+/// `node_modules/<path>` or forge `lib/<path>`. `None` if nothing resolves to a file.
 pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
     if path.is_empty() {
         return None;
     }
     let base_path = base.to_file_path().ok()?;
     let dir = base_path.parent()?;
-    let canonical = fs::canonicalize(dir.join(path)).ok()?;
+
+    // 1. relative to the importing file.
+    if let Some(uri) = file_uri(dir.join(path)) {
+        return Some(uri);
+    }
+
+    // 2 & 3. package / remapped imports, resolved against the project root.
+    let root = project_root(dir)?;
+    for (prefix, target) in load_remappings(&root) {
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            if let Some(uri) = file_uri(root.join(&target).join(rest)) {
+                return Some(uri);
+            }
+        }
+    }
+    for base_dir in ["node_modules", "lib"] {
+        if let Some(uri) = file_uri(root.join(base_dir).join(path)) {
+            return Some(uri);
+        }
+    }
+    None
+}
+
+/// Canonicalize an existing **file** path into a `file://` URL (None if missing/a dir).
+fn file_uri(path: PathBuf) -> Option<Url> {
+    let canonical = fs::canonicalize(path).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
     Url::from_file_path(canonical).ok()
+}
+
+/// The project root: the nearest ancestor of `start` carrying a `remappings.txt` /
+/// `foundry.toml` / `node_modules` / `.git` marker.
+fn project_root(start: &Path) -> Option<PathBuf> {
+    start
+        .ancestors()
+        .find(|d| {
+            d.join("remappings.txt").exists()
+                || d.join("foundry.toml").exists()
+                || d.join("node_modules").is_dir()
+                || d.join(".git").exists()
+        })
+        .map(Path::to_path_buf)
+}
+
+/// Import remappings (`prefix=target`) read from `remappings.txt` and `foundry.toml`.
+/// (Re-read per call; the files are small and OS-cached. Caching can come later.)
+fn load_remappings(root: &Path) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    if let Ok(text) = fs::read_to_string(root.join("remappings.txt")) {
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some((p, t)) = line.split_once('=') {
+                out.push((p.to_string(), t.to_string()));
+            }
+        }
+    }
+    if let Ok(text) = fs::read_to_string(root.join("foundry.toml")) {
+        // remappings appear as quoted "prefix=target" entries; a path target contains a
+        // `/`, which filters out unrelated quoted strings (versions, names).
+        for token in text.split('"').skip(1).step_by(2) {
+            if let Some((p, t)) = token.split_once('=') {
+                if !p.is_empty() && t.contains('/') {
+                    out.push((p.to_string(), t.to_string()));
+                }
+            }
+        }
+    }
+    out
 }
