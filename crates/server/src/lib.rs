@@ -897,11 +897,16 @@ fn collect_inherited_members(
 ) -> Vec<solsp_hir::resolve::Definition> {
     use std::collections::{HashSet, VecDeque};
     let mut visited: HashSet<(Url, String)> = HashSet::new();
-    let mut queue: VecDeque<(Url, solsp_syntax::SyntaxNode, solsp_syntax::SyntaxNode)> =
-        VecDeque::new();
+    // (uri, root, contract, is_base) — a base's `private` members are not inherited.
+    let mut queue: VecDeque<(
+        Url,
+        solsp_syntax::SyntaxNode,
+        solsp_syntax::SyntaxNode,
+        bool,
+    )> = VecDeque::new();
     let mut out = Vec::new();
-    queue.push_back((uri.clone(), root.clone(), contract.clone()));
-    while let Some((u, r, c)) = queue.pop_front() {
+    queue.push_back((uri.clone(), root.clone(), contract.clone(), false));
+    while let Some((u, r, c, is_base)) = queue.pop_front() {
         let key = (
             u.clone(),
             solsp_hir::resolve::contract_def_name(&c).unwrap_or_default(),
@@ -909,10 +914,15 @@ fn collect_inherited_members(
         if !visited.insert(key) {
             continue;
         }
-        out.extend(solsp_hir::resolve::contract_members(&c));
+        for def in solsp_hir::resolve::contract_members(&c) {
+            if is_base && solsp_hir::resolve::is_private(&def.full_ptr.to_node(&r)) {
+                continue;
+            }
+            out.push(def);
+        }
         for base in solsp_hir::resolve::base_names(&c) {
-            if let Some(b) = resolve_base(state, &u, &r, &base) {
-                queue.push_back(b);
+            if let Some((bu, br, bn)) = resolve_base(state, &u, &r, &base) {
+                queue.push_back((bu, br, bn, true));
             }
         }
     }
@@ -1334,10 +1344,15 @@ fn inherited_member(
 ) -> Option<(Url, solsp_hir::resolve::Definition)> {
     use std::collections::{HashSet, VecDeque};
     let mut visited: HashSet<(Url, String)> = HashSet::new();
-    let mut queue: VecDeque<(Url, solsp_syntax::SyntaxNode, solsp_syntax::SyntaxNode)> =
-        VecDeque::new();
-    queue.push_back((uri.clone(), root.clone(), contract.clone()));
-    while let Some((u, r, c)) = queue.pop_front() {
+    // (uri, root, contract, is_base) — a base's `private` member is not accessible here.
+    let mut queue: VecDeque<(
+        Url,
+        solsp_syntax::SyntaxNode,
+        solsp_syntax::SyntaxNode,
+        bool,
+    )> = VecDeque::new();
+    queue.push_back((uri.clone(), root.clone(), contract.clone(), false));
+    while let Some((u, r, c, is_base)) = queue.pop_front() {
         let key = (
             u.clone(),
             solsp_hir::resolve::contract_def_name(&c).unwrap_or_default(),
@@ -1346,11 +1361,14 @@ fn inherited_member(
             continue; // already searched this contract (diamond)
         }
         if let Some(def) = solsp_hir::resolve::contract_member(&c, name, arity) {
-            return Some((u, def));
+            if !is_base || !solsp_hir::resolve::is_private(&def.full_ptr.to_node(&r)) {
+                return Some((u, def));
+            }
+            // a private base member — not accessible from here; keep searching.
         }
         for base in solsp_hir::resolve::base_names(&c) {
-            if let Some(b) = resolve_base(state, &u, &r, &base) {
-                queue.push_back(b);
+            if let Some((bu, br, bn)) = resolve_base(state, &u, &r, &base) {
+                queue.push_back((bu, br, bn, true));
             }
         }
     }

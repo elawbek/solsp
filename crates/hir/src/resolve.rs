@@ -158,8 +158,14 @@ fn collect_scope(scope: &SyntaxNode, out: &mut Vec<Definition>) {
         SOURCE_FILE => out.extend(scope.children().filter_map(|n| def_for_decl(&n))),
         CONTRACT_DEF => {
             if let Some(root) = scope.ancestors().last() {
-                for c in c3_linearize(scope, &root) {
-                    out.extend(contract_members(&c));
+                // the contract itself first (private members visible), then bases (whose
+                // `private` members are not inherited).
+                for (i, c) in c3_linearize(scope, &root).into_iter().enumerate() {
+                    out.extend(
+                        contract_members(&c)
+                            .into_iter()
+                            .filter(|d| i == 0 || !is_private(&d.full_ptr.to_node(&root))),
+                    );
                 }
             }
         }
@@ -223,6 +229,14 @@ pub fn type_members(type_def: &SyntaxNode) -> Vec<Definition> {
 /// errors, events, user types). For imported-symbol completion.
 pub fn file_definitions(root: &SyntaxNode) -> Vec<Definition> {
     root.children().filter_map(|n| def_for_decl(&n)).collect()
+}
+
+/// Whether a member declaration is `private` (visible only in the declaring contract,
+/// not in derived contracts).
+pub fn is_private(decl: &SyntaxNode) -> bool {
+    decl.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| t.kind() == SyntaxKind::PRIVATE_KW)
 }
 
 /// Every member declared directly in a contract's own body (no inheritance).
@@ -448,13 +462,17 @@ pub fn decl_type_path(decl: &SyntaxNode, element: bool) -> Option<SyntaxNode> {
 /// most-derived override winning. Same-file bases only (cross-file imports: P-later).
 fn lookup_member(contract: &SyntaxNode, name: &str, arity: Option<usize>) -> Option<Definition> {
     let root = contract.ancestors().last()?; // SOURCE_FILE
-    for c in c3_linearize(contract, &root) {
-        let members = c
+                                             // The first entry is the contract itself (its `private` members are visible); the rest
+                                             // are bases, whose `private` members are NOT inherited.
+    for (i, c) in c3_linearize(contract, &root).into_iter().enumerate() {
+        let members: Vec<SyntaxNode> = c
             .children()
             .find(|n| n.kind() == SyntaxKind::CONTRACT_BODY)
             .into_iter()
-            .flat_map(|body| body.children());
-        if let Some(def) = find_named_decl(members, name, arity) {
+            .flat_map(|body| body.children())
+            .filter(|n| i == 0 || !is_private(n))
+            .collect();
+        if let Some(def) = find_named_decl(members.into_iter(), name, arity) {
             return Some(def);
         }
     }
@@ -752,6 +770,31 @@ mod tests {
         assert!(members.contains(&"stateVar".to_string()));
         assert!(members.contains(&"f".to_string()));
         assert!(members.contains(&"inherited".to_string()));
+    }
+
+    #[test]
+    fn private_base_members_not_inherited() {
+        let src = "contract Base { function pub_() internal {} function hid_() private {} }\n\
+                   contract C is Base { function f() public {} }";
+        let root = parse(src).syntax();
+        // the last BLOCK is `C.f`'s body.
+        let f_block = root
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::BLOCK)
+            .last()
+            .unwrap();
+        let names: Vec<String> = scope_definitions(&f_block)
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert!(
+            names.contains(&"pub_".to_string()),
+            "internal base member inherited"
+        );
+        assert!(
+            !names.contains(&"hid_".to_string()),
+            "private base member NOT inherited"
+        );
     }
 
     #[test]
