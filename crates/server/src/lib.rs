@@ -310,18 +310,35 @@ fn member_resolve(
 
 /// Resolve the receiver of a member access to its type definition node and the file
 /// that node lives in. A type name resolves to itself; a variable follows its declared
-/// type. Same-file lexical resolution first, then imported symbols.
+/// type; `arr[i]` follows the array's element type.
 fn resolve_receiver_type(
     state: &ServerState,
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    // `arr[i].member` — resolve the array's *element* type.
+    if receiver.kind() == solsp_syntax::SyntaxKind::INDEX_EXPR {
+        let base = receiver.first_child()?;
+        return resolve_value_type(state, uri, root, &base, true);
+    }
+    resolve_value_type(state, uri, root, receiver, false)
+}
+
+/// Resolve a receiver to a type def. With `element`, take the array element type
+/// (the receiver was indexed). A bare type name resolves to itself; a variable follows
+/// its declared type. Same-file lexical resolution first, then imported symbols.
+fn resolve_value_type(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+    element: bool,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
     use solsp_hir::resolve::DefKind;
     let name = solsp_hir::resolve::receiver_name(receiver)?;
     let recv_ref = receiver_name_ref(receiver)?;
 
-    // resolve the receiver: same-file lexical, else an imported top-level symbol.
     let (def_uri, def) = match solsp_hir::resolve::resolve(&recv_ref) {
         Some(def) => (uri.clone(), def),
         None => cross_file_definition(state, uri, root, &name)?,
@@ -330,19 +347,46 @@ fn resolve_receiver_type(
     let def_node = def.full_ptr.to_node(&def_root);
 
     match def.kind {
-        // the receiver IS a type.
+        // the receiver IS a type (only meaningful without indexing).
         DefKind::Contract
         | DefKind::Interface
         | DefKind::Library
         | DefKind::Struct
-        | DefKind::Enum => Some((def_uri, def_node)),
-        // the receiver is a value; follow its declared type.
+        | DefKind::Enum
+            if !element =>
+        {
+            Some((def_uri, def_node))
+        }
+        // the receiver is a value; follow its declared (or element) type path.
         DefKind::StateVariable | DefKind::Parameter | DefKind::Local => {
-            let type_name = solsp_hir::resolve::declared_type_name(&def_node)?;
-            resolve_type_by_name(state, &def_uri, &def_root, &type_name)
+            let path_type = solsp_hir::resolve::decl_type_path(&def_node, element)?;
+            resolve_path_type(state, &def_uri, &def_root, &path_type)
         }
         _ => None,
     }
+}
+
+/// Resolve a type path node (`IRoles` or qualified `ICraftV2.TokenInput`) to its type
+/// definition and file: the first segment is a top-level/imported type, each further
+/// segment a nested type member of the previous.
+fn resolve_path_type(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    path_type: &solsp_syntax::SyntaxNode,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    let segments = solsp_hir::resolve::path_type_segments(path_type);
+    let (first, rest) = segments.split_first()?;
+    let (turi, mut type_def) = resolve_type_by_name(state, uri, root, first)?;
+    for seg in rest {
+        let member = solsp_hir::resolve::member_in_type(&type_def, seg)?;
+        if !is_type_kind(member.kind) {
+            return None;
+        }
+        let troot = parse_root(state, &turi)?; // nested types live in the same file
+        type_def = member.full_ptr.to_node(&troot);
+    }
+    Some((turi, type_def))
 }
 
 /// Resolve a *type* name to its definition node and file: same-file top-level first,

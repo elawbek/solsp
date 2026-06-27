@@ -166,6 +166,38 @@ fn lookup_in_scope(scope: &SyntaxNode, name: &str) -> Option<Definition> {
         CONTRACT_DEF => lookup_member(scope, name),
         FUNCTION_DEF | MODIFIER_DEF | CONSTRUCTOR_DEF => find_param(scope, name),
         BLOCK => find_local(scope, name),
+        // a `for (T i; …)` init declaration is a direct child of the FOR_STMT, not the
+        // body block, so look for it here too.
+        FOR_STMT => find_local(scope, name),
+        _ => None,
+    }
+}
+
+/// The identifier segments of a type path (`["ICraftV2", "TokenInput"]` for
+/// `ICraftV2.TokenInput`).
+pub fn path_type_segments(path_type: &SyntaxNode) -> Vec<String> {
+    path_type
+        .children()
+        .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+        .filter_map(|n| ident_text(&n))
+        .collect()
+}
+
+/// The user-defined type node of a variable/param/state-var declaration: the
+/// `PATH_TYPE`, or — when `element` is set — the `PATH_TYPE` element of an
+/// `ARRAY_TYPE` (for `arr[i]`). `None` for elementary/mapping types or an array used
+/// without indexing.
+pub fn decl_type_path(decl: &SyntaxNode, element: bool) -> Option<SyntaxNode> {
+    use SyntaxKind::*;
+    let ty = decl
+        .children()
+        .find(|n| matches!(n.kind(), PATH_TYPE | ARRAY_TYPE))?;
+    match ty.kind() {
+        PATH_TYPE => (!element).then_some(ty),
+        ARRAY_TYPE => {
+            let inner = ty.children().find(|n| n.kind() == PATH_TYPE)?;
+            element.then_some(inner)
+        }
         _ => None,
     }
 }
@@ -389,6 +421,19 @@ mod tests {
         // `stored` (lhs) → the state variable (contract member)
         let d = resolve_at(src, "stored =").unwrap();
         assert_eq!(d.kind, DefKind::StateVariable);
+    }
+
+    #[test]
+    fn resolves_for_loop_variable() {
+        // the `for (T i; …)` init variable, used in the condition / body.
+        let src = "contract C { function f() public {\n\
+            for (uint256 i; i < 10; ++i) { uint256 x = i; }\n\
+        } }";
+        let d = resolve_at(src, "i < 10").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "i");
+        let d = resolve_at(src, "i; }").unwrap(); // `i` in the body `x = i`
+        assert_eq!(d.kind, DefKind::Local);
     }
 
     #[test]
