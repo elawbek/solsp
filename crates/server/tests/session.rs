@@ -2357,6 +2357,44 @@ fn argument_type_mismatch_is_diagnosed() {
     // exactly one: the `string` argument to an `address` parameter.
     assert_eq!(type_warnings.len(), 1, "{:?}", diags.diagnostics);
     assert!(type_warnings[0].message.contains("address"));
+    // a type mismatch is an error, not a warning.
+    assert_eq!(
+        type_warnings[0].severity,
+        Some(lsp_types::DiagnosticSeverity::ERROR)
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn named_argument_type_mismatch_is_diagnosed() {
+    let uri = Url::parse("file:///na.sol").unwrap();
+    // `f({ id: x })` passes a `bytes32` where the `id` parameter is `uint256`.
+    let src = "contract C { function f(uint256 id) public {} \
+               function g() public { bytes32 b; f({ id: b }); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let errs: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("convertible"))
+        .collect();
+    assert_eq!(errs.len(), 1, "{:?}", diags.diagnostics);
+    assert!(errs[0].message.contains("uint256"));
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);

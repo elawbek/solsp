@@ -1495,13 +1495,18 @@ fn type_check_diagnostics(
     li: &solsp_ide::LineIndex,
 ) -> Vec<lsp_types::Diagnostic> {
     use solsp_hir::resolve::DefKind;
-    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR};
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAMED_ARG_LIST};
     let mut out = Vec::new();
     for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
-        let Some(arg_list) = call.children().find(|n| n.kind() == ARG_LIST) else {
-            continue; // named-argument calls are not positionally checked here
-        };
-        let args: Vec<_> = arg_list.children().collect();
+        // the arguments: positional (`key = None`) or named (`key = Some`).
+        let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
+            if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {
+                al.children().map(|v| (None, v)).collect()
+            } else if let Some(nal) = call.children().find(|n| n.kind() == NAMED_ARG_LIST) {
+                named_arg_pairs(&nal)
+            } else {
+                continue;
+            };
         let Some(callee) = call.first_child() else {
             continue;
         };
@@ -1533,39 +1538,83 @@ fn type_check_diagnostics(
         // infer the argument types once; `Unknown` args never contribute a mismatch.
         let arg_tys: Vec<typecheck::Ty> = args
             .iter()
-            .map(|a| infer_arg_ty(state, uri, root, a))
+            .map(|(_, v)| infer_arg_ty(state, uri, root, v))
             .collect();
         let is_base = |a: &str, b: &str| is_subtype(state, uri, root, a, b);
+        // the parameter type an argument targets — by name for a named arg, else by
+        // position. `None` if a named key doesn't match any parameter.
+        let param_for = |params: &[(String, String)], i: usize| -> Option<String> {
+            match &args[i].0 {
+                Some(key) => params
+                    .iter()
+                    .find(|(pn, _)| pn == key)
+                    .map(|(_, t)| t.clone()),
+                None => params.get(i).map(|(_, t)| t.clone()),
+            }
+        };
         let accepts = |params: &[(String, String)]| {
-            params.iter().zip(&arg_tys).all(|((_, p), a)| {
-                typecheck::implicitly_convertible(a, &typecheck::parse_ty(p), &is_base)
+            (0..args.len()).all(|i| {
+                param_for(params, i).is_some_and(|p| {
+                    typecheck::implicitly_convertible(
+                        &arg_tys[i],
+                        &typecheck::parse_ty(&p),
+                        &is_base,
+                    )
+                })
             })
         };
-        // a call is valid if SOME overload accepts every argument (Solidity overload
-        // resolution is by argument type, which we approximate this way).
+        // a call is valid if SOME overload accepts every argument (Solidity resolves
+        // overloads by argument type, which we approximate this way).
         if overloads.iter().any(|p| accepts(p)) {
             continue;
         }
         if overloads.len() == 1 {
-            // unambiguous: flag each argument that the single signature rejects.
-            for ((arg, aty), (_, ptype)) in args.iter().zip(&arg_tys).zip(&overloads[0]) {
-                if matches!(aty, typecheck::Ty::Unknown)
-                    || typecheck::implicitly_convertible(aty, &typecheck::parse_ty(ptype), &is_base)
-                {
+            // unambiguous: flag each argument the single signature rejects.
+            for (i, (_, value)) in args.iter().enumerate() {
+                if matches!(arg_tys[i], typecheck::Ty::Unknown) {
                     continue;
                 }
-                out.push(type_mismatch(li, arg, &format!(
-                    "argument of type `{}` is not implicitly convertible to expected type `{ptype}`",
-                    arg_text(arg),
-                )));
+                let Some(ptype) = param_for(&overloads[0], i) else {
+                    continue;
+                };
+                if !typecheck::implicitly_convertible(
+                    &arg_tys[i],
+                    &typecheck::parse_ty(&ptype),
+                    &is_base,
+                ) {
+                    out.push(type_mismatch(li, value, &format!(
+                        "argument of type `{}` is not implicitly convertible to expected type `{ptype}`",
+                        arg_text(value),
+                    )));
+                }
             }
         } else {
             // overloaded and none matched → one diagnostic on the call.
+            let span = call
+                .children()
+                .find(|n| matches!(n.kind(), ARG_LIST | NAMED_ARG_LIST));
             out.push(type_mismatch(
                 li,
-                &arg_list,
-                &format!("no overload of `{name}` accepts these argument types",),
+                span.as_ref().unwrap_or(&call),
+                &format!("no overload of `{name}` accepts these argument types"),
             ));
+        }
+    }
+    out
+}
+
+/// The `(key, value)` pairs of a `NAMED_ARG_LIST` (`{ a: x, b: y }`).
+fn named_arg_pairs(
+    nal: &solsp_syntax::SyntaxNode,
+) -> Vec<(Option<String>, solsp_syntax::SyntaxNode)> {
+    use solsp_syntax::SyntaxKind::NAME;
+    let mut out = Vec::new();
+    let mut key: Option<String> = None;
+    for child in nal.children() {
+        if child.kind() == NAME {
+            key = node_ident(&child);
+        } else {
+            out.push((key.take(), child));
         }
     }
     out
@@ -1586,7 +1635,7 @@ fn type_mismatch(
 ) -> lsp_types::Diagnostic {
     lsp_types::Diagnostic {
         range: to_proto::range(li, node.text_range()),
-        severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+        severity: Some(lsp_types::DiagnosticSeverity::ERROR),
         source: Some("solsp".to_string()),
         message: message.to_string(),
         ..Default::default()
