@@ -301,18 +301,74 @@ fn member_completion(
     offset: rowan::TextSize,
 ) -> Option<Vec<CompletionItem>> {
     let receiver = dotted_receiver(root, offset)?;
-    let defs = resolve_receiver_type(state, uri, root, &receiver)
-        .map(|(turi, tdef)| {
-            let mut defs = solsp_hir::resolve::type_members(&tdef);
-            if tdef.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF {
-                if let Some(troot) = parse_root(state, &turi) {
-                    defs.extend(collect_inherited_members(state, &turi, &troot, &tdef));
-                }
+    // a receiver with a source type → its members (incl. cross-file inherited).
+    if let Some((turi, tdef)) = resolve_receiver_type(state, uri, root, &receiver) {
+        let mut defs = solsp_hir::resolve::type_members(&tdef);
+        if tdef.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF {
+            if let Some(troot) = parse_root(state, &turi) {
+                defs.extend(collect_inherited_members(state, &turi, &troot, &tdef));
             }
-            defs
-        })
-        .unwrap_or_default();
-    Some(completion_items_from(defs))
+        }
+        return Some(completion_items_from(defs));
+    }
+    // a builtin global (`block.`, `tx.`, `msg.`, `abi.`) has no source type.
+    if let Some(items) = builtin_member_items(&receiver) {
+        return Some(items);
+    }
+    Some(Vec::new())
+}
+
+/// Members of a builtin global object when the receiver is `block`/`tx`/`msg`/`abi`.
+fn builtin_member_items(receiver: &solsp_syntax::SyntaxNode) -> Option<Vec<CompletionItem>> {
+    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
+    if !matches!(receiver.kind(), PATH_EXPR | NAME_REF) {
+        return None; // only a bare global, not a chain/call
+    }
+    let name = solsp_hir::resolve::receiver_name(receiver)?;
+    let (members, kind): (&[&str], CompletionItemKind) = match name.as_str() {
+        "block" => (
+            &[
+                "basefee",
+                "blobbasefee",
+                "chainid",
+                "coinbase",
+                "difficulty",
+                "gaslimit",
+                "number",
+                "prevrandao",
+                "timestamp",
+            ],
+            CompletionItemKind::FIELD,
+        ),
+        "tx" => (&["gasprice", "origin"], CompletionItemKind::FIELD),
+        "msg" => (
+            &["data", "sender", "sig", "value"],
+            CompletionItemKind::FIELD,
+        ),
+        "abi" => (
+            &[
+                "decode",
+                "encode",
+                "encodeCall",
+                "encodePacked",
+                "encodeWithSelector",
+                "encodeWithSignature",
+            ],
+            CompletionItemKind::FUNCTION,
+        ),
+        _ => return None,
+    };
+    Some(
+        members
+            .iter()
+            .map(|&m| CompletionItem {
+                kind: Some(kind),
+                detail: Some("builtin".to_string()),
+                label: m.to_string(),
+                ..Default::default()
+            })
+            .collect(),
+    )
 }
 
 /// Completion for a bare identifier: every name visible at the cursor — locals, params,

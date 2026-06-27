@@ -1236,6 +1236,66 @@ fn completion_imported_symbols_and_named_args() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn completion_builtin_global_members() {
+    let uri = Url::parse("file:///b.sol").unwrap();
+    let src = "contract C { function f() public { uint256 x = block.; address a = tx.; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let labels = |id: i32, character: u32| -> Vec<String> {
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position { line: 0, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+        );
+        let resp = next_response(&client);
+        let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        match r {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+        .into_iter()
+        .map(|i| i.label)
+        .collect()
+    };
+
+    let block = labels(2, src.find("block.").unwrap() as u32 + 6);
+    assert!(
+        block.contains(&"number".to_string()) && block.contains(&"timestamp".to_string()),
+        "{block:?}"
+    );
+    let tx = labels(3, src.find("tx.").unwrap() as u32 + 3);
+    assert!(
+        tx.contains(&"origin".to_string()) && tx.contains(&"gasprice".to_string()),
+        "{tx:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
