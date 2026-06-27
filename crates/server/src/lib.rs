@@ -16,11 +16,11 @@ use lsp_types::request::{
     SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, InsertTextFormat, Location,
-    MarkupContent, MarkupKind, OneOf, ParameterInformation, ParameterLabel,
-    PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
+    Command, CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams,
+    CompletionResponse, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
+    InsertTextFormat, Location, MarkupContent, MarkupKind, OneOf, ParameterInformation,
+    ParameterLabel, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
     ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
     SignatureInformation, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
@@ -581,10 +581,12 @@ fn builtin_items() -> Vec<CompletionItem> {
         label: label.to_string(),
         ..Default::default()
     };
-    // a builtin function inserts `name()` with the cursor between the parens.
+    // a builtin function inserts `name()` with the cursor between the parens, and asks the
+    // client to pop signature help there (the `(` is inserted, not typed, so it triggers nothing).
     let func = |label: &str| CompletionItem {
         insert_text: Some(format!("{label}($0)")),
         insert_text_format: Some(InsertTextFormat::SNIPPET),
+        command: Some(trigger_signature_help()),
         ..item(label, K::FUNCTION, "builtin")
     };
     let mut out = Vec::with_capacity(KEYWORDS.len() + TYPES.len() + GLOBALS.len() + FUNCS.len());
@@ -1061,6 +1063,8 @@ fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<Compl
         .filter(|d| seen.insert(d.name.clone()))
         .map(|d| {
             let (insert_text, insert_text_format) = callable_snippet(&d.name, d.kind);
+            // a callable inserts `name()`; ask the client to pop signature help inside the parens.
+            let command = insert_text_format.map(|_| trigger_signature_help());
             CompletionItem {
                 kind: Some(completion_kind(d.kind)),
                 // a value member shows its declared type; everything else its kind label.
@@ -1070,6 +1074,7 @@ fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<Compl
                 ),
                 insert_text,
                 insert_text_format,
+                command,
                 label: d.name,
                 ..Default::default()
             }
@@ -1088,6 +1093,17 @@ fn callable_snippet(
         (Some(format!("{name}($0)")), Some(InsertTextFormat::SNIPPET))
     } else {
         (None, None)
+    }
+}
+
+/// A client command that re-opens signature help after a callable snippet is inserted. The
+/// snippet writes the `(` itself, so the `(` signature-help trigger character never fires;
+/// this nudges the client to request signature help with the cursor sitting inside the parens.
+fn trigger_signature_help() -> Command {
+    Command {
+        title: "Signature help".to_string(),
+        command: "editor.action.triggerParameterHints".to_string(),
+        arguments: None,
     }
 }
 
