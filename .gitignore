@@ -5,6 +5,16 @@
 # Local design docs / specs — kept out of VCS per project preference
 /docs/
 
+# Workflow-plugin plan/audit runs — local working state, not versioned
+/.workflow/
+
+# Local Claude Code tooling (hooks, agents, skills, settings) — not versioned
+/.claude/
+
+# Agent-memory plugin store (SQLite db + embeddings/graph/index/markdown mirrors)
+# — canonical durable store, kept local, not versioned
+/.memory/
+
 # Editor / OS noise
 *.swp
 .DS_Store
