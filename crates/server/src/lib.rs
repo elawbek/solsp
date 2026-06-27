@@ -370,7 +370,129 @@ fn member_completion(
     if let Some(items) = builtin_member_items(&receiver) {
         return Some(items);
     }
+    // `type(X).` — contract/integer/enum type introspection.
+    if let Some(items) = type_expr_members(state, uri, root, &receiver) {
+        return Some(items);
+    }
+    // builtins on an `address` / array / `bytes` value.
+    if let Some(items) = value_type_builtin_members(root, &receiver) {
+        return Some(items);
+    }
     Some(Vec::new())
+}
+
+/// Build completion items from `(name, detail, is_method)` triples — synthetic builtin
+/// members. Methods insert call parens.
+fn synthetic_members(items: &[(&str, &str, bool)]) -> Vec<CompletionItem> {
+    items
+        .iter()
+        .map(|&(name, detail, method)| {
+            let (insert_text, insert_text_format) = if method {
+                (Some(format!("{name}($0)")), Some(InsertTextFormat::SNIPPET))
+            } else {
+                (None, None)
+            };
+            CompletionItem {
+                kind: Some(if method {
+                    CompletionItemKind::METHOD
+                } else {
+                    CompletionItemKind::FIELD
+                }),
+                detail: Some(if detail.is_empty() {
+                    "builtin".to_string()
+                } else {
+                    detail.to_string()
+                }),
+                insert_text,
+                insert_text_format,
+                label: name.to_string(),
+                ..Default::default()
+            }
+        })
+        .collect()
+}
+
+/// Members of `type(X)`: integer `min`/`max`, enum `min`/`max`, or a contract/interface's
+/// `name`/`creationCode`/`runtimeCode`/`interfaceId`. `None` if the receiver isn't `type(X)`.
+fn type_expr_members(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<Vec<CompletionItem>> {
+    use solsp_syntax::SyntaxKind::{ENUM_DEF, PATH_TYPE, TYPE_EXPR};
+    if receiver.kind() != TYPE_EXPR {
+        return None;
+    }
+    let pt = receiver.children().find(|n| n.kind() == PATH_TYPE)?;
+    let name = solsp_hir::resolve::path_type_segments(&pt).pop()?;
+    if is_integer_type_name(&name) {
+        return Some(synthetic_members(&[("min", "", false), ("max", "", false)]));
+    }
+    if let Some((_, tdef)) = resolve_path_type(state, uri, root, &pt) {
+        return Some(match tdef.kind() {
+            ENUM_DEF => synthetic_members(&[("min", "", false), ("max", "", false)]),
+            _ => synthetic_members(&[
+                ("name", "string", false),
+                ("creationCode", "bytes", false),
+                ("runtimeCode", "bytes", false),
+                ("interfaceId", "bytes4", false),
+            ]),
+        });
+    }
+    Some(Vec::new())
+}
+
+/// Builtin members of an `address` / array / `bytes` value, by the receiver's declared
+/// type. `None` for other types.
+fn value_type_builtin_members(
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<Vec<CompletionItem>> {
+    let ty = value_type_text(root, receiver)?;
+    let ty = ty.trim();
+    if ty == "address" || ty == "address payable" {
+        return Some(synthetic_members(&[
+            ("balance", "uint256", false),
+            ("code", "bytes", false),
+            ("codehash", "bytes32", false),
+            ("call", "", true),
+            ("delegatecall", "", true),
+            ("staticcall", "", true),
+            ("transfer", "", true),
+            ("send", "", true),
+        ]));
+    }
+    if ty.ends_with("[]") || ty == "bytes" {
+        return Some(synthetic_members(&[
+            ("length", "uint256", false),
+            ("push", "", true),
+            ("pop", "", true),
+        ]));
+    }
+    if ty.ends_with(']') || is_fixed_bytes(ty) {
+        return Some(synthetic_members(&[("length", "uint256", false)]));
+    }
+    None
+}
+
+/// The declared type text of a simple same-file variable receiver.
+fn value_type_text(
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<String> {
+    let nr = receiver_name_ref(receiver)?;
+    let def = solsp_hir::resolve::resolve(&nr)?;
+    type_text(&def.full_ptr.to_node(root))
+}
+
+fn is_integer_type_name(n: &str) -> bool {
+    let rest = n.strip_prefix("uint").or_else(|| n.strip_prefix("int"));
+    matches!(rest, Some(d) if d.is_empty() || d.parse::<u16>().is_ok())
+}
+
+fn is_fixed_bytes(n: &str) -> bool {
+    matches!(n.strip_prefix("bytes").map(str::parse::<u8>), Some(Ok(w)) if (1..=32).contains(&w))
 }
 
 /// Whether a `CONTRACT_DEF` node is a `library`.
