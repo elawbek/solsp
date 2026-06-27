@@ -18,12 +18,13 @@ use lsp_types::request::{
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
-    MarkupKind, OneOf, ParameterInformation, ParameterLabel, PublishDiagnosticsParams,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
-    SignatureHelpParams, SignatureInformation, TextDocumentContentChangeEvent,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, InsertTextFormat, Location,
+    MarkupContent, MarkupKind, OneOf, ParameterInformation, ParameterLabel,
+    PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SignatureInformation, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
 };
 use solsp_ide::LineIndex;
 
@@ -580,11 +581,17 @@ fn builtin_items() -> Vec<CompletionItem> {
         label: label.to_string(),
         ..Default::default()
     };
+    // a builtin function inserts `name()` with the cursor between the parens.
+    let func = |label: &str| CompletionItem {
+        insert_text: Some(format!("{label}($0)")),
+        insert_text_format: Some(InsertTextFormat::SNIPPET),
+        ..item(label, K::FUNCTION, "builtin")
+    };
     let mut out = Vec::with_capacity(KEYWORDS.len() + TYPES.len() + GLOBALS.len() + FUNCS.len());
     out.extend(KEYWORDS.iter().map(|&k| item(k, K::KEYWORD, "keyword")));
     out.extend(TYPES.iter().map(|&t| item(t, K::TYPE_PARAMETER, "type")));
     out.extend(GLOBALS.iter().map(|&g| item(g, K::VARIABLE, "builtin")));
-    out.extend(FUNCS.iter().map(|&f| item(f, K::FUNCTION, "builtin")));
+    out.extend(FUNCS.iter().map(|&f| func(f)));
     out
 }
 
@@ -1052,17 +1059,36 @@ fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<Compl
     let mut seen = std::collections::HashSet::new();
     defs.into_iter()
         .filter(|d| seen.insert(d.name.clone()))
-        .map(|d| CompletionItem {
-            kind: Some(completion_kind(d.kind)),
-            // a value member shows its declared type; everything else its kind label.
-            detail: Some(
-                d.ty.clone()
-                    .unwrap_or_else(|| def_detail(d.kind).to_string()),
-            ),
-            label: d.name,
-            ..Default::default()
+        .map(|d| {
+            let (insert_text, insert_text_format) = callable_snippet(&d.name, d.kind);
+            CompletionItem {
+                kind: Some(completion_kind(d.kind)),
+                // a value member shows its declared type; everything else its kind label.
+                detail: Some(
+                    d.ty.clone()
+                        .unwrap_or_else(|| def_detail(d.kind).to_string()),
+                ),
+                insert_text,
+                insert_text_format,
+                label: d.name,
+                ..Default::default()
+            }
         })
         .collect()
+}
+
+/// For a callable (function/modifier/event/error), a snippet inserting `name()` with the
+/// cursor between the parentheses; `(None, None)` otherwise.
+fn callable_snippet(
+    name: &str,
+    kind: solsp_hir::resolve::DefKind,
+) -> (Option<String>, Option<InsertTextFormat>) {
+    use solsp_hir::resolve::DefKind::*;
+    if matches!(kind, Function | Modifier | Event | Error) {
+        (Some(format!("{name}($0)")), Some(InsertTextFormat::SNIPPET))
+    } else {
+        (None, None)
+    }
 }
 
 fn completion_kind(k: solsp_hir::resolve::DefKind) -> CompletionItemKind {

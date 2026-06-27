@@ -1834,6 +1834,63 @@ fn library_member_completion_shows_internal_hides_private() {
 }
 
 #[test]
+fn completion_callables_insert_call_parens() {
+    let uri = Url::parse("file:///sn.sol").unwrap();
+    let src = "contract C { function doThing(uint256 a) public {} uint256 val; \
+               function f() public { d } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let ch = src.find("{ d }").unwrap() as u32 + 3;
+    send_request(
+        &client,
+        2,
+        "textDocument/completion",
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        },
+    );
+    let resp = next_response(&client);
+    let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let items = match r {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let it = |label: &str| items.iter().find(|i| i.label == label).unwrap();
+    // a function inserts `name()` with the cursor between the parens; a variable does not.
+    assert_eq!(it("doThing").insert_text.as_deref(), Some("doThing($0)"));
+    assert_eq!(
+        it("doThing").insert_text_format,
+        Some(lsp_types::InsertTextFormat::SNIPPET)
+    );
+    assert_eq!(it("val").insert_text, None);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn member_completion_shows_field_types() {
     let uri = Url::parse("file:///ft.sol").unwrap();
     let src = "struct Recipe { uint128 inflation; address owner; }\n\
