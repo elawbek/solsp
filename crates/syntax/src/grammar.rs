@@ -653,7 +653,12 @@ fn primary(p: &mut Parser) -> Option<CompletedMarker> {
     let cm = match p.current() {
         NUMBER | STRING | TRUE_KW | FALSE_KW => {
             let m = p.start();
+            let is_number = p.at(NUMBER);
             p.bump_any();
+            // A numeric literal may carry a sub-denomination unit: `5 days`, `2 ether`.
+            if is_number && p.at(SUB_DENOM_KW) {
+                p.bump(SUB_DENOM_KW);
+            }
             m.complete(p, LITERAL_EXPR)
         }
         IDENT => {

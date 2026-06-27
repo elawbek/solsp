@@ -127,6 +127,11 @@ pub enum SyntaxKind {
     DEFAULT_KW, // Yul
     UNCHECKED_KW,
     TYPE_KW,
+    // A numeric sub-denomination unit (`wei`/`gwei`/`ether`, `seconds`..`weeks`).
+    // All such words share one kind; the original text is kept in the tree. These are
+    // reserved in Solidity 0.8, so lexing them as a keyword (never an identifier) is
+    // correct. (`finney`/`szabo`/`years` were removed and stay identifiers.)
+    SUB_DENOM_KW,
     TRUE_KW,
     FALSE_KW,
 
@@ -300,6 +305,11 @@ impl SyntaxKind {
             "default" => DEFAULT_KW,
             "unchecked" => UNCHECKED_KW,
             "type" => TYPE_KW,
+            // Numeric sub-denomination units (all map to one kind). Only the units
+            // still valid in Solidity 0.8: `finney`/`szabo`/`years` were removed and
+            // are now ordinary identifiers, so they must keep lexing as IDENT.
+            "wei" | "gwei" | "ether" => SUB_DENOM_KW,
+            "seconds" | "minutes" | "hours" | "days" | "weeks" => SUB_DENOM_KW,
             "true" => TRUE_KW,
             "false" => FALSE_KW,
             _ => return None,

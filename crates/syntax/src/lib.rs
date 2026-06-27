@@ -122,6 +122,41 @@ mod tests {
     }
 
     #[test]
+    fn sub_denomination_units_attach_to_number_literals() {
+        // `5 days`, `2 ether`, `3 gwei` — a numeric literal followed by a unit. The
+        // unit lexes as SUB_DENOM_KW and is consumed into the LITERAL_EXPR, so the
+        // statement parses cleanly (was: "expected ;" before the unit).
+        let src = "contract C { function f() public pure { \
+            uint a = 5 days; uint b = 2 ether; uint c = 3 gwei; } }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        // lossless: the tree spans the source byte-for-byte (units included).
+        assert_eq!(p.syntax().text().to_string(), src);
+        let tree = debug_tree(src);
+        assert!(
+            tree.contains("SUB_DENOM_KW@"),
+            "unit not recognized:\n{tree}"
+        );
+        assert!(tree.contains("\"days\""));
+        assert!(tree.contains("\"ether\""));
+        // and the unit sits inside a LITERAL_EXPR next to the NUMBER
+        assert!(tree.contains("LITERAL_EXPR"));
+
+        // the `is_number` guard: a unit word does NOT attach to a non-number literal.
+        let s = parse("contract C { function f() public { bool b = true days; } }");
+        assert!(!s.errors().is_empty(), "`true days` must not parse cleanly");
+
+        // removed units (`finney`/`szabo`/`years`) stay valid identifiers in 0.8.
+        for id in ["finney", "szabo", "years"] {
+            let src = format!("contract C {{ uint {id}; }}");
+            assert!(
+                parse(&src).errors().is_empty(),
+                "`{id}` should still lex as an identifier"
+            );
+        }
+    }
+
+    #[test]
     fn parse_is_total_and_lossless() {
         for src in [
             "",
