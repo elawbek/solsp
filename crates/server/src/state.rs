@@ -91,7 +91,6 @@ impl ServerState {
                 continue;
             }
             for target in self.import_targets(&uri) {
-                eprintln!("solsp: import graph: {uri} -> {target}");
                 self.ensure_loaded(&target);
                 queue.push(target);
             }
