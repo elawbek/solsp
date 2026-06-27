@@ -246,10 +246,6 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
         return Some(h);
     }
-    // 0b. a positional argument (`f(value)`) → the expected and passed types.
-    if let Some(h) = positional_arg_hover(state, &uri, &root, offset) {
-        return Some(h);
-    }
     // 1. same-file hover.
     if let Some(info) = solsp_ide::navigation::hover(&root, offset) {
         return Some(markup_hover(
@@ -757,70 +753,6 @@ fn callee_display_name(callee: &solsp_syntax::SyntaxNode) -> Option<String> {
             .and_then(|nr| node_ident(&nr)),
         _ => None,
     }
-}
-
-/// Hover over a positional argument (`f(value)`) → the type expected at that position
-/// and the type passed (the value's declared type).
-fn positional_arg_hover(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    offset: rowan::TextSize,
-) -> Option<Hover> {
-    use solsp_syntax::SyntaxKind::{ARG_LIST, IDENT};
-    let tok = root.token_at_offset(offset).find(|t| t.kind() == IDENT)?;
-    // the argument expression is the ancestor whose parent is the ARG_LIST.
-    let arg = tok
-        .parent()?
-        .ancestors()
-        .find(|n| n.parent().is_some_and(|p| p.kind() == ARG_LIST))?;
-    let arg_list = arg.parent()?;
-    let index = arg_list.children().position(|c| c == arg)?;
-    let callee = arg_list.parent()?.first_child()?;
-    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
-    let droot = parse_root(state, &def_uri)?;
-    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
-    let (ename, etype) = fields.get(index)?;
-    let expected = if ename.is_empty() {
-        format!("expected: {etype}")
-    } else {
-        format!("expected: {etype} {ename}")
-    };
-    // passed type: the type of the argument value.
-    let body = match positional_passed_type(state, uri, root, &arg, offset) {
-        Some(p) => format!("```solidity\npassed:   {p}\n{expected}\n```"),
-        None => format!("```solidity\n{expected}\n```"),
-    };
-    Some(markup_hover(body, None))
-}
-
-/// The type of an argument value, as a string: a simple variable's declared type, a
-/// member access `a.b`'s member type (possibly cross-file), or a user-typed call/index
-/// result.
-fn positional_passed_type(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    arg: &solsp_syntax::SyntaxNode,
-    offset: rowan::TextSize,
-) -> Option<String> {
-    // 1. a same-file declaration the value refers to → its declared type.
-    if let Some(def) = solsp_hir::resolve::definition_at(root, offset) {
-        if let Some(t) = type_text(&def.full_ptr.to_node(root)) {
-            return Some(t);
-        }
-    }
-    // 2. a member-access argument (`a.b`) → the member's declared type (may be cross-file).
-    if let Some((turi, def)) = member_resolve(state, uri, root, offset) {
-        if let Some(t) =
-            parse_root(state, &turi).and_then(|tr| type_text(&def.full_ptr.to_node(&tr)))
-        {
-            return Some(t);
-        }
-    }
-    // 3. otherwise the inferred user type of the whole expression (call/index → a type).
-    let (_, tdef) = receiver_type(state, uri, root, arg, false)?;
-    solsp_hir::resolve::contract_def_name(&tdef)
 }
 
 /// Resolve the callee of the call whose named-argument list is `nal` to its declaration.
