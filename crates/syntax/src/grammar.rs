@@ -513,7 +513,7 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
                 }
                 let m = cm.precede(p);
                 call_options(p);
-                arg_list(p);
+                call_args(p);
                 m.complete(p, CALL_EXPR)
             }
             L_BRACK => {
@@ -526,7 +526,7 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
             DOT => {
                 let m = cm.precede(p);
                 p.bump(DOT);
-                if p.at(IDENT) {
+                if at_name(p) {
                     name_ref(p);
                 } else {
                     p.error("expected a member name after '.'");
@@ -548,12 +548,18 @@ fn postfix(p: &mut Parser, mut cm: CompletedMarker) -> CompletedMarker {
 /// `({a: 1, b: 2})` form, a NAMED_ARG_LIST.
 fn call_expr(p: &mut Parser, cm: CompletedMarker) -> CompletedMarker {
     let m = cm.precede(p);
+    call_args(p);
+    m.complete(p, CALL_EXPR)
+}
+
+/// The argument list of a call: the named form `({a: 1, b: 2})` or the positional
+/// `(a, b)`. Shared by plain calls and `callee{options}(args)` call-option calls.
+fn call_args(p: &mut Parser) {
     if is_named_args(p) {
         named_arg_list(p);
     } else {
         arg_list(p);
     }
-    m.complete(p, CALL_EXPR)
 }
 
 /// Lookahead: `(` immediately followed by `{` is the `({name: expr, …})` named-
@@ -661,7 +667,7 @@ fn primary(p: &mut Parser) -> Option<CompletedMarker> {
             }
             m.complete(p, LITERAL_EXPR)
         }
-        IDENT => {
+        IDENT | ERROR_KW => {
             let m = p.start();
             name_ref(p);
             m.complete(p, PATH_EXPR)
@@ -906,8 +912,7 @@ fn expr_statement(p: &mut Parser) {
 fn is_var_decl_start(p: &mut Parser) -> bool {
     let cp = p.checkpoint();
     type_name(p);
-    let looks_like_decl =
-        p.at(IDENT) || matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW);
+    let looks_like_decl = at_name(p) || matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW);
     p.rewind(cp);
     looks_like_decl
 }
@@ -937,9 +942,9 @@ fn is_tuple_var_decl(p: &mut Parser) -> bool {
         if matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW) {
             p.bump_any();
         }
-        if p.at(IDENT) {
+        if at_name(p) {
             saw_typed_element = true;
-            p.bump(IDENT);
+            p.bump_any();
         }
         if !p.eat(COMMA) {
             break;
@@ -991,7 +996,7 @@ fn var_decl(p: &mut Parser) {
     if matches!(p.current(), MEMORY_KW | STORAGE_KW | CALLDATA_KW) {
         p.bump_any();
     }
-    if p.at(IDENT) {
+    if at_name(p) {
         name(p);
     } else {
         p.error("expected a variable name");
@@ -1450,6 +1455,12 @@ fn path_type(p: &mut Parser) -> CompletedMarker {
         p.bump(DOT);
         name_ref(p);
     }
+    // `address payable` — the `payable` keyword is part of the (address) type. Only
+    // `address` is legally payable; folding a trailing `payable` into any path type is
+    // harmlessly lenient and keeps recovery simple.
+    if p.at(PAYABLE_KW) {
+        p.bump(PAYABLE_KW);
+    }
     m.complete(p, PATH_TYPE)
 }
 
@@ -1528,7 +1539,7 @@ fn param(p: &mut Parser) {
             _ => break,
         }
     }
-    if p.at(IDENT) {
+    if at_name(p) {
         name(p);
     }
     m.complete(p, PARAM);
@@ -1542,10 +1553,17 @@ fn at_type_start(p: &Parser) -> bool {
 // ---- names -------------------------------------------------------------------
 
 /// A defining name (binding occurrence).
+/// Whether the current token can serve as an identifier name. `error` is a keyword for
+/// error *declarations* but a valid identifier elsewhere — OZ uses it as a parameter
+/// name (`function _throwError(RecoverError error)`).
+fn at_name(p: &Parser) -> bool {
+    matches!(p.current(), IDENT | ERROR_KW)
+}
+
 fn name(p: &mut Parser) {
-    if p.at(IDENT) {
+    if at_name(p) {
         let m = p.start();
-        p.bump(IDENT);
+        p.bump_any();
         m.complete(p, NAME);
     } else {
         p.error("expected a name");
@@ -1554,9 +1572,9 @@ fn name(p: &mut Parser) {
 
 /// A referencing name (use occurrence) — used in type paths, base lists, etc.
 fn name_ref(p: &mut Parser) {
-    if p.at(IDENT) {
+    if at_name(p) {
         let m = p.start();
-        p.bump(IDENT);
+        p.bump_any();
         m.complete(p, NAME_REF);
     } else {
         p.error("expected a name");

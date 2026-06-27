@@ -122,6 +122,51 @@ mod tests {
     }
 
     #[test]
+    fn error_word_as_identifier() {
+        // `error` is a keyword for error declarations but a valid identifier elsewhere
+        // (OZ uses it as a parameter / tuple-variable name). Was: a cascade of errors.
+        let src = "contract C {\n\
+            function f(RecoverError error) internal returns (bool) {\n\
+                (bool ok, RecoverError error2) = g();\n\
+                return error == error2 || ok;\n\
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        assert_eq!(p.syntax().text().to_string(), src);
+        // a top-level `error Foo();` declaration still parses as an error definition.
+        assert!(parse("error Bad(uint256 x);").errors().is_empty());
+    }
+
+    #[test]
+    fn call_with_options_and_named_args() {
+        // `new T{salt: …}({a: …, b: …})` — call options AND a named-argument call.
+        let src = "contract C { function f() public {\n\
+            x = new T{ salt: s }({ beacon: a, data: b });\n\
+        } }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        assert!(debug_tree(src).contains("CALL_OPTIONS"));
+        assert!(debug_tree(src).contains("NAMED_ARG_LIST"));
+    }
+
+    #[test]
+    fn parses_address_payable_type() {
+        // `address payable` is a distinct type; the `payable` keyword follows the type
+        // in declarations, params, and returns. (Was: a cascade of parse errors.)
+        let src = "contract C {\n\
+            address payable owner;\n\
+            function send(address payable to, uint256 amt) external returns (address payable) {\n\
+                owner = to;\n\
+            }\n\
+        }";
+        let p = parse(src);
+        assert!(p.errors().is_empty(), "unexpected errors: {:?}", p.errors());
+        assert_eq!(p.syntax().text().to_string(), src); // lossless
+        assert!(debug_tree(src).contains("PAYABLE_KW"));
+    }
+
+    #[test]
     fn sub_denomination_units_attach_to_number_literals() {
         // `5 days`, `2 ether`, `3 gwei` — a numeric literal followed by a unit. The
         // unit lexes as SUB_DENOM_KW and is consumed into the LITERAL_EXPR, so the
