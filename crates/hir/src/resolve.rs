@@ -193,7 +193,17 @@ pub fn definition_at(root: &SyntaxNode, offset: rowan::TextSize) -> Option<Defin
         // A `NAME` is itself a declaration's name — go-to-def lands on its own decl.
         SyntaxKind::NAME => {
             let decl = parent.parent()?;
-            def_for_decl(&decl)
+            if let Some(def) = def_for_decl(&decl) {
+                return Some(def);
+            }
+            // a Yul declaration name (`let x`, a param, a return) resolves to itself.
+            let kind = match decl.kind() {
+                SyntaxKind::YUL_VAR_DECL => DefKind::Local,
+                SyntaxKind::YUL_PARAM_LIST => DefKind::Parameter,
+                SyntaxKind::YUL_FUNCTION_DEF => DefKind::Function,
+                _ => return None,
+            };
+            make_yul_def(&parent, &decl, kind)
         }
         _ => None,
     }
@@ -214,8 +224,75 @@ fn lookup_in_scope(scope: &SyntaxNode, name: &str, arity: Option<usize>) -> Opti
         // a `for (T i; …)` init declaration is a direct child of the FOR_STMT, not the
         // body block, so look for it here too.
         FOR_STMT => find_local(scope, name),
+        // inline assembly (Yul): `let` declarations + nested `function` defs, and a
+        // Yul function's params / `-> r` returns.
+        YUL_BLOCK | YUL_FUNCTION_DEF => find_yul_binding(scope, name),
         _ => None,
     }
+}
+
+/// A Yul binding named `name` declared directly in a `YUL_BLOCK` (a `let` variable or a
+/// nested `function`) or a `YUL_FUNCTION_DEF` (its params / return names).
+fn find_yul_binding(scope: &SyntaxNode, name: &str) -> Option<Definition> {
+    yul_candidates(scope)
+        .into_iter()
+        .filter_map(|(nm, full, kind)| make_yul_def(&nm, &full, kind))
+        .find(|d| d.name == name)
+}
+
+/// `(name node, full decl node, kind)` for each Yul binding a scope introduces.
+fn yul_candidates(scope: &SyntaxNode) -> Vec<(SyntaxNode, SyntaxNode, DefKind)> {
+    use SyntaxKind::*;
+    let mut out = Vec::new();
+    match scope.kind() {
+        YUL_BLOCK => {
+            for n in scope.children() {
+                match n.kind() {
+                    YUL_VAR_DECL => {
+                        // `let a, b := …` declares each NAME child.
+                        for nm in n.children().filter(|c| c.kind() == NAME) {
+                            out.push((nm, n.clone(), DefKind::Local));
+                        }
+                    }
+                    YUL_FUNCTION_DEF => {
+                        if let Some(fname) = n.children().find(|c| c.kind() == NAME) {
+                            out.push((fname, n.clone(), DefKind::Function));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        YUL_FUNCTION_DEF => {
+            // params live in YUL_PARAM_LIST; the `-> r, s` return names are NAME children
+            // *after* the param list (the NAME before it is the function's own name).
+            let mut after_params = false;
+            for n in scope.children() {
+                match n.kind() {
+                    YUL_PARAM_LIST => {
+                        after_params = true;
+                        for nm in n.children().filter(|c| c.kind() == NAME) {
+                            out.push((nm.clone(), nm, DefKind::Parameter));
+                        }
+                    }
+                    NAME if after_params => out.push((n.clone(), n, DefKind::Local)),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// Build a [`Definition`] for a Yul binding from its name node + full declaration node.
+fn make_yul_def(name_node: &SyntaxNode, full: &SyntaxNode, kind: DefKind) -> Option<Definition> {
+    Some(Definition {
+        name: ident_text(name_node)?,
+        kind,
+        name_ptr: AstPtr::new(name_node),
+        full_ptr: AstPtr::new(full),
+    })
 }
 
 /// The identifier segments of a type path (`["ICraftV2", "TokenInput"]` for
@@ -511,6 +588,30 @@ mod tests {
         let one = resolved("f(1);");
         assert!(one.contains("(uint a)") && !one.contains("uint b")); // 1-arg → 1-param
         assert!(resolved("f(); }").trim_start().starts_with("function f()")); // 0 → 0
+    }
+
+    #[test]
+    fn resolves_yul_variables() {
+        let src = "contract C { function f() public { assembly {\n\
+            let x := 1\n\
+            let y := add(x, 2)\n\
+            function g(a) -> r { r := mul(a, x) }\n\
+        } } }";
+        // `x` in `add(x, 2)` → the `let x` declaration
+        let d = resolve_at(src, "x, 2").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "x");
+        // `a` in `mul(a, x)` → the Yul function parameter
+        let d = resolve_at(src, "a, x").unwrap();
+        assert_eq!(d.kind, DefKind::Parameter);
+        assert_eq!(d.name, "a");
+        // `r` in `r := …` → the Yul function return binding
+        let d = resolve_at(src, "r := mul").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "r");
+        // `x` in `mul(a, x)` (inside the Yul function) → the OUTER `let x` (closure)
+        let d = resolve_at(src, "x) }").unwrap();
+        assert_eq!(d.name, "x");
     }
 
     #[test]
