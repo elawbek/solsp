@@ -361,11 +361,8 @@ fn cross_file_goto_definition() {
     let token = dir.join("Token.sol");
     let main = dir.join("Main.sol");
     fs::write(&token, "contract Token { uint256 supply; }\n").unwrap();
-    fs::write(
-        &main,
-        "import \"./Token.sol\";\ncontract Main { Token t; }\n",
-    )
-    .unwrap();
+    // bare path (no `./`) must resolve too, not just `./Token.sol`.
+    fs::write(&main, "import \"Token.sol\";\ncontract Main { Token t; }\n").unwrap();
 
     let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
     let token_uri = Url::from_file_path(fs::canonicalize(&token).unwrap()).unwrap();

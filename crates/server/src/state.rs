@@ -91,6 +91,7 @@ impl ServerState {
                 continue;
             }
             for target in self.import_targets(&uri) {
+                eprintln!("solsp: import graph: {uri} -> {target}");
                 self.ensure_loaded(&target);
                 queue.push(target);
             }
@@ -110,12 +111,13 @@ impl ServerState {
     }
 }
 
-/// Resolve a relative import path (`./X.sol`, `../lib/Y.sol`) against the importing
-/// file's URI into the target file URI. Returns `None` for non-relative specifiers
-/// (remappings / bare package paths need a configured resolver — a later step) or if
-/// the target does not exist on disk.
+/// Resolve an import path against the importing file's URI into the target file URI.
+/// Tries the path relative to the importing file's directory — covering `./X.sol`,
+/// `../lib/Y.sol`, and bare `X.sol`. Returns `None` if that does not exist on disk
+/// (remapped / package specifiers like `@openzeppelin/...` need a configured resolver,
+/// a later step; they simply won't canonicalize here).
 pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
-    if !(path.starts_with("./") || path.starts_with("../")) {
+    if path.is_empty() {
         return None;
     }
     let base_path = base.to_file_path().ok()?;
