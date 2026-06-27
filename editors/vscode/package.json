@@ -1,0 +1,67 @@
+{
+  "name": "solsp-vscode",
+  "displayName": "solsp — Solidity Language Server",
+  "description": "Thin VS Code client for the solsp Solidity language server (outline, diagnostics, semantic highlighting).",
+  "version": "0.0.1",
+  "publisher": "solsp",
+  "license": "MIT OR Apache-2.0",
+  "private": true,
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:solidity"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "solidity",
+        "aliases": [
+          "Solidity",
+          "solidity"
+        ],
+        "extensions": [
+          ".sol"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "solsp",
+      "properties": {
+        "solsp.server.path": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Absolute path to the `solsp-server` binary. If empty, the extension looks for a Cargo build under the workspace's `target/debug` then `target/release`, and finally falls back to `solsp-server` on `PATH`."
+        },
+        "solsp.trace.server": {
+          "type": "string",
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
+          "default": "off",
+          "description": "Trace the JSON-RPC traffic between VS Code and solsp-server (for debugging)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}
