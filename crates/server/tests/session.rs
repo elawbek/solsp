@@ -947,6 +947,91 @@ fn cross_file_inheritance_resolves_inherited_members() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn transitive_reexport_and_root_relative_import() {
+    use std::fs;
+
+    // a Foundry-ish layout: foundry.toml marks the root; `contracts/` is the src dir.
+    let root = std::env::temp_dir().join("solsp_transitive");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("contracts")).unwrap();
+    fs::create_dir_all(root.join("test")).unwrap();
+    fs::write(
+        root.join("foundry.toml"),
+        "[profile.default]\nsrc = 'contracts'\n",
+    )
+    .unwrap();
+    fs::write(root.join("contracts/Roles.sol"), "contract Roles { }\n").unwrap();
+    // Base uses a project-root-relative import path (`contracts/...`, not `./`).
+    fs::write(
+        root.join("test/Base.sol"),
+        "import { Roles } from \"contracts/Roles.sol\";\ncontract Base { }\n",
+    )
+    .unwrap();
+    // Main glob-imports Base, which re-exports Roles transitively.
+    fs::write(
+        root.join("test/Main.sol"),
+        "import \"./Base.sol\";\ncontract Main is Base { function f() public { x = new Roles(); } }\n",
+    )
+    .unwrap();
+
+    let main_uri =
+        Url::from_file_path(fs::canonicalize(root.join("test/Main.sol")).unwrap()).unwrap();
+    let roles_uri =
+        Url::from_file_path(fs::canonicalize(root.join("contracts/Roles.sol")).unwrap()).unwrap();
+    let main_src = fs::read_to_string(root.join("test/Main.sol")).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    // `new Roles()` — Roles is reached via `./Base.sol` (glob) → Base's named import of
+    // `contracts/Roles.sol` (root-relative path).
+    let line1 = main_src.lines().nth(1).unwrap();
+    let ch = line1.find("Roles").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&main_uri),
+                position: Position {
+                    line: 1,
+                    character: ch + 1,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = def else {
+        panic!("expected a definition location");
+    };
+    assert_eq!(loc.uri, roles_uri);
+    assert_eq!(loc.range.start.line, 0); // `Roles` on Roles.sol line 0
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&root);
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]

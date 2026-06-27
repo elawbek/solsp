@@ -150,6 +150,17 @@ pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
             }
         }
     }
+    // 4. project-root-relative — Foundry resolves a bare `contracts/X.sol` from the
+    //    project root (`src = 'contracts'`), and relative to common source dirs.
+    if let Some(uri) = file_uri(root.join(path)) {
+        return Some(uri);
+    }
+    for src in ["src", "contracts"] {
+        if let Some(uri) = file_uri(root.join(src).join(path)) {
+            return Some(uri);
+        }
+    }
+    // 5. package roots.
     for base_dir in ["node_modules", "lib"] {
         if let Some(uri) = file_uri(root.join(base_dir).join(path)) {
             return Some(uri);

@@ -242,25 +242,17 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
             None,
         ));
     }
-    // 3. an imported top-level symbol → hover from the target file.
+    // 3. an imported top-level symbol (followed transitively through re-exports) → hover
+    //    from the target file. The hovered identifier is in *this* file, so report no
+    //    range and let the client highlight it.
     let name = solsp_ide::navigation::name_at(&root, offset)?;
-    for imp in solsp_hir::imports::imports(&root) {
-        let Some(export) = exported_name(&imp.kind, &name) else {
-            continue;
-        };
-        let Some(target_uri) = state::resolve_import_uri(&uri, &imp.path) else {
-            continue;
-        };
-        let Some(tfile) = state.file(&target_uri) else {
-            continue;
-        };
-        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        let arity = arity_at(&root, offset);
-        if let Some(info) = solsp_ide::navigation::hover_top_level(&troot, &export, arity) {
-            // The hovered identifier is in *this* file; report no range (the target
-            // range would be in the wrong document) and let the client highlight it.
-            return Some(markup_hover(info.contents, None));
-        }
+    let arity = arity_at(&root, offset);
+    if let Some((turi, def)) = cross_file_definition(state, &uri, &root, &name, arity) {
+        let troot = parse_root(state, &turi)?;
+        return Some(markup_hover(
+            solsp_ide::navigation::hover_text(&troot, &def),
+            None,
+        ));
     }
     None
 }
@@ -275,9 +267,8 @@ fn arity_at(root: &solsp_syntax::SyntaxNode, offset: rowan::TextSize) -> Option<
     solsp_hir::resolve::call_arity(&name_ref)
 }
 
-/// Find an imported top-level symbol `name` referenced in `root`: returns the target
-/// file URI and the byte range (in that file) of the declaration's name. `arity` picks
-/// a matching function overload.
+/// Find an imported top-level symbol `name` referenced in `root` (following re-exports
+/// transitively): the target file URI and the byte range of the declaration's name.
 fn cross_file_target(
     state: &ServerState,
     uri: &Url,
@@ -285,22 +276,9 @@ fn cross_file_target(
     name: &str,
     arity: Option<usize>,
 ) -> Option<(Url, rowan::TextRange)> {
-    for imp in solsp_hir::imports::imports(root) {
-        let Some(export) = exported_name(&imp.kind, name) else {
-            continue;
-        };
-        let Some(target_uri) = state::resolve_import_uri(uri, &imp.path) else {
-            continue;
-        };
-        let Some(tfile) = state.file(&target_uri) else {
-            continue;
-        };
-        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        if let Some(range) = solsp_ide::navigation::goto_top_level(&troot, &export, arity) {
-            return Some((target_uri, range));
-        }
-    }
-    None
+    let (turi, def) = cross_file_definition(state, uri, root, name, arity)?;
+    let troot = parse_root(state, &turi)?;
+    Some((turi, def_name_range(&troot, &def)))
 }
 
 /// The target-file export name a local `name` refers to under an import's binding, or
@@ -685,8 +663,10 @@ fn is_type_kind(kind: solsp_hir::resolve::DefKind) -> bool {
     )
 }
 
-/// Like [`cross_file_target`], but returns the resolved [`Definition`] (and the file
-/// it lives in) rather than a range — for further member/type resolution.
+/// Resolve a symbol `name` referenced in `root` to its declaration via the import graph,
+/// following re-exports transitively to full depth (cycle-safe). A glob `import "X"`
+/// re-exports everything `X` itself imports, so a symbol can sit several files away from
+/// where it is used. Returns the file + [`Definition`].
 fn cross_file_definition(
     state: &ServerState,
     uri: &Url,
@@ -694,6 +674,21 @@ fn cross_file_definition(
     name: &str,
     arity: Option<usize>,
 ) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    let mut visited = std::collections::HashSet::new();
+    cross_file_rec(state, uri, root, name, arity, &mut visited)
+}
+
+fn cross_file_rec(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    name: &str,
+    arity: Option<usize>,
+    visited: &mut std::collections::HashSet<Url>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    if !visited.insert(uri.clone()) {
+        return None; // already walked this file (import cycle)
+    }
     for imp in solsp_hir::imports::imports(root) {
         let Some(export) = exported_name(&imp.kind, name) else {
             continue;
@@ -705,8 +700,13 @@ fn cross_file_definition(
             continue;
         };
         let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        // a top-level declaration in the imported file…
         if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export, arity) {
             return Some((target_uri, def));
+        }
+        // …or one the imported file itself re-exports (transitively).
+        if let Some(found) = cross_file_rec(state, &target_uri, &troot, &export, arity, visited) {
+            return Some(found);
         }
     }
     None
