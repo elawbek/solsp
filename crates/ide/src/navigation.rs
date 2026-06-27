@@ -47,13 +47,49 @@ pub fn hover_text(root: &SyntaxNode, def: &Definition) -> String {
 /// line plus a `(kind) name` caption.
 fn hover_markdown(root: &SyntaxNode, def: &Definition) -> String {
     let decl = def.full_ptr.to_node(root);
-    let decl_text = decl.text().to_string();
-    let signature = first_line(&decl_text);
+    let sig = signature(&decl);
     format!(
-        "```solidity\n{signature}\n```\n\n*({label})* `{name}`",
+        "```solidity\n{sig}\n```\n\n*({label})* `{name}`",
         label = def_label(def.kind),
         name = def.name,
     )
+}
+
+/// A declaration's signature for hover: its text up to the body block (or the whole
+/// declaration if it has none), with comments dropped and whitespace collapsed — so a
+/// multi-line function header renders on one line. A trailing `;` is removed.
+fn signature(decl: &SyntaxNode) -> String {
+    use SyntaxKind::{BLOCK, COMMENT, WHITESPACE};
+    let end = decl
+        .children()
+        .find(|n| n.kind() == BLOCK)
+        .map(|b| b.text_range().start())
+        .unwrap_or_else(|| decl.text_range().end());
+    let mut out = String::new();
+    for tok in decl
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+    {
+        if tok.text_range().start() >= end {
+            break;
+        }
+        match tok.kind() {
+            COMMENT => {}
+            WHITESPACE => {
+                if !out.is_empty() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+            }
+            _ => out.push_str(tok.text()),
+        }
+    }
+    // tighten spacing introduced by collapsing newlines around punctuation.
+    let out = out
+        .replace("( ", "(")
+        .replace(" )", ")")
+        .replace(" ,", ",")
+        .replace(" ;", ";");
+    out.trim().trim_end_matches(';').trim_end().to_string()
 }
 
 /// The precise identifier range of a definition's name (the `IDENT` token, not the
@@ -76,30 +112,6 @@ fn ident_range_at(root: &SyntaxNode, offset: TextSize) -> Option<TextRange> {
     root.token_at_offset(offset)
         .find(|t| t.kind() == SyntaxKind::IDENT)
         .map(|t| t.text_range())
-}
-
-/// The signature line of a declaration: the first line that is actual code — skipping
-/// leading doc/`//`/`/* … */` comment lines the node may carry as trivia — with any
-/// trailing line comment stripped, so a hover shows the type (`uint128 inflation;`),
-/// not the comment.
-fn first_line(text: &str) -> String {
-    let code = text
-        .lines()
-        .map(str::trim)
-        .find(|l| !l.is_empty() && !is_comment_line(l))
-        .unwrap_or("");
-    // drop a trailing `// …` line comment (rare false positive inside a string literal
-    // is acceptable for a hover signature).
-    let code = match code.find("//") {
-        Some(i) => code[..i].trim_end(),
-        None => code,
-    };
-    code.to_string()
-}
-
-/// Does a trimmed line begin a comment (line, block, or a doc-comment continuation)?
-fn is_comment_line(line: &str) -> bool {
-    line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
 }
 
 /// Human label for a definition kind (used in hover captions).
@@ -158,6 +170,28 @@ mod tests {
         assert!(h.contents.contains("`helper`"));
         assert!(h.contents.contains("function helper(uint256 n)")); // signature line
         assert_eq!(&src[h.range], "helper"); // hovered identifier range
+    }
+
+    #[test]
+    fn hover_signature_collapses_multiline_and_drops_body() {
+        let src = "contract C {\n\
+            function big(\n\
+                uint256 amount,\n\
+                address to\n\
+            ) internal returns (bool ok) {\n\
+                return true;\n\
+            }\n\
+            function g() public { big(1, address(0)); }\n\
+        }";
+        let root = parse(src).syntax();
+        let h = hover(&root, at(src, "big(1")).unwrap();
+        assert!(
+            h.contents
+                .contains("function big(uint256 amount, address to) internal returns (bool ok)"),
+            "signature: {}",
+            h.contents
+        );
+        assert!(!h.contents.contains("return true"), "body must be excluded");
     }
 
     #[test]
