@@ -1492,10 +1492,12 @@ fn cross_file_rec(
     root: &solsp_syntax::SyntaxNode,
     name: &str,
     arity: Option<usize>,
-    visited: &mut std::collections::HashSet<Url>,
+    // keyed by (file, name): the same file may be searched for different names across a
+    // file's imports (e.g. a glob import probes it for `U`, an alias for `Utils`).
+    visited: &mut std::collections::HashSet<(Url, String)>,
 ) -> Option<(Url, solsp_hir::resolve::Definition)> {
-    if !visited.insert(uri.clone()) {
-        return None; // already walked this file (import cycle)
+    if !visited.insert((uri.clone(), name.to_string())) {
+        return None; // already searched this file for this name (import cycle)
     }
     for imp in solsp_hir::imports::imports(root) {
         let Some(export) = exported_name(&imp.kind, name) else {

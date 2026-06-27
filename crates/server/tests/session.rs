@@ -1548,6 +1548,86 @@ fn def_line_in_memory(src: &str, needle: &str) -> u32 {
 }
 
 #[test]
+fn alias_import_resolves_despite_a_competing_glob_import() {
+    // a glob import and an aliased named import target the SAME file. The glob's failed
+    // search for `U` must not poison the cross-file walk's visited set and block the
+    // alias's search for `Utils` in that file.
+    use std::fs;
+    let dir = std::env::temp_dir().join("solsp_alias_glob");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("Lib.sol"),
+        "library Utils { function foo() internal pure returns (uint256) { return 1; } }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("Mid.sol"),
+        "import \"Lib.sol\";\ncontract Mid {}\n",
+    )
+    .unwrap();
+    let main = dir.join("Main.sol");
+    fs::write(
+        &main,
+        "import \"Mid.sol\";\n\
+         import { Utils as U } from \"Mid.sol\";\n\
+         contract C { function f() public { U.foo(); } }\n",
+    )
+    .unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let lib_uri = Url::from_file_path(fs::canonicalize(dir.join("Lib.sol")).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line2 = main_src.lines().nth(2).unwrap();
+    let ch = line2.find("U.foo").unwrap() as u32 + "U.".len() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&main_uri),
+                position: Position {
+                    line: 2,
+                    character: ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let d: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = d else {
+        panic!("expected a location");
+    };
+    assert_eq!(loc.uri, lib_uri); // `U.foo` → Utils.foo in Lib.sol
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn namespace_import_member_resolves() {
     use std::fs;
     let dir = std::env::temp_dir().join("solsp_namespace");
