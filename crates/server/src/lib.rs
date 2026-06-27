@@ -317,6 +317,16 @@ fn member_completion(
     offset: rowan::TextSize,
 ) -> Option<Vec<CompletionItem>> {
     let receiver = dotted_receiver(root, offset)?;
+    // `N.` where `N` is an `import * as N` namespace alias → the imported file's exports.
+    if let Some(turi) = namespace_target_uri(uri, root, &receiver) {
+        if let Some(tfile) = state.file(&turi) {
+            let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+            let mut defs = solsp_hir::resolve::file_definitions(&troot);
+            let mut visited = std::collections::HashSet::new();
+            collect_file_exports(state, &turi, &troot, &mut visited, &mut defs);
+            return Some(completion_items_from(defs));
+        }
+    }
     // a receiver with a source type → its members (incl. cross-file inherited).
     if let Some((turi, tdef)) = resolve_receiver_type(state, uri, root, &receiver) {
         let mut defs = solsp_hir::resolve::type_members(&tdef);
@@ -1020,16 +1030,62 @@ fn member_resolve(
         .find(|t| t.kind() == SyntaxKind::IDENT)?;
     let member_ref = token.parent()?;
     let (receiver, member) = solsp_hir::resolve::member_access(&member_ref)?;
-
-    let (type_uri, type_def) = resolve_receiver_type(state, uri, root, &receiver)?;
     // `obj.method(args)` — pick the overload matching the call's argument count.
     let arity = solsp_hir::resolve::call_arity(&member_ref);
+
+    // `N.member` where `N` is an `import * as N` namespace alias → the imported file's
+    // top-level symbol.
+    if let Some(found) = namespace_member(state, uri, root, &receiver, &member, arity) {
+        return Some(found);
+    }
+
+    let (type_uri, type_def) = resolve_receiver_type(state, uri, root, &receiver)?;
     if let Some(def) = solsp_hir::resolve::member_in_type(&type_def, &member, arity) {
         return Some((type_uri, def));
     }
     // the member may be inherited from a cross-file base of the receiver's type.
     let troot = parse_root(state, &type_uri)?;
     inherited_member(state, &type_uri, &troot, &type_def, &member, arity)
+}
+
+/// The file a `* as N` namespace import aliases, if `receiver` is that bare alias `N`.
+fn namespace_target_uri(
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<Url> {
+    use solsp_hir::imports::ImportKind::Namespace;
+    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
+    if !matches!(receiver.kind(), PATH_EXPR | NAME_REF) {
+        return None;
+    }
+    let alias = solsp_hir::resolve::receiver_name(receiver)?;
+    solsp_hir::imports::imports(root)
+        .into_iter()
+        .find_map(|imp| {
+            matches!(&imp.kind, Namespace(a) if *a == alias)
+                .then(|| state::resolve_import_uri(uri, &imp.path))
+                .flatten()
+        })
+}
+
+/// Resolve `N.member` where `N` is a `* as N` namespace alias → the imported file's
+/// top-level symbol (following re-exports).
+fn namespace_member(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+    member: &str,
+    arity: Option<usize>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    let turi = namespace_target_uri(uri, root, receiver)?;
+    let tfile = state.file(&turi)?;
+    let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+    if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, member, arity) {
+        return Some((turi, def));
+    }
+    cross_file_definition(state, &turi, &troot, member, arity)
 }
 
 /// Resolve the receiver of a member access to its type definition node and the file
