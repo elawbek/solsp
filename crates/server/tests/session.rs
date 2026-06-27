@@ -1388,6 +1388,55 @@ fn named_arg_type_in_completion_and_hover() {
 }
 
 #[test]
+fn signature_help_lists_overloads() {
+    let uri = Url::parse("file:///ov.sol").unwrap();
+    let src = "contract C { function f(uint256 a) public {} \
+               function f(uint256 a, address b) public {} \
+               function g() public { f(1, addr); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let ch = src.find("f(1, addr)").unwrap() as u32 + 5; // after the comma, on the 2nd arg
+    send_request(
+        &client,
+        2,
+        "textDocument/signatureHelp",
+        SignatureHelpParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            context: None,
+        },
+    );
+    let resp = next_response(&client);
+    let sh: SignatureHelp = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let labels: Vec<&str> = sh.signatures.iter().map(|s| s.label.as_str()).collect();
+    assert_eq!(labels, ["f(uint256 a)", "f(uint256 a, address b)"]);
+    // the 2-argument call selects the 2-parameter overload.
+    assert_eq!(sh.active_signature, Some(1));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn signature_help_for_positional_call() {
     let uri = Url::parse("file:///s.sol").unwrap();
     let src = "contract C { function f(uint256 amount, address to) public {} \

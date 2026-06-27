@@ -771,27 +771,80 @@ fn signature_help(state: &ServerState, params: SignatureHelpParams) -> Option<Si
     let name = callee_display_name(&callee)?;
     let (def_uri, def) = resolve_named_callee(state, &uri, &root, &callee)?;
     let droot = parse_root(state, &def_uri)?;
-    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
+    let def_node = def.full_ptr.to_node(&droot);
 
-    let labels: Vec<String> = fields
-        .iter()
-        .map(|(n, t)| {
-            if n.is_empty() {
-                t.clone()
-            } else if t.is_empty() {
-                n.clone()
-            } else {
-                format!("{t} {n}")
-            }
-        })
-        .collect();
-    let label = format!("{name}({})", labels.join(", "));
+    // the candidate declarations: same-file overloads of a function, else the single
+    // struct/constructor.
+    let candidates = signature_candidates(&def, &def_node, &name, &droot);
+
     // active parameter = number of top-level commas before the cursor.
     let active = arg_list
         .children_with_tokens()
         .filter_map(|e| e.into_token())
         .filter(|t| t.kind() == COMMA && t.text_range().start() < offset)
         .count() as u32;
+    let signatures: Vec<SignatureInformation> = candidates
+        .iter()
+        .map(|(kind, node)| signature_info(&name, *kind, node, active))
+        .collect();
+    // pick the overload whose parameter count matches the arguments typed so far.
+    let arg_count = arg_list.children().count();
+    let active_sig = candidates
+        .iter()
+        .position(|(kind, node)| named_arg_fields(*kind, node).len() == arg_count)
+        .unwrap_or(0) as u32;
+    Some(SignatureHelp {
+        signatures,
+        active_signature: Some(active_sig),
+        active_parameter: Some(active),
+    })
+}
+
+/// The declarations to show as signatures: every same-file overload of a function (sorted
+/// by parameter count), or the single struct / constructor.
+fn signature_candidates(
+    def: &solsp_hir::resolve::Definition,
+    def_node: &solsp_syntax::SyntaxNode,
+    name: &str,
+    droot: &solsp_syntax::SyntaxNode,
+) -> Vec<(solsp_hir::resolve::DefKind, solsp_syntax::SyntaxNode)> {
+    use solsp_hir::resolve::DefKind::{Function, Modifier};
+    if !matches!(def.kind, Function | Modifier) {
+        return vec![(def.kind, def_node.clone())];
+    }
+    // same-named functions in the enclosing contract, or at file top level.
+    let pool = match enclosing_contract(def_node) {
+        Some(c) => solsp_hir::resolve::type_members(&c),
+        None => solsp_hir::resolve::file_definitions(droot),
+    };
+    let mut nodes: Vec<solsp_syntax::SyntaxNode> = pool
+        .into_iter()
+        .filter(|d| d.kind == Function && d.name == name)
+        .map(|d| d.full_ptr.to_node(droot))
+        .collect();
+    if nodes.is_empty() {
+        nodes.push(def_node.clone());
+    }
+    nodes.sort_by_key(|n| named_arg_fields(Function, n).len());
+    nodes.into_iter().map(|n| (def.kind, n)).collect()
+}
+
+/// Build a `SignatureInformation` from a declaration's `(name, type)` parameters.
+fn signature_info(
+    name: &str,
+    kind: solsp_hir::resolve::DefKind,
+    node: &solsp_syntax::SyntaxNode,
+    active: u32,
+) -> SignatureInformation {
+    let labels: Vec<String> = named_arg_fields(kind, node)
+        .into_iter()
+        .map(|(n, t)| match (n.is_empty(), t.is_empty()) {
+            (true, _) => t,
+            (_, true) => n,
+            _ => format!("{t} {n}"),
+        })
+        .collect();
+    let label = format!("{name}({})", labels.join(", "));
     let parameters = labels
         .into_iter()
         .map(|p| ParameterInformation {
@@ -799,16 +852,12 @@ fn signature_help(state: &ServerState, params: SignatureHelpParams) -> Option<Si
             documentation: None,
         })
         .collect();
-    Some(SignatureHelp {
-        signatures: vec![SignatureInformation {
-            label,
-            documentation: None,
-            parameters: Some(parameters),
-            active_parameter: Some(active),
-        }],
-        active_signature: Some(0),
+    SignatureInformation {
+        label,
+        documentation: None,
+        parameters: Some(parameters),
         active_parameter: Some(active),
-    })
+    }
 }
 
 /// The display name of a call's callee: `f` / `S` / `obj.method` / `new T`.
