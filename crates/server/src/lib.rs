@@ -230,6 +230,10 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
+    // 0. a named-argument key (`f({ owner_: … })`) → its parameter/field type.
+    if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
+        return Some(h);
+    }
     // 1. same-file hover.
     if let Some(info) = solsp_ide::navigation::hover(&root, offset) {
         return Some(markup_hover(
@@ -612,27 +616,9 @@ fn named_arg_completion(
     if last_delim == Some(COLON) {
         return None; // value position — let scope/member completion handle it
     }
-    let call = nal.parent()?;
-    let callee = call.first_child()?;
-    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    let (def_uri, def) = named_arg_target(state, uri, root, &nal)?;
     let droot = parse_root(state, &def_uri)?;
-    let node = def.full_ptr.to_node(&droot);
-    use solsp_hir::resolve::DefKind;
-    let names: Vec<String> = match def.kind {
-        DefKind::Function | DefKind::Modifier | DefKind::Event | DefKind::Error => {
-            param_names(&node)
-        }
-        DefKind::Struct => solsp_hir::resolve::type_members(&node)
-            .into_iter()
-            .map(|d| d.name)
-            .collect(),
-        DefKind::Contract => node
-            .descendants()
-            .find(|n| n.kind() == CONSTRUCTOR_DEF)
-            .map(|c| param_names(&c))
-            .unwrap_or_default(),
-        _ => return None,
-    };
+    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
     // drop keys already supplied in this argument list (the direct NAME children).
     let present: std::collections::HashSet<String> = nal
         .children()
@@ -640,17 +626,80 @@ fn named_arg_completion(
         .filter_map(|n| node_ident(&n))
         .collect();
     Some(
-        names
+        fields
             .into_iter()
-            .filter(|name| !present.contains(name))
-            .map(|name| CompletionItem {
+            .filter(|(name, _)| !present.contains(name))
+            .map(|(name, ty)| CompletionItem {
                 kind: Some(CompletionItemKind::FIELD),
-                detail: Some("named argument".to_string()),
+                detail: Some(ty), // the parameter/field type
                 label: name,
                 ..Default::default()
             })
             .collect(),
     )
+}
+
+/// Hover over a named-argument key (`f({ owner_: … })`) → its parameter/field type,
+/// shown as `type name`.
+fn named_arg_hover(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<Hover> {
+    use solsp_syntax::SyntaxKind::{IDENT, NAME, NAMED_ARG_LIST};
+    let tok = root.token_at_offset(offset).find(|t| t.kind() == IDENT)?;
+    let name_node = tok.parent()?;
+    // a key is a NAME that is a direct child of the NAMED_ARG_LIST.
+    if name_node.kind() != NAME {
+        return None;
+    }
+    let nal = name_node.parent()?;
+    if nal.kind() != NAMED_ARG_LIST {
+        return None;
+    }
+    let key = node_ident(&name_node)?;
+    let (def_uri, def) = named_arg_target(state, uri, root, &nal)?;
+    let droot = parse_root(state, &def_uri)?;
+    let (_, ty) = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot))
+        .into_iter()
+        .find(|(n, _)| n == &key)?;
+    Some(markup_hover(format!("```solidity\n{ty} {key}\n```"), None))
+}
+
+/// Resolve the callee of the call whose named-argument list is `nal` to its declaration.
+fn named_arg_target(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    nal: &solsp_syntax::SyntaxNode,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    let callee = nal.parent()?.first_child()?;
+    resolve_named_callee(state, uri, root, &callee)
+}
+
+/// The `(name, type)` of each named argument a callee accepts: a function/constructor's
+/// parameters, or a struct's fields.
+fn named_arg_fields(
+    kind: solsp_hir::resolve::DefKind,
+    node: &solsp_syntax::SyntaxNode,
+) -> Vec<(String, String)> {
+    use solsp_hir::resolve::DefKind::*;
+    use solsp_syntax::SyntaxKind::{CONSTRUCTOR_DEF, STRUCT_FIELD};
+    match kind {
+        Function | Modifier | Event | Error => param_name_types(node),
+        Struct => node
+            .descendants()
+            .filter(|n| n.kind() == STRUCT_FIELD)
+            .filter_map(|f| named_type(&f))
+            .collect(),
+        Contract => node
+            .descendants()
+            .find(|n| n.kind() == CONSTRUCTOR_DEF)
+            .map(|c| param_name_types(&c))
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
 }
 
 /// The identifier text of a `NAME`/`NAME_REF` node.
@@ -680,22 +729,39 @@ fn resolve_named_callee(
     resolve_callee(state, uri, root, callee, None)
 }
 
-/// The parameter names of a function/constructor (its first `PARAM_LIST`).
-fn param_names(decl: &solsp_syntax::SyntaxNode) -> Vec<String> {
-    use solsp_syntax::SyntaxKind::{IDENT, NAME, PARAM, PARAM_LIST};
+/// The `(name, type)` of each parameter of a function/constructor (its first
+/// `PARAM_LIST`).
+fn param_name_types(decl: &solsp_syntax::SyntaxNode) -> Vec<(String, String)> {
+    use solsp_syntax::SyntaxKind::{PARAM, PARAM_LIST};
     decl.children()
         .find(|n| n.kind() == PARAM_LIST)
         .into_iter()
         .flat_map(|pl| pl.children())
         .filter(|n| n.kind() == PARAM)
-        .filter_map(|p| p.children().find(|c| c.kind() == NAME))
-        .filter_map(|nm| {
-            nm.children_with_tokens()
-                .filter_map(|e| e.into_token())
-                .find(|t| t.kind() == IDENT)
-                .map(|t| t.text().to_string())
-        })
+        .filter_map(|p| named_type(&p))
         .collect()
+}
+
+/// The `(name, type)` of a `PARAM` / `STRUCT_FIELD`: its `NAME` and its type node's text
+/// (whitespace-normalized, data-location stripped).
+fn named_type(decl: &solsp_syntax::SyntaxNode) -> Option<(String, String)> {
+    use solsp_syntax::SyntaxKind::NAME;
+    let name = decl
+        .children()
+        .find(|n| n.kind() == NAME)
+        .and_then(|n| node_ident(&n))?;
+    let ty = decl
+        .children()
+        .find(|n| n.kind() != NAME)
+        .map(|t| {
+            t.text()
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .unwrap_or_default();
+    Some((name, ty))
 }
 
 /// The receiver expression of a `receiver.member` access at `offset`, when the cursor is
