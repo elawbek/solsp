@@ -318,6 +318,8 @@ fn member_completion(
     offset: rowan::TextSize,
 ) -> Option<Vec<CompletionItem>> {
     let receiver = dotted_receiver(root, offset)?;
+    // library functions attached to the receiver's type via `using L for T`.
+    let using_items = using_member_items(state, uri, root, &receiver);
     // `N.` where `N` is an `import * as N` namespace alias → the imported file's exports.
     if let Some(turi) = namespace_target_uri(uri, root, &receiver) {
         if let Some(tfile) = state.file(&turi) {
@@ -365,6 +367,7 @@ fn member_completion(
                 state, &turi, &troot, &tdef, external,
             )));
         }
+        items.extend(using_items);
         let mut seen = std::collections::HashSet::new();
         items.retain(|i| seen.insert(i.label.clone()));
         return Some(items);
@@ -377,9 +380,14 @@ fn member_completion(
     if let Some(items) = type_expr_members(state, uri, root, &receiver) {
         return Some(items);
     }
-    // builtins on an `address` / array / `bytes` value.
-    if let Some(items) = value_type_builtin_members(root, &receiver) {
+    // builtins on an `address` / array / `bytes` value (plus any `using` functions).
+    if let Some(mut items) = value_type_builtin_members(root, &receiver) {
+        items.extend(using_items);
         return Some(items);
+    }
+    // an elementary value with only `using L for T` functions (e.g. `uint256.toString`).
+    if !using_items.is_empty() {
+        return Some(using_items);
     }
     Some(Vec::new())
 }
@@ -496,6 +504,113 @@ fn is_integer_type_name(n: &str) -> bool {
 
 fn is_fixed_bytes(n: &str) -> bool {
     matches!(n.strip_prefix("bytes").map(str::parse::<u8>), Some(Ok(w)) if (1..=32).contains(&w))
+}
+
+/// Parse a `USING_DIRECTIVE` into `(library, target)` — `target` is `None` for `for *`.
+/// The `using { f, g } for T` form (no single library) is skipped.
+fn parse_using(node: &solsp_syntax::SyntaxNode) -> Option<(String, Option<String>)> {
+    use solsp_syntax::SyntaxKind::{FOR_KW, IDENT, STAR, USING_KW};
+    let toks: Vec<_> = node
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| !matches!(t.kind(), solsp_syntax::SyntaxKind::WHITESPACE))
+        .collect();
+    let using_pos = toks.iter().position(|t| t.kind() == USING_KW)?;
+    let lib_tok = toks.get(using_pos + 1)?;
+    if lib_tok.kind() != IDENT {
+        return None; // `using { … } for T`
+    }
+    let for_pos = toks.iter().position(|t| t.kind() == FOR_KW)?;
+    let target_tok = toks.get(for_pos + 1)?;
+    let target = match target_tok.kind() {
+        STAR => None,
+        IDENT => Some(target_tok.text().to_string()),
+        _ => return None,
+    };
+    Some((lib_tok.text().to_string(), target))
+}
+
+/// The `using L for T` directives in scope at `node`: the enclosing contract's and the
+/// file's.
+fn using_directives(node: &solsp_syntax::SyntaxNode) -> Vec<(String, Option<String>)> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_BODY, SOURCE_FILE, USING_DIRECTIVE};
+    node.ancestors()
+        .filter(|n| matches!(n.kind(), CONTRACT_BODY | SOURCE_FILE))
+        .flat_map(|n| n.children())
+        .filter(|c| c.kind() == USING_DIRECTIVE)
+        .filter_map(|c| parse_using(&c))
+        .collect()
+}
+
+/// The type name of a receiver value: a user type's name, or an elementary type's text.
+fn receiver_type_name(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<String> {
+    if let Some((_, tdef)) = resolve_receiver_type(state, uri, root, receiver) {
+        return solsp_hir::resolve::contract_def_name(&tdef);
+    }
+    value_type_text(root, receiver)
+}
+
+/// Resolve `value.member` through a `using L for T` directive: the library function
+/// (the receiver is its implicit first argument). `None` if no directive attaches it.
+fn using_member(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+    member: &str,
+    arity: Option<usize>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    let type_name = receiver_type_name(state, uri, root, receiver)?;
+    for (lib, target) in using_directives(receiver) {
+        if target.as_deref().is_none_or(|t| t == type_name) {
+            if let Some((luri, lnode)) = resolve_type_by_name(state, uri, root, &lib, None) {
+                // the call's args plus the implicit receiver argument.
+                let def = solsp_hir::resolve::member_in_type(&lnode, member, arity.map(|a| a + 1))
+                    .or_else(|| solsp_hir::resolve::member_in_type(&lnode, member, None));
+                if let Some(def) = def {
+                    return Some((luri, def));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Completion items for the library functions a `using L for T` directive attaches to the
+/// receiver's type.
+fn using_member_items(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Vec<CompletionItem> {
+    let Some(type_name) = receiver_type_name(state, uri, root, receiver) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (lib, target) in using_directives(receiver) {
+        if target.as_deref().is_none_or(|t| t == type_name) {
+            if let Some((luri, lnode)) = resolve_type_by_name(state, uri, root, &lib, None) {
+                let Some(lroot) = parse_root(state, &luri) else {
+                    continue;
+                };
+                let funcs: Vec<_> = solsp_hir::resolve::type_members(&lnode)
+                    .into_iter()
+                    .filter(|d| {
+                        d.kind == solsp_hir::resolve::DefKind::Function
+                            && !solsp_hir::resolve::is_private(&d.full_ptr.to_node(&lroot))
+                    })
+                    .collect();
+                out.extend(completion_items_from(funcs));
+            }
+        }
+    }
+    out
 }
 
 /// Whether a `CONTRACT_DEF` node is a `library`.
@@ -1337,13 +1452,21 @@ fn member_resolve(
         return Some(found);
     }
 
-    let (type_uri, type_def) = resolve_receiver_type(state, uri, root, &receiver)?;
-    if let Some(def) = solsp_hir::resolve::member_in_type(&type_def, &member, arity) {
-        return Some((type_uri, def));
+    if let Some((type_uri, type_def)) = resolve_receiver_type(state, uri, root, &receiver) {
+        if let Some(def) = solsp_hir::resolve::member_in_type(&type_def, &member, arity) {
+            return Some((type_uri, def));
+        }
+        // the member may be inherited from a cross-file base of the receiver's type.
+        if let Some(troot) = parse_root(state, &type_uri) {
+            if let Some(found) =
+                inherited_member(state, &type_uri, &troot, &type_def, &member, arity)
+            {
+                return Some(found);
+            }
+        }
     }
-    // the member may be inherited from a cross-file base of the receiver's type.
-    let troot = parse_root(state, &type_uri)?;
-    inherited_member(state, &type_uri, &troot, &type_def, &member, arity)
+    // `using L for T` — a library function attached to the receiver's type.
+    using_member(state, uri, root, &receiver, &member, arity)
 }
 
 /// The file a `* as N` namespace import aliases, if `receiver` is that bare alias `N`.

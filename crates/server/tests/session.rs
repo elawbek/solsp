@@ -1245,6 +1245,90 @@ fn completion_imported_symbols_and_named_args() {
 }
 
 #[test]
+fn using_for_library_method() {
+    let uri = Url::parse("file:///uf.sol").unwrap();
+    let src = "library Str { function toString(uint256 v) internal pure returns (string memory) {} \
+               function half(uint256 v) internal pure returns (uint256) {} }\n\
+               contract C { using Str for uint256; function f() public { uint256 x; x.toString(); x.M; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line1 = src.lines().nth(1).unwrap();
+    // go-to-def on `x.toString()` lands on the library function (line 0).
+    let ch = line1.find("x.toString").unwrap() as u32 + 2;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 1,
+                    character: ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let d: GotoDefinitionResponse =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = d else {
+        panic!("expected a location")
+    };
+    assert_eq!(loc.range.start.line, 0);
+
+    // completion on `x.` lists the attached library functions.
+    let mch = line1.find("x.M").unwrap() as u32 + 2;
+    send_request(
+        &client,
+        3,
+        "textDocument/completion",
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 1,
+                    character: mch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        },
+    );
+    let r: CompletionResponse =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let labels: Vec<String> = match r {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    }
+    .into_iter()
+    .map(|i| i.label)
+    .collect();
+    assert!(
+        labels.contains(&"toString".to_string()) && labels.contains(&"half".to_string()),
+        "{labels:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn this_and_super_member_completion() {
     let uri = Url::parse("file:///ts.sol").unwrap();
     let src = "contract Base { function pub_() public {} function int_() internal {} }\n\
