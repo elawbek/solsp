@@ -8,9 +8,9 @@ use lsp_types::{
     CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
     Hover, HoverContents, HoverParams, InitializeParams, InitializeResult, Position,
-    PublishDiagnosticsParams, Range, SemanticTokensParams, SemanticTokensResult, SymbolKind,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    PublishDiagnosticsParams, Range, SemanticTokensParams, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
 };
 use std::thread;
 
@@ -1372,6 +1372,86 @@ fn named_arg_type_in_completion_and_hover() {
         panic!("expected markup hover");
     };
     assert!(m.value.contains("uint256 x"), "hover was {:?}", m.value);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn signature_help_and_positional_arg_hover() {
+    let uri = Url::parse("file:///s.sol").unwrap();
+    let src = "contract C { function f(uint256 amount, address to) public {} \
+               function g() public { uint256 x; address a; f(x, a); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let call = src.find("f(x, a)").unwrap();
+
+    // signature help while on the second argument → the signature + active parameter 1.
+    send_request(
+        &client,
+        2,
+        "textDocument/signatureHelp",
+        SignatureHelpParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: (call + 5) as u32,
+                }, // after `f(x, `
+            },
+            work_done_progress_params: Default::default(),
+            context: None,
+        },
+    );
+    let resp = next_response(&client);
+    let sh: SignatureHelp = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(sh.signatures[0].label, "f(uint256 amount, address to)");
+    assert_eq!(sh.active_parameter, Some(1));
+
+    // hover over the first argument `x` → expected + passed types.
+    send_request(
+        &client,
+        3,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: (call + 2) as u32,
+                }, // the `x`
+            },
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(m) = hov.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        m.value.contains("expected: uint256 amount"),
+        "hover was {:?}",
+        m.value
+    );
+    assert!(
+        m.value.contains("passed:   uint256"),
+        "hover was {:?}",
+        m.value
+    );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);

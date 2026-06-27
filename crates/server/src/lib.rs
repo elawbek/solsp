@@ -13,16 +13,17 @@ use lsp_types::notification::{
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
-    SemanticTokensFullRequest,
+    SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams, CompletionResponse,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
     Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
-    MarkupKind, OneOf, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    MarkupKind, OneOf, ParameterInformation, ParameterLabel, PublishDiagnosticsParams,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SignatureInformation, TextDocumentContentChangeEvent,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
 };
 use solsp_ide::LineIndex;
 
@@ -45,6 +46,11 @@ pub fn server_capabilities() -> ServerCapabilities {
             // `.` triggers member completion; bare-identifier completion is implicit.
             trigger_characters: Some(vec![".".to_string()]),
             ..Default::default()
+        }),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: None,
+            work_done_progress_options: WorkDoneProgressOptions::default(),
         }),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
@@ -125,6 +131,12 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
             Ok((id, params)) => Response::new_ok(id, completion(state, params)),
             Err(e) => extract_err_response(id, e),
         },
+        SignatureHelpRequest::METHOD => {
+            match req.extract::<SignatureHelpParams>(SignatureHelpRequest::METHOD) {
+                Ok((id, params)) => Response::new_ok(id, signature_help(state, params)),
+                Err(e) => extract_err_response(id, e),
+            }
+        }
         _ => Response::new_err(
             id,
             ErrorCode::MethodNotFound as i32,
@@ -232,6 +244,10 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     let root = solsp_base_db::parse(state.db(), file).syntax();
     // 0. a named-argument key (`f({ owner_: … })`) → its parameter/field type.
     if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
+        return Some(h);
+    }
+    // 0b. a positional argument (`f(value)`) → the expected and passed types.
+    if let Some(h) = positional_arg_hover(state, &uri, &root, offset) {
         return Some(h);
     }
     // 1. same-file hover.
@@ -667,6 +683,127 @@ fn named_arg_hover(
     Some(markup_hover(format!("```solidity\n{ty} {key}\n```"), None))
 }
 
+/// `textDocument/signatureHelp` → the signature of the call the cursor is inside (a
+/// positional `f(…)` call), with the active parameter highlighted.
+fn signature_help(state: &ServerState, params: SignatureHelpParams) -> Option<SignatureHelp> {
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, COMMA};
+    let pos = params.text_document_position_params;
+    let uri = pos.text_document.uri;
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let offset = to_proto::offset(li, pos.position)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+
+    let tok = root.token_at_offset(offset).left_biased()?;
+    let arg_list = tok.parent()?.ancestors().find(|n| n.kind() == ARG_LIST)?;
+    let call = arg_list.parent()?;
+    if call.kind() != CALL_EXPR {
+        return None;
+    }
+    let callee = call.first_child()?;
+    let name = callee_display_name(&callee)?;
+    let (def_uri, def) = resolve_named_callee(state, &uri, &root, &callee)?;
+    let droot = parse_root(state, &def_uri)?;
+    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
+
+    let labels: Vec<String> = fields
+        .iter()
+        .map(|(n, t)| {
+            if n.is_empty() {
+                t.clone()
+            } else if t.is_empty() {
+                n.clone()
+            } else {
+                format!("{t} {n}")
+            }
+        })
+        .collect();
+    let label = format!("{name}({})", labels.join(", "));
+    // active parameter = number of top-level commas before the cursor.
+    let active = arg_list
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == COMMA && t.text_range().start() < offset)
+        .count() as u32;
+    let parameters = labels
+        .into_iter()
+        .map(|p| ParameterInformation {
+            label: ParameterLabel::Simple(p),
+            documentation: None,
+        })
+        .collect();
+    Some(SignatureHelp {
+        signatures: vec![SignatureInformation {
+            label,
+            documentation: None,
+            parameters: Some(parameters),
+            active_parameter: Some(active),
+        }],
+        active_signature: Some(0),
+        active_parameter: Some(active),
+    })
+}
+
+/// The display name of a call's callee: `f` / `S` / `obj.method` / `new T`.
+fn callee_display_name(callee: &solsp_syntax::SyntaxNode) -> Option<String> {
+    use solsp_syntax::SyntaxKind::{MEMBER_EXPR, NAME_REF, NEW_EXPR, PATH_EXPR};
+    match callee.kind() {
+        PATH_EXPR | NAME_REF => solsp_hir::resolve::receiver_name(callee),
+        MEMBER_EXPR => member_name(callee),
+        NEW_EXPR => callee
+            .descendants()
+            .filter(|n| n.kind() == NAME_REF)
+            .last()
+            .and_then(|nr| node_ident(&nr)),
+        _ => None,
+    }
+}
+
+/// Hover over a positional argument (`f(value)`) → the type expected at that position
+/// and the type passed (the value's declared type).
+fn positional_arg_hover(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<Hover> {
+    use solsp_syntax::SyntaxKind::{ARG_LIST, IDENT};
+    let tok = root.token_at_offset(offset).find(|t| t.kind() == IDENT)?;
+    // the argument expression is the ancestor whose parent is the ARG_LIST.
+    let arg = tok
+        .parent()?
+        .ancestors()
+        .find(|n| n.parent().is_some_and(|p| p.kind() == ARG_LIST))?;
+    let arg_list = arg.parent()?;
+    let index = arg_list.children().position(|c| c == arg)?;
+    let callee = arg_list.parent()?.first_child()?;
+    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    let droot = parse_root(state, &def_uri)?;
+    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
+    let (ename, etype) = fields.get(index)?;
+    let expected = if ename.is_empty() {
+        format!("expected: {etype}")
+    } else {
+        format!("expected: {etype} {ename}")
+    };
+    // passed type: the value's declared type, if the argument resolves to a declaration.
+    let body = match positional_passed_type(root, offset) {
+        Some(p) => format!("```solidity\npassed:   {p}\n{expected}\n```"),
+        None => format!("```solidity\n{expected}\n```"),
+    };
+    Some(markup_hover(body, None))
+}
+
+/// The declared type of the value at `offset`, when it resolves to a same-file
+/// declaration (local/param/state-var).
+fn positional_passed_type(
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<String> {
+    let def = solsp_hir::resolve::definition_at(root, offset)?;
+    type_text(&def.full_ptr.to_node(root))
+}
+
 /// Resolve the callee of the call whose named-argument list is `nal` to its declaration.
 fn named_arg_target(
     state: &ServerState,
@@ -750,9 +887,15 @@ fn named_type(decl: &solsp_syntax::SyntaxNode) -> Option<(String, String)> {
         .children()
         .find(|n| n.kind() == NAME)
         .and_then(|n| node_ident(&n))?;
-    let ty = decl
-        .children()
-        .find(|n| n.kind() != NAME)
+    Some((name, type_text(decl).unwrap_or_default()))
+}
+
+/// The declared type of a `PARAM` / `STRUCT_FIELD` / `VAR_DECL` / state-variable node:
+/// its first non-`NAME` child node's text (whitespace-normalized; a data-location
+/// keyword is a token between the type node and the name, so it is excluded).
+fn type_text(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
+    decl.children()
+        .find(|n| n.kind() != solsp_syntax::SyntaxKind::NAME)
         .map(|t| {
             t.text()
                 .to_string()
@@ -760,8 +903,6 @@ fn named_type(decl: &solsp_syntax::SyntaxNode) -> Option<(String, String)> {
                 .collect::<Vec<_>>()
                 .join(" ")
         })
-        .unwrap_or_default();
-    Some((name, ty))
 }
 
 /// The receiver expression of a `receiver.member` access at `offset`, when the cursor is
