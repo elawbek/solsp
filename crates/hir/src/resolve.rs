@@ -41,6 +41,27 @@ pub struct Definition {
     pub name_ptr: AstPtr,
     /// The whole declaration node.
     pub full_ptr: AstPtr,
+    /// The declared type, for value members (field/state-var/param/local). `None` for
+    /// functions, types, etc. Used as the completion `detail`.
+    pub ty: Option<String>,
+}
+
+/// The declared type text of a value declaration, for the `ty` field — its first
+/// non-`NAME` child node, whitespace-normalized. Only for value kinds.
+fn decl_ty(node: &SyntaxNode, kind: DefKind) -> Option<String> {
+    use DefKind::*;
+    if !matches!(kind, StateVariable | Parameter | Local | Field) {
+        return None;
+    }
+    node.children()
+        .find(|n| n.kind() != SyntaxKind::NAME)
+        .map(|t| {
+            t.text()
+                .to_string()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
 }
 
 /// A top-level declaration of `root` named `name` (contract/function/struct/etc.).
@@ -125,15 +146,19 @@ pub fn member_in_type(
             .filter(|n| matches!(n.kind(), STRUCT_FIELD | ENUM_VARIANT))
             .find_map(|n| {
                 let name_node = n.children().find(|c| c.kind() == NAME)?;
-                (ident_text(&name_node)? == member).then(|| Definition {
-                    name: member.to_string(),
-                    kind: if n.kind() == STRUCT_FIELD {
+                (ident_text(&name_node)? == member).then(|| {
+                    let kind = if n.kind() == STRUCT_FIELD {
                         DefKind::Field
                     } else {
                         DefKind::Variant
-                    },
-                    name_ptr: AstPtr::new(&name_node),
-                    full_ptr: AstPtr::new(&n),
+                    };
+                    Definition {
+                        name: member.to_string(),
+                        kind,
+                        name_ptr: AstPtr::new(&name_node),
+                        full_ptr: AstPtr::new(&n),
+                        ty: decl_ty(&n, kind),
+                    }
                 })
             }),
         _ => None,
@@ -209,15 +234,17 @@ pub fn type_members(type_def: &SyntaxNode) -> Vec<Definition> {
             .filter(|n| matches!(n.kind(), STRUCT_FIELD | ENUM_VARIANT))
             .filter_map(|n| {
                 let name_node = n.children().find(|c| c.kind() == NAME)?;
+                let kind = if n.kind() == STRUCT_FIELD {
+                    DefKind::Field
+                } else {
+                    DefKind::Variant
+                };
                 Some(Definition {
                     name: ident_text(&name_node)?,
-                    kind: if n.kind() == STRUCT_FIELD {
-                        DefKind::Field
-                    } else {
-                        DefKind::Variant
-                    },
+                    kind,
                     name_ptr: AstPtr::new(&name_node),
                     full_ptr: AstPtr::new(&n),
+                    ty: decl_ty(&n, kind),
                 })
             })
             .collect(),
@@ -429,6 +456,7 @@ fn make_yul_def(name_node: &SyntaxNode, full: &SyntaxNode, kind: DefKind) -> Opt
         kind,
         name_ptr: AstPtr::new(name_node),
         full_ptr: AstPtr::new(full),
+        ty: None, // Yul values are untyped words
     })
 }
 
@@ -689,6 +717,7 @@ fn make_def(node: &SyntaxNode, kind: DefKind) -> Option<Definition> {
         kind,
         name_ptr: AstPtr::new(&name_node),
         full_ptr: AstPtr::new(node),
+        ty: decl_ty(node, kind),
     })
 }
 

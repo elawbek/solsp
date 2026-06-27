@@ -349,12 +349,12 @@ fn member_completion(
                 true
             }
         };
-        // same-file members (struct fields, same-file C3) carry their declared type.
+        // members carry their declared type (`Definition::ty`) in the completion detail.
         let same_file = solsp_hir::resolve::type_members(&tdef)
             .into_iter()
             .filter(|d| keep(&d.full_ptr.to_node(&troot)))
             .collect();
-        let mut items = typed_items(same_file, &troot);
+        let mut items = completion_items_from(same_file);
         // contracts inherit across files (libraries do not); add those members.
         if contract_like && !library {
             items.extend(completion_items_from(collect_inherited_members(
@@ -1005,41 +1005,15 @@ fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<Compl
         .filter(|d| seen.insert(d.name.clone()))
         .map(|d| CompletionItem {
             kind: Some(completion_kind(d.kind)),
-            detail: Some(def_detail(d.kind).to_string()),
+            // a value member shows its declared type; everything else its kind label.
+            detail: Some(
+                d.ty.clone()
+                    .unwrap_or_else(|| def_detail(d.kind).to_string()),
+            ),
             label: d.name,
             ..Default::default()
         })
         .collect()
-}
-
-/// Completion items whose `detail` carries the member's declared type (for fields and
-/// variables), resolved against `root` — the file the members live in. Functions and
-/// types keep their kind label.
-fn typed_items(
-    defs: Vec<solsp_hir::resolve::Definition>,
-    root: &solsp_syntax::SyntaxNode,
-) -> Vec<CompletionItem> {
-    defs.into_iter()
-        .map(|d| {
-            let detail = member_detail(&d, root);
-            CompletionItem {
-                kind: Some(completion_kind(d.kind)),
-                detail: Some(detail),
-                label: d.name,
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
-/// The `detail` for a member: its declared type (field/variable) or its kind label.
-fn member_detail(def: &solsp_hir::resolve::Definition, root: &solsp_syntax::SyntaxNode) -> String {
-    use solsp_hir::resolve::DefKind::*;
-    match def.kind {
-        StateVariable | Parameter | Local | Field => type_text(&def.full_ptr.to_node(root))
-            .unwrap_or_else(|| def_detail(def.kind).to_string()),
-        _ => def_detail(def.kind).to_string(),
-    }
 }
 
 fn completion_kind(k: solsp_hir::resolve::DefKind) -> CompletionItemKind {
