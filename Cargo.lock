@@ -656,8 +656,10 @@ dependencies = [
  "lsp-server",
  "lsp-types",
  "rowan",
+ "salsa",
  "serde",
  "serde_json",
+ "solsp-base-db",
  "solsp-ide",
  "solsp-syntax",
 ]

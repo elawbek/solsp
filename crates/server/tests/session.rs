@@ -7,7 +7,7 @@ use lsp_server::{Connection, Message, Notification, Request, RequestId, Response
 use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, InitializeParams, InitializeResult, Position, PublishDiagnosticsParams,
+    HoverParams, InitializeParams, InitializeResult, Position, PublishDiagnosticsParams, Range,
     SemanticTokensParams, SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent,
     TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
     VersionedTextDocumentIdentifier,
@@ -178,6 +178,88 @@ fn full_lsp_session() {
     assert_eq!(resp.id, RequestId::from(4));
     send_notification(&client, "exit", serde_json::Value::Null);
 
+    server_thread.join().expect("server thread panicked");
+}
+
+fn incremental_change(
+    uri: &Url,
+    version: i32,
+    start: (u32, u32),
+    end: (u32, u32),
+    text: &str,
+) -> DidChangeTextDocumentParams {
+    DidChangeTextDocumentParams {
+        text_document: VersionedTextDocumentIdentifier {
+            uri: uri.clone(),
+            version,
+        },
+        content_changes: vec![TextDocumentContentChangeEvent {
+            range: Some(Range {
+                start: Position {
+                    line: start.0,
+                    character: start.1,
+                },
+                end: Position {
+                    line: end.0,
+                    character: end.1,
+                },
+            }),
+            range_length: None,
+            text: text.to_string(),
+        }],
+    }
+}
+
+#[test]
+fn incremental_edit_updates_diagnostics() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let resp = next_response(&client);
+    // server advertises INCREMENTAL sync
+    let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let sync = serde_json::to_value(init.capabilities.text_document_sync.unwrap()).unwrap();
+    assert_eq!(sync, serde_json::json!(2)); // TextDocumentSyncKind::INCREMENTAL
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+
+    let uri = Url::parse("file:///C.sol").unwrap();
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&uri, "contract C {}"),
+    );
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let d: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(d.diagnostics.is_empty());
+
+    // splice "@@@ " at the very start → now broken
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        incremental_change(&uri, 1, (0, 0), (0, 0), "@@@ "),
+    );
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let d: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(!d.diagnostics.is_empty(), "broken after insert");
+
+    // delete the "@@@ " back out → clean again
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        incremental_change(&uri, 2, (0, 0), (0, 4), ""),
+    );
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let d: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(d.diagnostics.is_empty(), "clean after delete");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
     server_thread.join().expect("server thread panicked");
 }
 

@@ -19,9 +19,10 @@ use lsp_types::{
     Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
     MarkupKind, OneOf, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkDoneProgressOptions,
+    ServerCapabilities, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
 };
+use solsp_ide::LineIndex;
 
 pub mod state;
 pub mod to_proto;
@@ -32,7 +33,9 @@ use state::ServerState;
 /// and semantic tokens (full-document) with our legend.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
+        text_document_sync: Some(TextDocumentSyncCapability::Kind(
+            TextDocumentSyncKind::INCREMENTAL,
+        )),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -51,7 +54,7 @@ pub fn server_capabilities() -> ServerCapabilities {
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
 pub fn run(connection: &Connection) -> Result<()> {
-    let state = ServerState::default();
+    let mut state = ServerState::default();
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
@@ -62,7 +65,7 @@ pub fn run(connection: &Connection) -> Result<()> {
                 connection.sender.send(Message::Response(resp))?;
             }
             Message::Notification(not) => {
-                handle_notification(connection, &state, not)?;
+                handle_notification(connection, &mut state, not)?;
             }
             Message::Response(_resp) => {}
         }
@@ -109,12 +112,13 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
 /// `textDocument/documentSymbol` → nested outline (empty if the doc is not open).
 fn document_symbols(state: &ServerState, params: DocumentSymbolParams) -> DocumentSymbolResponse {
     let uri = params.text_document.uri;
-    let symbols = match state.get(&uri) {
-        Some(doc) => {
-            let bare = solsp_ide::document_symbols::document_symbols(&doc.parse.syntax());
-            to_proto::document_symbols(&bare, &doc.line_index)
+    let symbols = match (state.file(&uri), state.line_index(&uri)) {
+        (Some(file), Some(li)) => {
+            let root = solsp_base_db::parse(state.db(), file).syntax();
+            let bare = solsp_ide::document_symbols::document_symbols(&root);
+            to_proto::document_symbols(&bare, li)
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     DocumentSymbolResponse::Nested(symbols)
 }
@@ -125,9 +129,11 @@ fn semantic_tokens(
     params: SemanticTokensParams,
 ) -> Option<SemanticTokensResult> {
     let uri = params.text_document.uri;
-    let doc = state.get(&uri)?;
-    let bare = solsp_ide::semantic_tokens::semantic_tokens(&doc.parse.syntax());
-    let tokens = to_proto::semantic_tokens(&bare, &doc.text, &doc.line_index);
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let parse = solsp_base_db::parse(state.db(), file);
+    let bare = solsp_ide::semantic_tokens::semantic_tokens(&parse.syntax());
+    let tokens = to_proto::semantic_tokens(&bare, file.text(state.db()), li);
     Some(SemanticTokensResult::Tokens(tokens))
 }
 
@@ -139,29 +145,30 @@ fn goto_definition(
 ) -> Option<GotoDefinitionResponse> {
     let pos = params.text_document_position_params;
     let uri = pos.text_document.uri;
-    let doc = state.get(&uri)?;
-    let offset = to_proto::offset(&doc.line_index, pos.position)?;
-    let target = solsp_ide::navigation::goto_definition(&doc.parse.syntax(), offset)?;
-    let range = to_proto::range(&doc.line_index, target);
-    Some(GotoDefinitionResponse::Scalar(Location {
-        uri: uri.clone(),
-        range,
-    }))
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let offset = to_proto::offset(li, pos.position)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+    let target = solsp_ide::navigation::goto_definition(&root, offset)?;
+    let range = to_proto::range(li, target);
+    Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
 }
 
 /// `textDocument/hover` → the definition's signature + kind as markdown (or `None`).
 fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     let pos = params.text_document_position_params;
     let uri = pos.text_document.uri;
-    let doc = state.get(&uri)?;
-    let offset = to_proto::offset(&doc.line_index, pos.position)?;
-    let info = solsp_ide::navigation::hover(&doc.parse.syntax(), offset)?;
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let offset = to_proto::offset(li, pos.position)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+    let info = solsp_ide::navigation::hover(&root, offset)?;
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value: info.contents,
         }),
-        range: Some(to_proto::range(&doc.line_index, info.range)),
+        range: Some(to_proto::range(li, info.range)),
     })
 }
 
@@ -169,7 +176,7 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
 /// close drops the doc and clears its diagnostics. Unknown notifications are ignored.
 fn handle_notification(
     connection: &Connection,
-    state: &ServerState,
+    state: &mut ServerState,
     not: Notification,
 ) -> Result<()> {
     match not.method.as_str() {
@@ -186,10 +193,16 @@ fn handle_notification(
                 return Ok(());
             };
             let uri = params.text_document.uri;
-            // FULL sync: the last content change carries the entire new document text.
-            if let Some(change) = params.content_changes.into_iter().next_back() {
-                state.set(&uri, change.text);
+            // INCREMENTAL sync: apply each content change in order to the current text
+            // (each is relative to the document after the previous change), then reset
+            // the whole text — full-document changes (range: None) also work.
+            let Some(mut text) = state.text(&uri) else {
+                return Ok(());
+            };
+            for change in params.content_changes {
+                apply_change(&mut text, change);
             }
+            state.set(&uri, text);
             publish_diagnostics(connection, state, &uri)?;
         }
         DidCloseTextDocument::METHOD => {
@@ -204,6 +217,28 @@ fn handle_notification(
         _ => {}
     }
     Ok(())
+}
+
+/// Apply one LSP content change to `text`. A change with a `range` splices the
+/// replacement over those bytes (range is in UTF-16 line/col, mapped via a fresh
+/// `LineIndex` over the current text); a change without a range replaces the whole
+/// document. Out-of-range edits are ignored rather than panicking.
+fn apply_change(text: &mut String, change: TextDocumentContentChangeEvent) {
+    let Some(range) = change.range else {
+        *text = change.text;
+        return;
+    };
+    let li = LineIndex::new(text);
+    let (Some(start), Some(end)) = (
+        to_proto::offset(&li, range.start),
+        to_proto::offset(&li, range.end),
+    ) else {
+        return;
+    };
+    let (start, end) = (u32::from(start) as usize, u32::from(end) as usize);
+    if start <= end && end <= text.len() {
+        text.replace_range(start..end, &change.text);
+    }
 }
 
 /// Extract a notification's params, or `None` (logging) on malformed params. Crucial:
@@ -227,12 +262,13 @@ where
 
 /// Compute and publish diagnostics for an open document (empty list if missing).
 fn publish_diagnostics(connection: &Connection, state: &ServerState, uri: &Url) -> Result<()> {
-    let diagnostics = match state.get(uri) {
-        Some(doc) => {
-            let bare = solsp_ide::diagnostics::diagnostics(&doc.parse);
-            to_proto::diagnostics(&bare, &doc.line_index)
+    let diagnostics = match (state.file(uri), state.line_index(uri)) {
+        (Some(file), Some(li)) => {
+            let parse = solsp_base_db::parse(state.db(), file);
+            let bare = solsp_ide::diagnostics::diagnostics(parse.errors());
+            to_proto::diagnostics(&bare, li)
         }
-        None => Vec::new(),
+        _ => Vec::new(),
     };
     send_diagnostics(connection, uri.clone(), diagnostics)
 }

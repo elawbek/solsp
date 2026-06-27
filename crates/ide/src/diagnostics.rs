@@ -2,7 +2,7 @@
 //! The "pulse" of the parser — if it breaks, this lights up (design §4, feature 1).
 
 use rowan::TextRange;
-use solsp_syntax::Parse;
+use solsp_syntax::SyntaxError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Severity {
@@ -18,10 +18,10 @@ pub struct Diagnostic {
     pub severity: Severity,
 }
 
-/// Collect syntax diagnostics from a parse result.
-pub fn diagnostics(parse: &Parse) -> Vec<Diagnostic> {
-    parse
-        .errors()
+/// Collect syntax diagnostics from a parse's errors. Takes the error slice (rather
+/// than a `Parse`) so it serves both `solsp_syntax::Parse` and the salsa `SolParse`.
+pub fn diagnostics(errors: &[SyntaxError]) -> Vec<Diagnostic> {
+    errors
         .iter()
         .map(|e| Diagnostic {
             range: e.range,
@@ -40,7 +40,7 @@ mod tests {
     fn clean_parse_yields_no_diagnostics() {
         let p = parse("contract C {}");
         assert!(p.errors().is_empty());
-        assert!(diagnostics(&p).is_empty());
+        assert!(diagnostics(p.errors()).is_empty());
     }
 
     #[test]
@@ -48,7 +48,7 @@ mod tests {
         // Leading garbage `@@@` reliably yields ≥1 syntax error (the parser
         // err_and_bumps each unexpected token at the file level).
         let p = parse("@@@ contract C {}");
-        let diags = diagnostics(&p);
+        let diags = diagnostics(p.errors());
         assert_eq!(diags.len(), p.errors().len());
         assert!(!diags.is_empty(), "expected at least one diagnostic");
         for (d, e) in diags.iter().zip(p.errors()) {

@@ -53,7 +53,7 @@ contract Vault is Ownable {\n\
         let root = p.syntax();
 
         // Feature 1 — diagnostics: a clean parse ⇒ none.
-        assert!(diagnostics(&p).is_empty());
+        assert!(diagnostics(p.errors()).is_empty());
 
         // Infra — LineIndex round-trips on a UTF-16-shifting comment line.
         let li = LineIndex::new(VAULT);
