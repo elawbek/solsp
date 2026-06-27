@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 solsp-syntax = { path = "../syntax" }
+solsp-hir = { path = "../hir" }
 rowan = "0.15"

@@ -11,12 +11,16 @@ use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
     PublishDiagnostics,
 };
-use lsp_types::request::{DocumentSymbolRequest, Request as _, SemanticTokensFullRequest};
+use lsp_types::request::{
+    DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _, SemanticTokensFullRequest,
+};
 use lsp_types::{
-    DocumentSymbolParams, DocumentSymbolResponse, OneOf, PublishDiagnosticsParams,
-    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, HoverProviderCapability, Location, MarkupContent,
+    MarkupKind, OneOf, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkDoneProgressOptions,
 };
 
 pub mod state;
@@ -30,6 +34,8 @@ pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
         text_document_sync: Some(TextDocumentSyncCapability::Kind(TextDocumentSyncKind::FULL)),
         document_symbol_provider: Some(OneOf::Left(true)),
+        definition_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
         semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
             SemanticTokensOptions {
                 work_done_progress_options: WorkDoneProgressOptions::default(),
@@ -83,6 +89,15 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
                 Err(e) => extract_err_response(id, e),
             }
         }
+        GotoDefinition::METHOD => match req.extract::<GotoDefinitionParams>(GotoDefinition::METHOD)
+        {
+            Ok((id, params)) => Response::new_ok(id, goto_definition(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
+        HoverRequest::METHOD => match req.extract::<HoverParams>(HoverRequest::METHOD) {
+            Ok((id, params)) => Response::new_ok(id, hover(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
         _ => Response::new_err(
             id,
             ErrorCode::MethodNotFound as i32,
@@ -114,6 +129,40 @@ fn semantic_tokens(
     let bare = solsp_ide::semantic_tokens::semantic_tokens(&doc.parse.syntax());
     let tokens = to_proto::semantic_tokens(&bare, &doc.text, &doc.line_index);
     Some(SemanticTokensResult::Tokens(tokens))
+}
+
+/// `textDocument/definition` → the declaration's name range, as a same-file
+/// `Location` (or `None` if nothing resolves under the cursor).
+fn goto_definition(
+    state: &ServerState,
+    params: GotoDefinitionParams,
+) -> Option<GotoDefinitionResponse> {
+    let pos = params.text_document_position_params;
+    let uri = pos.text_document.uri;
+    let doc = state.get(&uri)?;
+    let offset = to_proto::offset(&doc.line_index, pos.position)?;
+    let target = solsp_ide::navigation::goto_definition(&doc.parse.syntax(), offset)?;
+    let range = to_proto::range(&doc.line_index, target);
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri: uri.clone(),
+        range,
+    }))
+}
+
+/// `textDocument/hover` → the definition's signature + kind as markdown (or `None`).
+fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
+    let pos = params.text_document_position_params;
+    let uri = pos.text_document.uri;
+    let doc = state.get(&uri)?;
+    let offset = to_proto::offset(&doc.line_index, pos.position)?;
+    let info = solsp_ide::navigation::hover(&doc.parse.syntax(), offset)?;
+    Some(Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value: info.contents,
+        }),
+        range: Some(to_proto::range(&doc.line_index, info.range)),
+    })
 }
 
 /// Handle a notification: open/change update the store and republish diagnostics;

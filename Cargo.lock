@@ -643,6 +643,7 @@ name = "solsp-ide"
 version = "0.0.1"
 dependencies = [
  "rowan",
+ "solsp-hir",
  "solsp-syntax",
 ]
 

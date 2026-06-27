@@ -6,9 +6,11 @@
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
     DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, InitializeParams, InitializeResult, PublishDiagnosticsParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, InitializeParams, InitializeResult, Position, PublishDiagnosticsParams,
     SemanticTokensParams, SemanticTokensResult, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, Url, VersionedTextDocumentIdentifier,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier,
 };
 use std::thread;
 
@@ -176,6 +178,94 @@ fn full_lsp_session() {
     assert_eq!(resp.id, RequestId::from(4));
     send_notification(&client, "exit", serde_json::Value::Null);
 
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn goto_definition_and_hover() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let resp = next_response(&client);
+    let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(init.capabilities.definition_provider.is_some());
+    assert!(init.capabilities.hover_provider.is_some());
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+
+    // single line ⇒ UTF-16 character == byte offset, so positions come from `find`.
+    let uri = Url::parse("file:///C.sol").unwrap();
+    let src = "contract C { uint256 s; function f() public { s = 1; } }";
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let use_char = src.find("s = 1").unwrap() as u32;
+    let decl_char = src.find("s;").unwrap() as u32;
+    let cursor = TextDocumentPositionParams {
+        text_document: doc_id(&uri),
+        position: Position {
+            line: 0,
+            character: use_char,
+        },
+    };
+
+    // definition: jumps to the state-variable declaration name `s`.
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: cursor.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = def else {
+        panic!("expected a single definition location");
+    };
+    assert_eq!(loc.uri, uri);
+    assert_eq!(
+        loc.range.start,
+        Position {
+            line: 0,
+            character: decl_char
+        }
+    );
+    assert_eq!(
+        loc.range.end,
+        Position {
+            line: 0,
+            character: decl_char + 1
+        }
+    );
+
+    // hover: kind + signature for the same identifier.
+    send_request(
+        &client,
+        3,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: cursor,
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hover: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(markup.value.contains("(state variable)"));
+    assert!(markup.value.contains("`s`"));
+
+    send_request(&client, 4, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
     server_thread.join().expect("server thread panicked");
 }
 

@@ -12,7 +12,7 @@ use rowan::{TextRange, TextSize};
 use solsp_ide::diagnostics::{Diagnostic as IdeDiagnostic, Severity};
 use solsp_ide::document_symbols::{DocumentSymbol as IdeSymbol, SymbolKind as IdeSymbolKind};
 use solsp_ide::semantic_tokens::{SemanticToken as IdeToken, TokenType};
-use solsp_ide::LineIndex;
+use solsp_ide::{LineCol, LineIndex};
 
 // ---------------------------------------------------------------------------
 // Positions
@@ -25,6 +25,15 @@ fn position(li: &LineIndex, offset: TextSize) -> Position {
         line: lc.line,
         character: lc.col,
     }
+}
+
+/// LSP `{line, character}` → byte offset (`None` past EOF). The inverse of
+/// [`position`]; used to turn a request cursor into a `TextSize`.
+pub fn offset(li: &LineIndex, pos: Position) -> Option<TextSize> {
+    li.offset(LineCol {
+        line: pos.line,
+        col: pos.character,
+    })
 }
 
 /// Byte `TextRange` → LSP `Range`.

@@ -7,6 +7,7 @@
 pub mod diagnostics;
 pub mod document_symbols;
 pub mod line_index;
+pub mod navigation;
 pub mod semantic_tokens;
 
 pub use line_index::{LineCol, LineIndex};
