@@ -30,10 +30,53 @@ pub struct Hover {
 /// Hover for the identifier at `offset`: the declaration's signature line plus a
 /// `(kind) name` caption. `None` if nothing resolves.
 pub fn hover(root: &SyntaxNode, offset: TextSize) -> Option<Hover> {
-    let def = definition_at(root, offset)?;
-    let contents = hover_markdown(root, &def);
-    let range = ident_range_at(root, offset).unwrap_or_else(|| name_range(root, &def));
-    Some(Hover { contents, range })
+    if let Some(def) = definition_at(root, offset) {
+        let contents = hover_markdown(root, &def);
+        let range = ident_range_at(root, offset).unwrap_or_else(|| name_range(root, &def));
+        return Some(Hover { contents, range });
+    }
+    // a literal (`5`, `"hi"`, `true`, `1 ether`) → its inferred type.
+    literal_hover(root, offset)
+}
+
+/// Hover for a literal at `offset`: its inferred type and the literal text.
+fn literal_hover(root: &SyntaxNode, offset: TextSize) -> Option<Hover> {
+    use SyntaxKind::{FALSE_KW, LITERAL_EXPR, NUMBER, STRING, TRUE_KW};
+    let tok = root
+        .token_at_offset(offset)
+        .find(|t| matches!(t.kind(), NUMBER | STRING | TRUE_KW | FALSE_KW))?;
+    let lit = tok
+        .parent()
+        .filter(|n| n.kind() == LITERAL_EXPR)
+        .unwrap_or_else(|| tok.parent().expect("token has a parent"));
+    let text = lit.text().to_string();
+    let trimmed = text.trim();
+    let (ty, label) = match tok.kind() {
+        TRUE_KW | FALSE_KW => ("bool", "boolean literal"),
+        STRING => {
+            if trimmed.starts_with("hex") {
+                ("bytes", "hex literal")
+            } else {
+                ("string", "string literal")
+            }
+        }
+        // NUMBER: an `0x`-prefixed 40-hex-digit value is an address; otherwise an integer.
+        _ => {
+            let hex = tok
+                .text()
+                .strip_prefix("0x")
+                .or_else(|| tok.text().strip_prefix("0X"));
+            if hex.is_some_and(|h| h.len() == 40 && h.bytes().all(|b| b.is_ascii_hexdigit())) {
+                ("address", "address literal")
+            } else {
+                ("uint256", "number literal")
+            }
+        }
+    };
+    Some(Hover {
+        contents: format!("```solidity\n{ty}\n```\n\n*({label})* `{trimmed}`"),
+        range: lit.text_range(),
+    })
 }
 
 /// The hover markdown for a definition (public so the server can render a hover for a
@@ -192,6 +235,20 @@ mod tests {
             h.contents
         );
         assert!(!h.contents.contains("return true"), "body must be excluded");
+    }
+
+    #[test]
+    fn hover_on_literals_shows_inferred_type() {
+        let src = "contract C { function f() public { \
+                   uint256 n = 5; string memory s = \"hi\"; bool b = true; uint256 e = 1 ether; \
+                   address a = 0x1111111111111111111111111111111111111111; } }";
+        let root = parse(src).syntax();
+        let ty = |needle: &str| hover(&root, at(src, needle)).unwrap().contents;
+        assert!(ty("5;").contains("uint256") && ty("5;").contains("number literal"));
+        assert!(ty("\"hi\"").contains("string"));
+        assert!(ty("true").contains("bool"));
+        assert!(ty("1 ether").contains("uint256"));
+        assert!(ty("0x1111").contains("address"));
     }
 
     #[test]
