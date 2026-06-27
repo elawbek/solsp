@@ -1043,7 +1043,8 @@ fn completion_member_and_scope_with_inheritance() {
     let main = dir.join("Main.sol");
     fs::write(
         &base,
-        "contract Base { uint256 baseVar; function baseFn() internal {} }\n",
+        "contract Base { uint256 baseVar; function baseFn() internal {} \
+         function basePub() public {} }\n",
     )
     .unwrap();
     // lines are flush-left so column math is simple; `c` is a local of contract type C.
@@ -1112,14 +1113,21 @@ fn completion_member_and_scope_with_inheritance() {
         );
     }
 
-    // member completion after `c.` (line 4) — `c` is of contract type C, so its members
-    // incl. the inherited `baseFn`/`baseVar`.
+    // member completion after `c.` (line 4) — `c` is a contract *instance*, so external
+    // access shows the inherited public `basePub` but NOT the internal `baseFn`/`baseVar`.
     let member = labels(3, 4, 2);
     assert!(
-        member.contains(&"baseFn".to_string()),
-        "member missing baseFn: {member:?}"
+        member.contains(&"basePub".to_string()),
+        "member missing basePub: {member:?}"
     );
-    assert!(member.contains(&"baseVar".to_string()));
+    assert!(
+        !member.contains(&"baseFn".to_string()),
+        "internal leaked: {member:?}"
+    );
+    assert!(
+        !member.contains(&"baseVar".to_string()),
+        "internal var leaked: {member:?}"
+    );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
@@ -1709,6 +1717,71 @@ fn tuple_declared_local_member_resolves() {
                function f() public { (bool ok, Thing memory t) = g(); t.amount; } }";
     // `amount` in `t.amount` → the field on line 0 (resolved through `t`'s type).
     assert_eq!(def_line_in_memory(src, ".amount"), 0);
+}
+
+#[test]
+fn library_member_completion_shows_internal_hides_private() {
+    let uri = Url::parse("file:///lib.sol").unwrap();
+    let src = "library L { function pubFn() public {} function intFn() internal {} \
+               function privFn() private {} }\n\
+               contract C { function f() public { L. } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line1 = src.lines().nth(1).unwrap();
+    let ch = line1.find("L. ").unwrap() as u32 + 2;
+    send_request(
+        &client,
+        2,
+        "textDocument/completion",
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 1,
+                    character: ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        },
+    );
+    let resp = next_response(&client);
+    let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let labels: Vec<String> = match r {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    }
+    .into_iter()
+    .map(|i| i.label)
+    .collect();
+    // a library exposes internal + public functions for direct `L.fn()` calls, but not
+    // its private ones.
+    assert!(labels.contains(&"pubFn".to_string()), "{labels:?}");
+    assert!(
+        labels.contains(&"intFn".to_string()),
+        "internal should show: {labels:?}"
+    );
+    assert!(
+        !labels.contains(&"privFn".to_string()),
+        "private must be hidden: {labels:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
 }
 
 #[test]

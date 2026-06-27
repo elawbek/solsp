@@ -239,6 +239,19 @@ pub fn is_private(decl: &SyntaxNode) -> bool {
         .any(|t| t.kind() == SyntaxKind::PRIVATE_KW)
 }
 
+/// Whether a member is reachable through *external* access (`instance.member`): a
+/// `public`/`external` function, or a `public` state variable (its getter). `internal` /
+/// `private` members and modifiers are not.
+pub fn is_externally_visible(decl: &SyntaxNode) -> bool {
+    use SyntaxKind::{EXTERNAL_KW, FUNCTION_DEF, PUBLIC_KW, STATE_VAR_DEF};
+    if !matches!(decl.kind(), FUNCTION_DEF | STATE_VAR_DEF) {
+        return false;
+    }
+    decl.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| matches!(t.kind(), PUBLIC_KW | EXTERNAL_KW))
+}
+
 /// Every member declared directly in a contract's own body (no inheritance).
 pub fn contract_members(contract: &SyntaxNode) -> Vec<Definition> {
     contract

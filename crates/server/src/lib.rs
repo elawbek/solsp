@@ -334,12 +334,31 @@ fn member_completion(
                 &tdef,
             )));
         };
+        let contract_like = matches!(tdef.kind(), solsp_syntax::SyntaxKind::CONTRACT_DEF);
+        let library = contract_like && is_library_node(&tdef);
+        // a contract/interface *instance* (`x.`) → only public/external members; a library
+        // (`Lib.`) → everything except `private`; a struct → all fields.
+        let external =
+            contract_like && !library && is_instance_receiver(state, uri, root, &receiver);
+        let keep = |node: &solsp_syntax::SyntaxNode| {
+            if external {
+                solsp_hir::resolve::is_externally_visible(node)
+            } else if contract_like {
+                !solsp_hir::resolve::is_private(node)
+            } else {
+                true
+            }
+        };
         // same-file members (struct fields, same-file C3) carry their declared type.
-        let mut items = typed_items(solsp_hir::resolve::type_members(&tdef), &troot);
-        if tdef.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF {
-            // cross-file inherited members live in other files → kind-only detail.
+        let same_file = solsp_hir::resolve::type_members(&tdef)
+            .into_iter()
+            .filter(|d| keep(&d.full_ptr.to_node(&troot)))
+            .collect();
+        let mut items = typed_items(same_file, &troot);
+        // contracts inherit across files (libraries do not); add those members.
+        if contract_like && !library {
             items.extend(completion_items_from(collect_inherited_members(
-                state, &turi, &troot, &tdef,
+                state, &turi, &troot, &tdef, external,
             )));
         }
         let mut seen = std::collections::HashSet::new();
@@ -351,6 +370,36 @@ fn member_completion(
         return Some(items);
     }
     Some(Vec::new())
+}
+
+/// Whether a `CONTRACT_DEF` node is a `library`.
+fn is_library_node(c: &solsp_syntax::SyntaxNode) -> bool {
+    c.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| t.kind() == solsp_syntax::SyntaxKind::LIBRARY_KW)
+}
+
+/// Whether a receiver is a *value* (a contract instance) rather than a bare type name —
+/// i.e. `instance.member` (external access) vs `Type.member` (static).
+fn is_instance_receiver(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> bool {
+    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
+    if !matches!(receiver.kind(), PATH_EXPR | NAME_REF) {
+        return true; // a member/call/index expression is always a value
+    }
+    let Some(name) = solsp_hir::resolve::receiver_name(receiver) else {
+        return true;
+    };
+    let resolved = receiver_name_ref(receiver)
+        .and_then(|nr| solsp_hir::resolve::resolve(&nr))
+        .or_else(|| cross_file_definition(state, uri, root, &name, None).map(|(_, d)| d));
+    // a bare name that resolves to a type (library/contract/struct/enum) is a static
+    // receiver; anything else (a variable, or unresolved) is treated as an instance.
+    !resolved.map(|d| is_type_kind(d.kind)).unwrap_or(false)
 }
 
 /// Members of a builtin global object when the receiver is `block`/`tx`/`msg`/`abi`.
@@ -421,7 +470,10 @@ fn scope_completion(
         .unwrap_or_else(|| root.clone());
     let mut defs = solsp_hir::resolve::scope_definitions(&node);
     if let Some(contract) = enclosing_contract(&node) {
-        defs.extend(collect_inherited_members(state, uri, root, &contract));
+        // internal access (the contract's own scope) — keep all but private bases.
+        defs.extend(collect_inherited_members(
+            state, uri, root, &contract, false,
+        ));
     }
     defs.extend(imported_symbols(state, uri, root));
     let mut items = completion_items_from(defs);
@@ -903,6 +955,8 @@ fn collect_inherited_members(
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     contract: &solsp_syntax::SyntaxNode,
+    // external access (`instance.member`) → only `public`/`external` members.
+    external_only: bool,
 ) -> Vec<solsp_hir::resolve::Definition> {
     use std::collections::{HashSet, VecDeque};
     let mut visited: HashSet<(Url, String)> = HashSet::new();
@@ -924,7 +978,12 @@ fn collect_inherited_members(
             continue;
         }
         for def in solsp_hir::resolve::contract_members(&c) {
-            if is_base && solsp_hir::resolve::is_private(&def.full_ptr.to_node(&r)) {
+            let node = def.full_ptr.to_node(&r);
+            if external_only {
+                if !solsp_hir::resolve::is_externally_visible(&node) {
+                    continue;
+                }
+            } else if is_base && solsp_hir::resolve::is_private(&node) {
                 continue;
             }
             out.push(def);
@@ -1167,6 +1226,13 @@ fn receiver_type(
         MEMBER_EXPR => {
             let recv = expr.first_child()?;
             let member = member_name(expr)?;
+            // `N.Type` where `N` is an `import * as N` namespace alias → the imported type.
+            if let Some((turi, def)) = namespace_member(state, uri, root, &recv, &member, None) {
+                if is_type_kind(def.kind) && !element {
+                    let troot = parse_root(state, &turi)?;
+                    return Some((turi, def.full_ptr.to_node(&troot)));
+                }
+            }
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
             let troot = parse_root(state, &turi)?;
             let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, None)?;
