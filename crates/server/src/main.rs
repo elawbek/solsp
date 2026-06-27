@@ -11,6 +11,11 @@ fn main() -> Result<()> {
     let capabilities = serde_json::to_value(solsp_server::server_capabilities())?;
     let _init_params = connection.initialize(capabilities)?;
     solsp_server::run(&connection)?;
+
+    // Drop the connection before joining: its `sender` feeds the stdio writer
+    // thread, which only finishes once every sender clone is gone. Without this,
+    // `io_threads.join()` would block forever after shutdown (a zombie server).
+    drop(connection);
     io_threads.join()?;
     Ok(())
 }
