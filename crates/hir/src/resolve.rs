@@ -282,11 +282,13 @@ fn find_named_decl(nodes: impl Iterator<Item = SyntaxNode>, name: &str) -> Optio
 /// `PARAM_LIST`s (arguments and returns); a Solidity function body holds no `PARAM`s,
 /// so scanning descendants is safe.
 fn find_param(scope: &SyntaxNode, name: &str) -> Option<Definition> {
+    // `filter_map(..).find(name)` — NOT `find_map(..).filter(name)`, which would stop at
+    // the first PARAM and only ever resolve the first parameter.
     scope
         .descendants()
         .filter(|n| n.kind() == SyntaxKind::PARAM)
-        .find_map(|p| make_def(&p, DefKind::Parameter))
-        .filter(|d| d.name == name)
+        .filter_map(|p| make_def(&p, DefKind::Parameter))
+        .find(|d| d.name == name)
 }
 
 /// A local variable declared directly in this block named `name` (not nested blocks).
@@ -295,8 +297,8 @@ fn find_local(block: &SyntaxNode, name: &str) -> Option<Definition> {
         .children()
         .filter(|n| n.kind() == SyntaxKind::VAR_DECL_STMT)
         .filter_map(|stmt| stmt.children().find(|n| n.kind() == SyntaxKind::VAR_DECL))
-        .find_map(|v| make_def(&v, DefKind::Local))
-        .filter(|d| d.name == name)
+        .filter_map(|v| make_def(&v, DefKind::Local))
+        .find(|d| d.name == name)
 }
 
 /// Build a [`Definition`] for a top-level/member declaration node, or `None` if it is
@@ -387,6 +389,32 @@ mod tests {
         // `stored` (lhs) → the state variable (contract member)
         let d = resolve_at(src, "stored =").unwrap();
         assert_eq!(d.kind, DefKind::StateVariable);
+    }
+
+    #[test]
+    fn resolves_non_first_param_and_local() {
+        // regression: find_param/find_local must scan ALL params/locals, not just the
+        // first — a use of the 2nd/3rd param or a later local must resolve.
+        let src = "contract C {\n\
+            function f(uint a, uint b, uint c) public {\n\
+                uint x = 1;\n\
+                uint y = 2;\n\
+                c = a + b;\n\
+                y = x;\n\
+            }\n\
+        }";
+        // 3rd parameter `c` (lhs of `c = a + b`)
+        let d = resolve_at(src, "c = a").unwrap();
+        assert_eq!(d.kind, DefKind::Parameter);
+        assert_eq!(d.name, "c");
+        // 2nd parameter `b`
+        let d = resolve_at(src, "b;").unwrap();
+        assert_eq!(d.kind, DefKind::Parameter);
+        assert_eq!(d.name, "b");
+        // 2nd local `y` (lhs of `y = x`)
+        let d = resolve_at(src, "y = x").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "y");
     }
 
     #[test]
