@@ -3,7 +3,7 @@
 //! `mapping(...)` -> type, ...). No name resolution in M1 — that sharpens this in
 //! M2 (e.g. state var vs local) (design §4, feature 3).
 
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use solsp_syntax::{SyntaxKind, SyntaxNode, SyntaxToken};
 
 /// Token classification (maps to the LSP semantic-tokens legend in the server).
@@ -18,6 +18,8 @@ pub enum TokenType {
     Number,
     String,
     Comment,
+    /// A NatSpec tag (`@param`, `@dev`, …) inside a doc comment.
+    NatspecTag,
 }
 
 /// One classified token span.
@@ -34,13 +36,109 @@ pub struct SemanticToken {
 pub fn semantic_tokens(root: &SyntaxNode) -> Vec<SemanticToken> {
     root.descendants_with_tokens()
         .filter_map(|el| el.into_token())
-        .filter_map(|tok| {
-            classify(&tok).map(|token_type| SemanticToken {
-                range: tok.text_range(),
-                token_type,
-            })
+        .flat_map(|tok| -> Vec<SemanticToken> {
+            // A doc comment expands into NatSpec sub-tokens (`@tag`, the name after
+            // `@param`/`@inheritdoc`, and the surrounding comment text); every other
+            // token is a single classified span (or nothing).
+            if tok.kind() == SyntaxKind::COMMENT {
+                natspec_tokens(&tok)
+            } else {
+                classify(&tok)
+                    .map(|token_type| SemanticToken {
+                        range: tok.text_range(),
+                        token_type,
+                    })
+                    .into_iter()
+                    .collect()
+            }
         })
         .collect()
+}
+
+/// Split a comment into NatSpec sub-tokens. Only `///` and `/** … */` doc comments are
+/// scanned; any other comment stays a single `Comment` span. The result tiles the whole
+/// comment (gaps emitted as `Comment`) so nothing overlaps.
+fn natspec_tokens(tok: &SyntaxToken) -> Vec<SemanticToken> {
+    let text = tok.text();
+    let base = tok.text_range().start();
+    let whole = || {
+        vec![SemanticToken {
+            range: tok.text_range(),
+            token_type: TokenType::Comment,
+        }]
+    };
+    if !(text.starts_with("///") || text.starts_with("/**")) {
+        return whole();
+    }
+    let specials = natspec_spans(text);
+    if specials.is_empty() {
+        return whole();
+    }
+    let span = |s: usize, e: usize, ty: TokenType| SemanticToken {
+        range: TextRange::new(
+            base + TextSize::from(s as u32),
+            base + TextSize::from(e as u32),
+        ),
+        token_type: ty,
+    };
+    let mut out = Vec::with_capacity(specials.len() * 2 + 1);
+    let mut cursor = 0usize;
+    for (s, e, ty) in specials {
+        if s > cursor {
+            out.push(span(cursor, s, TokenType::Comment));
+        }
+        out.push(span(s, e, ty));
+        cursor = e;
+    }
+    if cursor < text.len() {
+        out.push(span(cursor, text.len(), TokenType::Comment));
+    }
+    out
+}
+
+/// Find the special spans in a doc comment: each `@tag`, plus the identifier following
+/// `@param` (a parameter) or `@inheritdoc` (a type). Byte offsets into `text`, ordered
+/// and non-overlapping.
+fn natspec_spans(text: &str) -> Vec<(usize, usize, TokenType)> {
+    let b = text.as_bytes();
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        // a tag is `@word` at a word boundary (so `foo@bar` in prose is not a tag).
+        if b[i] == b'@' && (i == 0 || !is_ident(b[i - 1])) {
+            let start = i;
+            i += 1;
+            while i < b.len() && b[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if i == start + 1 {
+                continue; // a lone `@`
+            }
+            spans.push((start, i, TokenType::NatspecTag));
+            let name_ty = match &text[start + 1..i] {
+                "param" => TokenType::Parameter,
+                "inheritdoc" => TokenType::Type,
+                _ => continue,
+            };
+            // the name on the same line after the tag (skip spaces/tabs).
+            let mut j = i;
+            while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+                j += 1;
+            }
+            let nstart = j;
+            while j < b.len() && is_ident(b[j]) {
+                j += 1;
+            }
+            if j > nstart {
+                spans.push((nstart, j, name_ty));
+                i = j;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    spans
 }
 
 /// The token type for one token, or `None` if it should not be highlighted.
@@ -158,6 +256,29 @@ mod tests {
             .filter(|t| t.token_type == tt)
             .map(|t| &src[t.range])
             .collect()
+    }
+
+    #[test]
+    fn natspec_tags_names_and_text() {
+        let src = "/// @notice sets it\n\
+                   /// @param owner_ the new owner\n\
+                   /// @inheritdoc IBase\n\
+                   contract C {}";
+        let toks = semantic_tokens(&parse(src).syntax());
+        assert_eq!(
+            pick(src, &toks, TokenType::NatspecTag),
+            ["@notice", "@param", "@inheritdoc"]
+        );
+        // `@param`'s name is a parameter; `@inheritdoc`'s is a type.
+        assert!(pick(src, &toks, TokenType::Parameter).contains(&"owner_"));
+        assert!(pick(src, &toks, TokenType::Type).contains(&"IBase"));
+        // the descriptions stay plain comment text (distinct from tag/name).
+        let comments = pick(src, &toks, TokenType::Comment);
+        assert!(comments.iter().any(|c| c.contains("sets it")));
+        assert!(comments.iter().any(|c| c.contains("the new owner")));
+        // a non-doc comment is left as a single comment span (no tag scanning).
+        let plain = semantic_tokens(&parse("// @param x\ncontract C {}").syntax());
+        assert!(pick("// @param x\ncontract C {}", &plain, TokenType::NatspecTag).is_empty());
     }
 
     #[test]

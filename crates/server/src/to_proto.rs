@@ -101,7 +101,7 @@ fn symbol_kind(kind: IdeSymbolKind) -> LspSymbolKind {
 /// The semantic-token legend, in a single fixed order. The index of a `TokenType`
 /// in `TOKEN_TYPES` is exactly its `tokenType` index on the wire — `legend()` and
 /// `token_index()` both read this array, so they can never drift apart.
-const TOKEN_TYPES: [TokenType; 9] = [
+const TOKEN_TYPES: [TokenType; 10] = [
     TokenType::Keyword,
     TokenType::Type,
     TokenType::Function,
@@ -111,6 +111,7 @@ const TOKEN_TYPES: [TokenType; 9] = [
     TokenType::Number,
     TokenType::String,
     TokenType::Comment,
+    TokenType::NatspecTag,
 ];
 
 /// The LSP `SemanticTokenType` standard name for each ide `TokenType`.
@@ -125,6 +126,9 @@ fn semantic_token_type(t: TokenType) -> SemanticTokenType {
         TokenType::Number => SemanticTokenType::NUMBER,
         TokenType::String => SemanticTokenType::STRING,
         TokenType::Comment => SemanticTokenType::COMMENT,
+        // a NatSpec `@tag` — `decorator` renders like an annotation, distinct from the
+        // surrounding comment text.
+        TokenType::NatspecTag => SemanticTokenType::DECORATOR,
     }
 }
 
