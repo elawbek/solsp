@@ -1621,6 +1621,17 @@ fn namespace_import_member_resolves() {
 }
 
 #[test]
+fn tuple_declared_local_member_resolves() {
+    // the second variable of a tuple destructuring (`Thing t`) must resolve, and member
+    // access through it follows its declared type.
+    let src = "struct Thing { uint256 amount; }\n\
+               contract C { function g() internal returns (bool, Thing memory) {}\n\
+               function f() public { (bool ok, Thing memory t) = g(); t.amount; } }";
+    // `amount` in `t.amount` → the field on line 0 (resolved through `t`'s type).
+    assert_eq!(def_line_in_memory(src, ".amount"), 0);
+}
+
+#[test]
 fn mapping_value_member_resolves() {
     // `things[k].amount` — indexing the mapping yields its value type `Thing`, whose
     // `amount` field is declared on line 0.

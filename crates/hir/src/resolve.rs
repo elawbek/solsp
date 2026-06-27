@@ -173,7 +173,7 @@ fn collect_scope(scope: &SyntaxNode, out: &mut Vec<Definition>) {
             scope
                 .children()
                 .filter(|n| n.kind() == VAR_DECL_STMT)
-                .filter_map(|stmt| stmt.children().find(|n| n.kind() == VAR_DECL))
+                .flat_map(|stmt| stmt.children().filter(|n| n.kind() == VAR_DECL))
                 .filter_map(|v| make_def(&v, DefKind::Local)),
         ),
         YUL_BLOCK | YUL_FUNCTION_DEF => out.extend(
@@ -617,7 +617,8 @@ fn find_local(block: &SyntaxNode, name: &str) -> Option<Definition> {
     block
         .children()
         .filter(|n| n.kind() == SyntaxKind::VAR_DECL_STMT)
-        .filter_map(|stmt| stmt.children().find(|n| n.kind() == SyntaxKind::VAR_DECL))
+        // a tuple declaration `(A a, B b) = …` has several VAR_DECL children — keep all.
+        .flat_map(|stmt| stmt.children().filter(|n| n.kind() == SyntaxKind::VAR_DECL))
         .filter_map(|v| make_def(&v, DefKind::Local))
         .find(|d| d.name == name)
 }
