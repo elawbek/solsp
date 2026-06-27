@@ -1,8 +1,0 @@
-name = "Solidity"
-grammar = "solidity"
-path_suffixes = ["sol"]
-line_comments = ["// "]
-autoclose_before = ";:.,=}])>"
-
-[brackets]
-# pairs Zed auto-closes / matches
