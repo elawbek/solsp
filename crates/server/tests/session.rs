@@ -1548,6 +1548,16 @@ fn def_line_in_memory(src: &str, needle: &str) -> u32 {
 }
 
 #[test]
+fn mapping_value_member_resolves() {
+    // `things[k].amount` — indexing the mapping yields its value type `Thing`, whose
+    // `amount` field is declared on line 0.
+    let src = "struct Thing { uint256 amount; }\n\
+               contract C { mapping(bytes32 => Thing) things;\n\
+               function f() public { things[bytes32(0)].amount; } }";
+    assert_eq!(def_line_in_memory(src, "].amount"), 0);
+}
+
+#[test]
 fn nested_struct_type_resolves_within_contract() {
     // `S` is declared inside the contract; `s.x` must resolve to the field on line 1.
     let src = "contract C {\n\

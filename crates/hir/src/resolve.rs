@@ -423,12 +423,21 @@ pub fn decl_type_path(decl: &SyntaxNode, element: bool) -> Option<SyntaxNode> {
     use SyntaxKind::*;
     let ty = decl
         .children()
-        .find(|n| matches!(n.kind(), PATH_TYPE | ARRAY_TYPE))?;
+        .find(|n| matches!(n.kind(), PATH_TYPE | ARRAY_TYPE | MAPPING_TYPE))?;
     match ty.kind() {
         PATH_TYPE => (!element).then_some(ty),
         ARRAY_TYPE => {
             let inner = ty.children().find(|n| n.kind() == PATH_TYPE)?;
             element.then_some(inner)
+        }
+        // `m[k]` on a mapping yields its value type — the `=> V` side (last type child),
+        // returned only when it is a user-defined `PATH_TYPE`.
+        MAPPING_TYPE if element => {
+            let value = ty
+                .children()
+                .filter(|n| matches!(n.kind(), PATH_TYPE | ARRAY_TYPE | MAPPING_TYPE))
+                .last()?;
+            (value.kind() == PATH_TYPE).then_some(value)
         }
         _ => None,
     }
