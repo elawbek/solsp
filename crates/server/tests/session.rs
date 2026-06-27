@@ -1146,10 +1146,12 @@ fn completion_imported_symbols_and_named_args() {
     fs::write(
         &main,
         "import {Point, Maker} from \"Lib.sol\";\n\
+         import * as Lib from \"Lib.sol\";\n\
          contract C {\n\
          function f() public {\n\
          Maker m = new Maker({ });\n\
          Point p = Point({ });\n\
+         Point q = Point({ x: 1, });\n\
          }\n\
          }\n",
     )
@@ -1200,26 +1202,32 @@ fn completion_imported_symbols_and_named_args() {
         .collect()
     };
 
-    // scope completion offers the imported symbols.
-    let scope = labels(2, 3, 0);
-    assert!(
-        scope.contains(&"Point".to_string()),
-        "scope missing Point: {scope:?}"
-    );
-    assert!(scope.contains(&"Maker".to_string()));
+    // scope completion offers imported symbols, the namespace alias, and builtins.
+    let scope = labels(2, 4, 0);
+    for want in ["Point", "Maker", "Lib", "require", "address", "msg"] {
+        assert!(
+            scope.contains(&want.to_string()),
+            "scope missing {want}: {scope:?}"
+        );
+    }
 
     // `new Maker({ <here> })` → the constructor's parameter.
-    let l3 = main_src.lines().nth(3).unwrap();
-    let maker = labels(3, 3, l3.find("({").unwrap() as u32 + 2);
+    let l4 = main_src.lines().nth(4).unwrap();
+    let maker = labels(3, 4, l4.find("({").unwrap() as u32 + 2);
     assert_eq!(maker, ["owner_"]);
 
     // `Point({ <here> })` → the struct's fields.
-    let l4 = main_src.lines().nth(4).unwrap();
-    let point = labels(4, 4, l4.find("({").unwrap() as u32 + 2);
+    let l5 = main_src.lines().nth(5).unwrap();
+    let point = labels(4, 5, l5.find("({").unwrap() as u32 + 2);
     assert!(
         point.contains(&"x".to_string()) && point.contains(&"y".to_string()),
         "{point:?}"
     );
+
+    // `Point({ x: 1, <here> })` — the already-supplied key `x` is filtered out.
+    let l6 = main_src.lines().nth(6).unwrap();
+    let rest = labels(5, 6, l6.find("})").unwrap() as u32);
+    assert_eq!(rest, ["y"], "should offer only the unsupplied field");
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);

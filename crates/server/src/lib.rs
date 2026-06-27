@@ -333,7 +333,116 @@ fn scope_completion(
         defs.extend(collect_inherited_members(state, uri, root, &contract));
     }
     defs.extend(imported_symbols(state, uri, root));
-    completion_items_from(defs)
+    let mut items = completion_items_from(defs);
+    items.extend(namespace_alias_items(root)); // `import * as N` → N
+    items.extend(builtin_items()); // keywords, elementary types, globals
+                                   // dedup by label, keeping the first (user/imported names shadow builtins).
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|i| seen.insert(i.label.clone()));
+    items
+}
+
+/// A completion item for each `import * as N` namespace alias.
+fn namespace_alias_items(root: &solsp_syntax::SyntaxNode) -> Vec<CompletionItem> {
+    use solsp_hir::imports::ImportKind;
+    solsp_hir::imports::imports(root)
+        .into_iter()
+        .filter_map(|imp| match imp.kind {
+            ImportKind::Namespace(alias) => Some(CompletionItem {
+                kind: Some(CompletionItemKind::MODULE),
+                detail: Some("import namespace".to_string()),
+                label: alias,
+                ..Default::default()
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Solidity keywords, elementary types, and global builtins — always available as
+/// bare-identifier completions.
+fn builtin_items() -> Vec<CompletionItem> {
+    use CompletionItemKind as K;
+    const KEYWORDS: &[&str] = &[
+        "if",
+        "else",
+        "for",
+        "while",
+        "do",
+        "return",
+        "break",
+        "continue",
+        "emit",
+        "try",
+        "catch",
+        "new",
+        "delete",
+        "using",
+        "unchecked",
+        "assembly",
+        "is",
+        "virtual",
+        "override",
+        "public",
+        "private",
+        "internal",
+        "external",
+        "view",
+        "pure",
+        "payable",
+        "memory",
+        "storage",
+        "calldata",
+        "constant",
+        "immutable",
+        "returns",
+        "function",
+        "modifier",
+        "struct",
+        "enum",
+        "event",
+        "error",
+        "mapping",
+        "contract",
+        "interface",
+        "library",
+        "import",
+        "pragma",
+        "abstract",
+        "indexed",
+        "anonymous",
+    ];
+    const TYPES: &[&str] = &[
+        "address", "bool", "string", "bytes", "uint", "uint8", "uint16", "uint32", "uint64",
+        "uint128", "uint256", "int", "int128", "int256", "bytes1", "bytes4", "bytes20", "bytes32",
+    ];
+    const GLOBALS: &[&str] = &["msg", "block", "tx", "abi", "this", "super", "type", "now"];
+    const FUNCS: &[&str] = &[
+        "require",
+        "assert",
+        "revert",
+        "keccak256",
+        "sha256",
+        "ripemd160",
+        "ecrecover",
+        "addmod",
+        "mulmod",
+        "selfdestruct",
+        "blockhash",
+        "gasleft",
+    ];
+    let item = |label: &str, kind: CompletionItemKind, detail: &str| CompletionItem {
+        kind: Some(kind),
+        detail: Some(detail.to_string()),
+        label: label.to_string(),
+        ..Default::default()
+    };
+    let mut out = Vec::with_capacity(KEYWORDS.len() + TYPES.len() + GLOBALS.len() + FUNCS.len());
+    out.extend(KEYWORDS.iter().map(|&k| item(k, K::KEYWORD, "keyword")));
+    out.extend(TYPES.iter().map(|&t| item(t, K::TYPE_PARAMETER, "type")));
+    out.extend(GLOBALS.iter().map(|&g| item(g, K::VARIABLE, "builtin")));
+    out.extend(FUNCS.iter().map(|&f| item(f, K::FUNCTION, "builtin")));
+    out
 }
 
 /// Every symbol the file's imports bring into scope (so `new Roles(` offers `Roles`):
@@ -468,9 +577,16 @@ fn named_arg_completion(
             .unwrap_or_default(),
         _ => return None,
     };
+    // drop keys already supplied in this argument list (the direct NAME children).
+    let present: std::collections::HashSet<String> = nal
+        .children()
+        .filter(|n| n.kind() == NAME)
+        .filter_map(|n| node_ident(&n))
+        .collect();
     Some(
         names
             .into_iter()
+            .filter(|name| !present.contains(name))
             .map(|name| CompletionItem {
                 kind: Some(CompletionItemKind::FIELD),
                 detail: Some("named argument".to_string()),
@@ -479,6 +595,14 @@ fn named_arg_completion(
             })
             .collect(),
     )
+}
+
+/// The identifier text of a `NAME`/`NAME_REF` node.
+fn node_ident(n: &solsp_syntax::SyntaxNode) -> Option<String> {
+    n.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())
 }
 
 /// Resolve a named-call callee to its declaration: `new T(...)` → the type `T`, else a
