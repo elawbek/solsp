@@ -1245,6 +1245,74 @@ fn completion_imported_symbols_and_named_args() {
 }
 
 #[test]
+fn this_and_super_member_completion() {
+    let uri = Url::parse("file:///ts.sol").unwrap();
+    let src = "contract Base { function pub_() public {} function int_() internal {} }\n\
+               contract C is Base { function f() public { this.X1; super.X2; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line1 = src.lines().nth(1).unwrap();
+    let labels = |id: i32, marker: &str| -> Vec<String> {
+        let ch = line1.find(marker).unwrap() as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position {
+                        line: 1,
+                        character: ch,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+        );
+        let resp = next_response(&client);
+        let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        match r {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+        .into_iter()
+        .map(|i| i.label)
+        .collect()
+    };
+    // `this.` is external access → only public members.
+    let this_m = labels(2, "X1");
+    assert!(this_m.contains(&"pub_".to_string()), "{this_m:?}");
+    assert!(
+        !this_m.contains(&"int_".to_string()),
+        "this. leaked internal: {this_m:?}"
+    );
+    // `super.` is internal access → inherited public + internal.
+    let super_m = labels(3, "X2");
+    assert!(
+        super_m.contains(&"int_".to_string()),
+        "super. should see internal: {super_m:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn completion_builtin_type_members() {
     let uri = Url::parse("file:///bt.sol").unwrap();
     let src = "interface IFoo { function x() external; }\n\

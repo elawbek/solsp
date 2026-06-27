@@ -337,10 +337,13 @@ fn member_completion(
         };
         let contract_like = matches!(tdef.kind(), solsp_syntax::SyntaxKind::CONTRACT_DEF);
         let library = contract_like && is_library_node(&tdef);
-        // a contract/interface *instance* (`x.`) → only public/external members; a library
-        // (`Lib.`) → everything except `private`; a struct → all fields.
-        let external =
-            contract_like && !library && is_instance_receiver(state, uri, root, &receiver);
+        // a contract/interface *instance* (`x.`, `this.`) → only public/external members;
+        // a library (`Lib.`) or `super.` → everything except `private`; a struct → fields.
+        let is_super = solsp_hir::resolve::receiver_name(&receiver).as_deref() == Some("super");
+        let external = contract_like
+            && !library
+            && !is_super
+            && is_instance_receiver(state, uri, root, &receiver);
         let keep = |node: &solsp_syntax::SyntaxNode| {
             if external {
                 solsp_hir::resolve::is_externally_visible(node)
@@ -1425,7 +1428,17 @@ fn receiver_type(
             let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, None)?;
             member_value_type(state, &turi, &troot, &mdef, element)
         }
-        PATH_EXPR | NAME_REF => resolve_value_type(state, uri, root, expr, element),
+        PATH_EXPR | NAME_REF => {
+            // `this` / `super` → the enclosing contract's type.
+            if !element {
+                if let Some(name) = solsp_hir::resolve::receiver_name(expr) {
+                    if (name == "this" || name == "super") && enclosing_contract(expr).is_some() {
+                        return Some((uri.clone(), enclosing_contract(expr)?));
+                    }
+                }
+            }
+            resolve_value_type(state, uri, root, expr, element)
+        }
         _ => None,
     }
 }
