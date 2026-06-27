@@ -361,12 +361,18 @@ fn cross_file_goto_definition() {
     let token = dir.join("Token.sol");
     let main = dir.join("Main.sol");
     fs::write(&token, "contract Token { uint256 supply; }\n").unwrap();
-    // bare path (no `./`) must resolve too, not just `./Token.sol`.
-    fs::write(&main, "import \"Token.sol\";\ncontract Main { Token t; }\n").unwrap();
+    // named import; line 0 = the directive, line 1 = a use site.
+    fs::write(
+        &main,
+        "import {Token} from \"Token.sol\";\ncontract Main { Token t; }\n",
+    )
+    .unwrap();
 
     let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
     let token_uri = Url::from_file_path(fs::canonicalize(&token).unwrap()).unwrap();
     let main_src = fs::read_to_string(&main).unwrap();
+    let line0 = main_src.lines().next().unwrap();
+    let line1 = main_src.lines().nth(1).unwrap();
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
@@ -387,37 +393,61 @@ fn cross_file_goto_definition() {
     );
     let _ = next_notification(&client, "textDocument/publishDiagnostics");
 
-    // cursor on the `Token` type use (line 1) → jumps into Token.sol.
-    let line1 = main_src.lines().nth(1).unwrap();
-    let ch = line1.find("Token t").unwrap() as u32;
-    send_request(
-        &client,
-        2,
-        "textDocument/definition",
-        GotoDefinitionParams {
-            text_document_position_params: TextDocumentPositionParams {
-                text_document: doc_id(&main_uri),
-                position: Position {
-                    line: 1,
-                    character: ch + 1,
+    let definition = |id: i32, line: u32, character: u32| {
+        send_request(
+            &client,
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&main_uri),
+                    position: Position { line, character },
                 },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
             },
-            work_done_progress_params: Default::default(),
-            partial_result_params: Default::default(),
-        },
-    );
-    let resp = next_response(&client);
-    let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
-    let GotoDefinitionResponse::Scalar(loc) = def else {
-        panic!("expected a cross-file definition location");
+        );
+        let resp = next_response(&client);
+        let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let GotoDefinitionResponse::Scalar(loc) = def else {
+            panic!("expected a single definition location");
+        };
+        loc
     };
-    assert_eq!(loc.uri, token_uri, "should jump into Token.sol");
-    // `Token` is declared at column 9 of line 0 (`contract Token`).
+
+    // 1. a use site of the imported `Token` → its declaration in Token.sol.
+    let use_ch = line1.find("Token t").unwrap() as u32;
+    let loc = definition(2, 1, use_ch + 1);
+    assert_eq!(loc.uri, token_uri);
     assert_eq!(
         loc.range.start,
         Position {
             line: 0,
             character: 9
+        }
+    ); // `contract Token`
+
+    // 2. the name `Token` inside `{ ... }` of the import → same declaration.
+    let brace_ch = line0.find("Token}").unwrap() as u32;
+    let loc = definition(3, 0, brace_ch + 1);
+    assert_eq!(loc.uri, token_uri);
+    assert_eq!(
+        loc.range.start,
+        Position {
+            line: 0,
+            character: 9
+        }
+    );
+
+    // 3. the import path string → opens the target file at its start.
+    let path_ch = line0.find("Token.sol").unwrap() as u32;
+    let loc = definition(4, 0, path_ch + 1);
+    assert_eq!(loc.uri, token_uri);
+    assert_eq!(
+        loc.range.start,
+        Position {
+            line: 0,
+            character: 0
         }
     );
 

@@ -47,6 +47,17 @@ pub fn imports(root: &SyntaxNode) -> Vec<Import> {
         .collect()
 }
 
+/// The import directive at `offset`, if the cursor is inside one (e.g. on its path
+/// string or `from`). Lets go-to-def on an import open the target file.
+pub fn import_at(root: &SyntaxNode, offset: rowan::TextSize) -> Option<Import> {
+    let token = root.token_at_offset(offset).next()?;
+    let directive = token
+        .parent()?
+        .ancestors()
+        .find(|n| n.kind() == SyntaxKind::IMPORT_DIRECTIVE)?;
+    extract(&directive)
+}
+
 /// Read one `IMPORT_DIRECTIVE` node's structured form, or `None` if it has no path.
 fn extract(directive: &SyntaxNode) -> Option<Import> {
     use SyntaxKind::*;

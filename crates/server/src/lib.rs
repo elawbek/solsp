@@ -154,13 +154,25 @@ fn goto_definition(
         let range = to_proto::range(li, target);
         return Some(GotoDefinitionResponse::Scalar(Location { uri, range }));
     }
-    // 2. an imported top-level symbol → jump into the target file.
-    let name = solsp_ide::navigation::name_at(&root, offset)?;
-    let (target_uri, range) = cross_file_target(state, &uri, &root, &name)?;
-    let tli = state.line_index(&target_uri)?;
+    // 2. an imported top-level symbol (a use site, or a name inside `{ ... }`) → jump
+    //    into the target file.
+    if let Some(name) = solsp_ide::navigation::name_at(&root, offset) {
+        if let Some((target_uri, range)) = cross_file_target(state, &uri, &root, &name) {
+            let tli = state.line_index(&target_uri)?;
+            return Some(GotoDefinitionResponse::Scalar(Location {
+                uri: target_uri,
+                range: to_proto::range(tli, range),
+            }));
+        }
+    }
+    // 3. the cursor is inside an import directive (its path string / `from`) → open
+    //    the imported file at its start.
+    let imp = solsp_hir::imports::import_at(&root, offset)?;
+    let target_uri = state::resolve_import_uri(&uri, &imp.path)?;
+    state.file(&target_uri)?; // ensure it is loaded
     Some(GotoDefinitionResponse::Scalar(Location {
         uri: target_uri,
-        range: to_proto::range(tli, range),
+        range: lsp_types::Range::default(),
     }))
 }
 
