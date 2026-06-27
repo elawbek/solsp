@@ -1499,6 +1499,65 @@ fn signature_help_on_inherited_internal_method() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// Resolve a single member-access definition request in `src` at the offset of `needle`,
+/// returning the 0-based target line (same file). Panics if it does not resolve.
+fn def_line_in_memory(src: &str, needle: &str) -> u32 {
+    let uri = Url::parse("file:///probe.sol").unwrap();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    // click the LAST character of the needle (so the needle can carry context, e.g.
+    // `s.x` lands on the member `x`).
+    let off = src.find(needle).expect("needle") + needle.len() - 1;
+    let before = &src[..off];
+    let line = before.matches('\n').count() as u32;
+    let character = (off - before.rfind('\n').map(|i| i + 1).unwrap_or(0)) as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position { line, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let d: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let line = match d {
+        GotoDefinitionResponse::Scalar(loc) => loc.range.start.line,
+        _ => panic!("expected a single location for {needle:?}"),
+    };
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    line
+}
+
+#[test]
+fn nested_struct_type_resolves_within_contract() {
+    // `S` is declared inside the contract; `s.x` must resolve to the field on line 1.
+    let src = "contract C {\n\
+               struct S { uint256 x; }\n\
+               S s;\n\
+               function f() public { s.x; }\n\
+               }";
+    assert_eq!(def_line_in_memory(src, "s.x"), 1); // `x` in `s.x` → the field on line 1
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]

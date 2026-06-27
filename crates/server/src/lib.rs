@@ -1338,7 +1338,7 @@ fn resolve_path_type(
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
     let segments = solsp_hir::resolve::path_type_segments(path_type);
     let (first, rest) = segments.split_first()?;
-    let (turi, mut type_def) = resolve_type_by_name(state, uri, root, first)?;
+    let (turi, mut type_def) = resolve_type_by_name(state, uri, root, first, Some(path_type))?;
     for seg in rest {
         let member = solsp_hir::resolve::member_in_type(&type_def, seg, None)?;
         if !is_type_kind(member.kind) {
@@ -1357,12 +1357,30 @@ fn resolve_type_by_name(
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     type_name: &str,
+    context: Option<&solsp_syntax::SyntaxNode>,
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    // 1. a contract-nested type visible where the name is used (its enclosing contract +
+    //    cross-file bases) — these shadow file scope.
+    if let Some(contract) = context.and_then(enclosing_contract) {
+        if let Some(def) = solsp_hir::resolve::member_in_type(&contract, type_name, None) {
+            if is_type_kind(def.kind) {
+                return Some((uri.clone(), def.full_ptr.to_node(root)));
+            }
+        }
+        if let Some((turi, def)) = inherited_member(state, uri, root, &contract, type_name, None) {
+            if is_type_kind(def.kind) {
+                let troot = parse_root(state, &turi)?;
+                return Some((turi, def.full_ptr.to_node(&troot)));
+            }
+        }
+    }
+    // 2. a top-level type in this file.
     if let Some(def) = solsp_hir::resolve::top_level_definition(root, type_name, None) {
         if is_type_kind(def.kind) {
             return Some((uri.clone(), def.full_ptr.to_node(root)));
         }
     }
+    // 3. an imported type.
     let (turi, def) = cross_file_definition(state, uri, root, type_name, None)?;
     if is_type_kind(def.kind) {
         let troot = parse_root(state, &turi)?;
