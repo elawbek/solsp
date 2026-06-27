@@ -26,6 +26,10 @@ pub enum DefKind {
     UserType,
     Parameter,
     Local,
+    /// A struct field.
+    Field,
+    /// An enum variant.
+    Variant,
 }
 
 /// A resolved declaration: where it is named (go-to-def target) and its full extent.
@@ -114,9 +118,9 @@ pub fn member_in_type(type_def: &SyntaxNode, member: &str) -> Option<Definition>
                 (ident_text(&name_node)? == member).then(|| Definition {
                     name: member.to_string(),
                     kind: if n.kind() == STRUCT_FIELD {
-                        DefKind::StateVariable
+                        DefKind::Field
                     } else {
-                        DefKind::Enum
+                        DefKind::Variant
                     },
                     name_ptr: AstPtr::new(&name_node),
                     full_ptr: AstPtr::new(&n),

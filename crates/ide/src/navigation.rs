@@ -96,10 +96,28 @@ fn ident_range_at(root: &SyntaxNode, offset: TextSize) -> Option<TextRange> {
         .map(|t| t.text_range())
 }
 
-/// The first non-blank line of a declaration's text (its signature). The decl node
-/// can carry leading trivia (newline + indent), so trim that before taking the line.
-fn first_line(text: &str) -> &str {
-    text.trim_start().lines().next().unwrap_or("").trim_end()
+/// The signature line of a declaration: the first line that is actual code — skipping
+/// leading doc/`//`/`/* … */` comment lines the node may carry as trivia — with any
+/// trailing line comment stripped, so a hover shows the type (`uint128 inflation;`),
+/// not the comment.
+fn first_line(text: &str) -> String {
+    let code = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !is_comment_line(l))
+        .unwrap_or("");
+    // drop a trailing `// …` line comment (rare false positive inside a string literal
+    // is acceptable for a hover signature).
+    let code = match code.find("//") {
+        Some(i) => code[..i].trim_end(),
+        None => code,
+    };
+    code.to_string()
+}
+
+/// Does a trimmed line begin a comment (line, block, or a doc-comment continuation)?
+fn is_comment_line(line: &str) -> bool {
+    line.starts_with("//") || line.starts_with("/*") || line.starts_with('*')
 }
 
 /// Human label for a definition kind (used in hover captions).
@@ -118,6 +136,8 @@ fn def_label(kind: DefKind) -> &'static str {
         DefKind::UserType => "type",
         DefKind::Parameter => "parameter",
         DefKind::Local => "local",
+        DefKind::Field => "field",
+        DefKind::Variant => "enum variant",
     }
 }
 
@@ -156,6 +176,24 @@ mod tests {
         assert!(h.contents.contains("`helper`"));
         assert!(h.contents.contains("function helper(uint256 n)")); // signature line
         assert_eq!(&src[h.range], "helper"); // hovered identifier range
+    }
+
+    #[test]
+    fn hover_shows_type_not_comments() {
+        let src = "contract C {\n\
+            /// @notice the running balance\n\
+            uint256 balance; // storage slot 0\n\
+            function f() public { balance = 1; }\n\
+        }";
+        let root = parse(src).syntax();
+        let h = hover(&root, at(src, "balance = 1")).unwrap();
+        assert!(
+            h.contents.contains("uint256 balance"),
+            "type shown: {}",
+            h.contents
+        );
+        assert!(!h.contents.contains("slot 0"), "trailing comment stripped");
+        assert!(!h.contents.contains("@notice"), "leading doc skipped");
     }
 
     #[test]
