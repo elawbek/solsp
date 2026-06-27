@@ -30,6 +30,7 @@ use solsp_ide::LineIndex;
 
 pub mod state;
 pub mod to_proto;
+pub mod typecheck;
 
 use state::ServerState;
 
