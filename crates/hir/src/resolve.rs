@@ -53,15 +53,15 @@ fn decl_ty(node: &SyntaxNode, kind: DefKind) -> Option<String> {
     if !matches!(kind, StateVariable | Parameter | Local | Field) {
         return None;
     }
-    node.children()
-        .find(|n| n.kind() != SyntaxKind::NAME)
-        .map(|t| {
-            t.text()
-                .to_string()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+    let ty = node.children().find(|n| n.kind() != SyntaxKind::NAME)?;
+    // the type node may carry a leading comment as trivia — drop comments, normalize ws.
+    let text: String = ty
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != SyntaxKind::COMMENT)
+        .map(|t| t.text().to_string())
+        .collect();
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// A top-level declaration of `root` named `name` (contract/function/struct/etc.).

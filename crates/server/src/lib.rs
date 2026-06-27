@@ -501,14 +501,32 @@ fn receiver_value_info(
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
 ) -> Option<(String, bool)> {
-    use solsp_syntax::SyntaxKind::{CALL_EXPR, MEMBER_EXPR, STATE_VAR_DEF, STORAGE_KW};
+    use solsp_syntax::SyntaxKind::{CALL_EXPR, INDEX_EXPR, MEMBER_EXPR};
     if receiver.kind() == CALL_EXPR {
         let callee = receiver.first_child()?;
-        return match callee_display_name(&callee)?.as_str() {
-            "address" => Some(("address".to_string(), false)),
-            "payable" => Some(("address payable".to_string(), false)),
-            _ => None,
-        };
+        match callee_display_name(&callee)?.as_str() {
+            "address" => return Some(("address".to_string(), false)),
+            "payable" => return Some(("address payable".to_string(), false)),
+            _ => {}
+        }
+        // a function call → its return type (a memory/value result).
+        let (duri, def) = resolve_named_callee(state, uri, root, &callee)?;
+        let droot = parse_root(state, &duri)?;
+        let ret = function_return_param(&def.full_ptr.to_node(&droot))?;
+        return Some((type_text(&ret)?, false));
+    }
+    if receiver.kind() == INDEX_EXPR {
+        // `base[i]` → the array element / mapping value type; storage follows the base.
+        let base = receiver.first_child()?;
+        // a declared array/mapping → its element/value type (handles mapping values).
+        if let Some(base_decl) = receiver_decl(state, uri, root, &base) {
+            if let Some(elem) = solsp_hir::resolve::decl_type_path(&base_decl, true) {
+                return Some((node_type_text(&elem), is_storage_decl(&base_decl)));
+            }
+        }
+        // a nested index / call base → strip one array level from its type text.
+        let (base_ty, storage) = receiver_value_info(state, uri, root, &base)?;
+        return Some((base_ty.strip_suffix("[]")?.trim().to_string(), storage));
     }
     if receiver.kind() == MEMBER_EXPR {
         let recv_name = solsp_hir::resolve::receiver_name(&receiver.first_child()?);
@@ -521,14 +539,18 @@ fn receiver_value_info(
         }
     }
     let decl = receiver_decl(state, uri, root, receiver)?;
-    let ty = type_text(&decl)?;
-    // state variables are storage; a local is storage only with the `storage` keyword.
-    let is_storage = decl.kind() == STATE_VAR_DEF
+    Some((type_text(&decl)?, is_storage_decl(&decl)))
+}
+
+/// Whether a declaration's value lives in storage: a state variable, or a local with the
+/// `storage` data location.
+fn is_storage_decl(decl: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::{STATE_VAR_DEF, STORAGE_KW};
+    decl.kind() == STATE_VAR_DEF
         || decl
             .children_with_tokens()
             .filter_map(|e| e.into_token())
-            .any(|t| t.kind() == STORAGE_KW);
-    Some((ty, is_storage))
+            .any(|t| t.kind() == STORAGE_KW)
 }
 
 /// The declaration node a receiver value refers to: a simple/cross-file variable or a
@@ -1282,15 +1304,22 @@ fn named_type(decl: &solsp_syntax::SyntaxNode) -> Option<(String, String)> {
 /// its first non-`NAME` child node's text (whitespace-normalized; a data-location
 /// keyword is a token between the type node and the name, so it is excluded).
 fn type_text(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
-    decl.children()
-        .find(|n| n.kind() != solsp_syntax::SyntaxKind::NAME)
-        .map(|t| {
-            t.text()
-                .to_string()
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
+    let ty = decl
+        .children()
+        .find(|n| n.kind() != solsp_syntax::SyntaxKind::NAME)?;
+    Some(node_type_text(&ty))
+}
+
+/// The text of a type node with comment trivia dropped and whitespace normalized, so a
+/// `// note\n  address` type node reads as `address`.
+fn node_type_text(ty: &solsp_syntax::SyntaxNode) -> String {
+    let text: String = ty
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() != solsp_syntax::SyntaxKind::COMMENT)
+        .map(|t| t.text().to_string())
+        .collect();
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The receiver expression of a `receiver.member` access at `offset`, when the cursor is

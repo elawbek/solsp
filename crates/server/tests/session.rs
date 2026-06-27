@@ -1397,6 +1397,71 @@ fn this_and_super_member_completion() {
 }
 
 #[test]
+fn address_builtins_for_array_element_and_commented_field() {
+    let uri = Url::parse("file:///ae.sol").unwrap();
+    // `a[0]` is an address element; `s.who` is an address field with a leading comment
+    // (the comment is trivia of the type and must not pollute the type text).
+    let src = "struct S { // some note\naddress who; }\n\
+               contract C { S s; function f() public { address[] memory a; a[0].M1; s.who.M2; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line2 = src.lines().nth(2).unwrap();
+    let labels = |id: i32, marker: &str| -> Vec<String> {
+        let ch = line2.find(marker).unwrap() as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position {
+                        line: 2,
+                        character: ch,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+        );
+        let r: CompletionResponse =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        match r {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+        .into_iter()
+        .map(|i| i.label)
+        .collect()
+    };
+    assert!(
+        labels(2, "M1").contains(&"call".to_string()),
+        "array element"
+    );
+    assert!(
+        labels(3, "M2").contains(&"call".to_string()),
+        "commented struct field"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn address_and_array_builtins_by_location_and_form() {
     let uri = Url::parse("file:///av.sol").unwrap();
     let src = "contract C { uint256[] sarr; struct S { address who; } S s; \
