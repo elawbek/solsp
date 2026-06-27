@@ -478,6 +478,92 @@ fn cross_file_goto_definition() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn member_access_resolves_cross_file() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_member_xfile");
+    fs::create_dir_all(&dir).unwrap();
+    let other = dir.join("Other.sol");
+    let main = dir.join("Main.sol");
+    fs::write(
+        &other,
+        "interface IThing { function ping() external; }\n\
+         library Lib { function doThing() internal pure {} }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        "import {Lib, IThing} from \"Other.sol\";\n\
+         contract Main {\n\
+             IThing thing;\n\
+             function f() public { Lib.doThing(); thing.ping(); }\n\
+         }\n",
+    )
+    .unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let other_uri = Url::from_file_path(fs::canonicalize(&other).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line3 = main_src.lines().nth(3).unwrap();
+    let definition = |id: i32, character: u32| {
+        send_request(
+            &client,
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&main_uri),
+                    position: Position { line: 3, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        );
+        let resp = next_response(&client);
+        let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let GotoDefinitionResponse::Scalar(loc) = def else {
+            panic!("expected a definition location");
+        };
+        loc
+    };
+
+    // `Lib.doThing()` → the library method in Other.sol (line 1).
+    let ch = line3.find("doThing").unwrap() as u32;
+    let loc = definition(2, ch + 1);
+    assert_eq!(loc.uri, other_uri);
+    assert_eq!(loc.range.start.line, 1);
+
+    // `thing.ping()` → via the state var `IThing thing` → IThing.ping in Other.sol (line 0).
+    let ch = line3.find("ping").unwrap() as u32;
+    let loc = definition(3, ch + 1);
+    assert_eq!(loc.uri, other_uri);
+    assert_eq!(loc.range.start.line, 0);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]

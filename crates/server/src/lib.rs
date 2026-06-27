@@ -167,7 +167,17 @@ fn goto_definition(
         let range = to_proto::range(li, target);
         return Some(GotoDefinitionResponse::Scalar(Location { uri, range }));
     }
-    // 2. an imported top-level symbol (a use site, or a name inside `{ ... }`) → jump
+    // 2. member access `receiver.member` → resolve via the receiver's type.
+    if let Some((target_uri, def)) = member_resolve(state, &uri, &root, offset) {
+        let troot = parse_root(state, &target_uri)?;
+        let tli = state.line_index(&target_uri)?;
+        let range = to_proto::range(tli, def_name_range(&troot, &def));
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: target_uri,
+            range,
+        }));
+    }
+    // 3. an imported top-level symbol (a use site, or a name inside `{ ... }`) → jump
     //    into the target file.
     if let Some(name) = solsp_ide::navigation::name_at(&root, offset) {
         if let Some((target_uri, range)) = cross_file_target(state, &uri, &root, &name) {
@@ -204,7 +214,15 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
             Some(to_proto::range(li, info.range)),
         ));
     }
-    // 2. an imported top-level symbol → hover from the target file.
+    // 2. member access `receiver.member` → hover from the member's declaration.
+    if let Some((target_uri, def)) = member_resolve(state, &uri, &root, offset) {
+        let troot = parse_root(state, &target_uri)?;
+        return Some(markup_hover(
+            solsp_ide::navigation::hover_text(&troot, &def),
+            None,
+        ));
+    }
+    // 3. an imported top-level symbol → hover from the target file.
     let name = solsp_ide::navigation::name_at(&root, offset)?;
     for imp in solsp_hir::imports::imports(&root) {
         let Some(export) = exported_name(&imp.kind, &name) else {
@@ -265,6 +283,153 @@ fn exported_name(kind: &solsp_hir::imports::ImportKind, name: &str) -> Option<St
             .map(|n| n.name.clone()),
         ImportKind::Namespace(_) => None,
     }
+}
+
+/// Resolve a member access `receiver.member` at `offset`: returns the target file URI
+/// and the member's [`Definition`]. Handles a receiver that is a type name
+/// (contract/library/interface/struct/enum) or a variable (following its declared
+/// type), same-file or imported.
+fn member_resolve(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use solsp_syntax::SyntaxKind;
+    // the clicked identifier must be the member side of a `receiver.member`.
+    let token = root
+        .token_at_offset(offset)
+        .find(|t| t.kind() == SyntaxKind::IDENT)?;
+    let member_ref = token.parent()?;
+    let (receiver, member) = solsp_hir::resolve::member_access(&member_ref)?;
+
+    let (type_uri, type_def) = resolve_receiver_type(state, uri, root, &receiver)?;
+    let member_def = solsp_hir::resolve::member_in_type(&type_def, &member)?;
+    Some((type_uri, member_def))
+}
+
+/// Resolve the receiver of a member access to its type definition node and the file
+/// that node lives in. A type name resolves to itself; a variable follows its declared
+/// type. Same-file lexical resolution first, then imported symbols.
+fn resolve_receiver_type(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    use solsp_hir::resolve::DefKind;
+    let name = solsp_hir::resolve::receiver_name(receiver)?;
+    let recv_ref = receiver_name_ref(receiver)?;
+
+    // resolve the receiver: same-file lexical, else an imported top-level symbol.
+    let (def_uri, def) = match solsp_hir::resolve::resolve(&recv_ref) {
+        Some(def) => (uri.clone(), def),
+        None => cross_file_definition(state, uri, root, &name)?,
+    };
+    let def_root = parse_root(state, &def_uri)?;
+    let def_node = def.full_ptr.to_node(&def_root);
+
+    match def.kind {
+        // the receiver IS a type.
+        DefKind::Contract
+        | DefKind::Interface
+        | DefKind::Library
+        | DefKind::Struct
+        | DefKind::Enum => Some((def_uri, def_node)),
+        // the receiver is a value; follow its declared type.
+        DefKind::StateVariable | DefKind::Parameter | DefKind::Local => {
+            let type_name = solsp_hir::resolve::declared_type_name(&def_node)?;
+            resolve_type_by_name(state, &def_uri, &def_root, &type_name)
+        }
+        _ => None,
+    }
+}
+
+/// Resolve a *type* name to its definition node and file: same-file top-level first,
+/// then an imported type.
+fn resolve_type_by_name(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    type_name: &str,
+) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    if let Some(def) = solsp_hir::resolve::top_level_definition(root, type_name) {
+        if is_type_kind(def.kind) {
+            return Some((uri.clone(), def.full_ptr.to_node(root)));
+        }
+    }
+    let (turi, def) = cross_file_definition(state, uri, root, type_name)?;
+    if is_type_kind(def.kind) {
+        let troot = parse_root(state, &turi)?;
+        return Some((turi, def.full_ptr.to_node(&troot)));
+    }
+    None
+}
+
+fn is_type_kind(kind: solsp_hir::resolve::DefKind) -> bool {
+    use solsp_hir::resolve::DefKind::*;
+    matches!(
+        kind,
+        Contract | Interface | Library | Struct | Enum | UserType
+    )
+}
+
+/// Like [`cross_file_target`], but returns the resolved [`Definition`] (and the file
+/// it lives in) rather than a range — for further member/type resolution.
+fn cross_file_definition(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    name: &str,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    for imp in solsp_hir::imports::imports(root) {
+        let Some(export) = exported_name(&imp.kind, name) else {
+            continue;
+        };
+        let Some(target_uri) = state::resolve_import_uri(uri, &imp.path) else {
+            continue;
+        };
+        let Some(tfile) = state.file(&target_uri) else {
+            continue;
+        };
+        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export) {
+            return Some((target_uri, def));
+        }
+    }
+    None
+}
+
+/// The `NAME_REF` node of a receiver expression (`PATH_EXPR` → `NAME_REF`, or a bare
+/// `NAME_REF`).
+fn receiver_name_ref(receiver: &solsp_syntax::SyntaxNode) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::NAME_REF;
+    if receiver.kind() == NAME_REF {
+        Some(receiver.clone())
+    } else {
+        receiver.children().find(|n| n.kind() == NAME_REF)
+    }
+}
+
+/// Parse the current tree of a tracked file.
+fn parse_root(state: &ServerState, uri: &Url) -> Option<solsp_syntax::SyntaxNode> {
+    let file = state.file(uri)?;
+    Some(solsp_base_db::parse(state.db(), file).syntax())
+}
+
+/// The byte range of a definition's name identifier within `root`.
+fn def_name_range(
+    root: &solsp_syntax::SyntaxNode,
+    def: &solsp_hir::resolve::Definition,
+) -> rowan::TextRange {
+    use solsp_syntax::SyntaxKind::IDENT;
+    let name_node = def.name_ptr.to_node(root);
+    name_node
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == IDENT)
+        .map(|t| t.text_range())
+        .unwrap_or_else(|| name_node.text_range())
 }
 
 /// Wrap markdown text (and an optional range) into an LSP `Hover`.

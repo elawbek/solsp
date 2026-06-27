@@ -45,6 +45,71 @@ pub fn top_level_definition(root: &SyntaxNode, name: &str) -> Option<Definition>
     find_named_decl(root.children(), name)
 }
 
+/// If `reference` (a `NAME_REF`) is the member side of a `receiver.member` access,
+/// return the receiver expression node and the member name. `None` otherwise.
+pub fn member_access(reference: &SyntaxNode) -> Option<(SyntaxNode, String)> {
+    let parent = reference.parent()?;
+    if parent.kind() != SyntaxKind::MEMBER_EXPR {
+        return None;
+    }
+    let receiver = parent.first_child()?; // the receiver expression
+    if &receiver == reference {
+        return None; // `reference` is the receiver, not the member
+    }
+    Some((receiver, ident_text(reference)?))
+}
+
+/// The simple name of a receiver expression — `X` in `X.member` — when it is a bare
+/// identifier (`NAME_REF` / `PATH_EXPR`). `None` for complex receivers (chains, calls).
+pub fn receiver_name(receiver: &SyntaxNode) -> Option<String> {
+    let name_ref = if receiver.kind() == SyntaxKind::NAME_REF {
+        receiver.clone()
+    } else {
+        receiver
+            .children()
+            .find(|n| n.kind() == SyntaxKind::NAME_REF)?
+    };
+    ident_text(&name_ref)
+}
+
+/// The declared type name of a variable/parameter/state-variable declaration — `IRoles`
+/// in `IRoles roles`. `None` for elementary/mapping/array types (no user path type).
+pub fn declared_type_name(decl: &SyntaxNode) -> Option<String> {
+    let path_type = decl
+        .children()
+        .find(|n| n.kind() == SyntaxKind::PATH_TYPE)?;
+    let name_ref = path_type
+        .descendants()
+        .find(|n| n.kind() == SyntaxKind::NAME_REF)?;
+    ident_text(&name_ref)
+}
+
+/// Look up `member` inside a type definition's body: contract/interface/library
+/// members (incl. same-file C3 bases), struct fields, or enum variants.
+pub fn member_in_type(type_def: &SyntaxNode, member: &str) -> Option<Definition> {
+    use SyntaxKind::*;
+    match type_def.kind() {
+        CONTRACT_DEF => lookup_member(type_def, member),
+        STRUCT_DEF | ENUM_DEF => type_def
+            .descendants()
+            .filter(|n| matches!(n.kind(), STRUCT_FIELD | ENUM_VARIANT))
+            .find_map(|n| {
+                let name_node = n.children().find(|c| c.kind() == NAME)?;
+                (ident_text(&name_node)? == member).then(|| Definition {
+                    name: member.to_string(),
+                    kind: if n.kind() == STRUCT_FIELD {
+                        DefKind::StateVariable
+                    } else {
+                        DefKind::Enum
+                    },
+                    name_ptr: AstPtr::new(&name_node),
+                    full_ptr: AstPtr::new(&n),
+                })
+            }),
+        _ => None,
+    }
+}
+
 /// Resolve a `NAME_REF` (or `NAME`) node to its definition within the same file.
 /// Returns `None` for builtins/unknowns (and anything needing imports/inheritance).
 pub fn resolve(reference: &SyntaxNode) -> Option<Definition> {
@@ -380,6 +445,42 @@ mod tests {
         let c_off = src.find("contract C").unwrap();
         let f_off: usize = node.text_range().start().into();
         assert!(f_off > b_off && f_off < c_off, "override should be B::f");
+    }
+
+    #[test]
+    fn member_resolution_helpers() {
+        let src = "library L { function s() internal returns (uint) {} }\n\
+            contract C {\n\
+                L lib;\n\
+                function f() public { L.s(); lib.s(); }\n\
+            }";
+        let root = parse(src).syntax();
+
+        // the member NAME_REF `s` in `L.s()`
+        let s_ref = root
+            .descendants()
+            .filter(|n| n.kind() == SyntaxKind::NAME_REF)
+            .find(|n| ident_text(n).as_deref() == Some("s") && member_access(n).is_some())
+            .unwrap();
+        let (receiver, member) = member_access(&s_ref).unwrap();
+        assert_eq!(member, "s");
+        assert_eq!(receiver_name(&receiver).as_deref(), Some("L"));
+
+        // member lookup in the library type
+        let lib_def = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::CONTRACT_DEF)
+            .unwrap();
+        let m = member_in_type(&lib_def, "s").unwrap();
+        assert_eq!(m.kind, DefKind::Function);
+        assert_eq!(m.name, "s");
+
+        // declared type of the state variable `L lib;`
+        let var = root
+            .descendants()
+            .find(|n| n.kind() == SyntaxKind::STATE_VAR_DEF)
+            .unwrap();
+        assert_eq!(declared_type_name(&var).as_deref(), Some("L"));
     }
 
     #[test]

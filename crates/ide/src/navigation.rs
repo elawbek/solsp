@@ -54,6 +54,13 @@ pub fn hover(root: &SyntaxNode, offset: TextSize) -> Option<Hover> {
     Some(Hover { contents, range })
 }
 
+/// The hover markdown for a definition (public so the server can render a hover for a
+/// member it resolved itself): a `solidity` code block with the signature line plus a
+/// `(kind) name` caption.
+pub fn hover_text(root: &SyntaxNode, def: &Definition) -> String {
+    hover_markdown(root, def)
+}
+
 /// The hover markdown for a definition: a `solidity` code block with its signature
 /// line plus a `(kind) name` caption.
 fn hover_markdown(root: &SyntaxNode, def: &Definition) -> String {
