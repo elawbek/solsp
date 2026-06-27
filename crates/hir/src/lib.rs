@@ -4,6 +4,9 @@
 //! (base-db), so it memoizes and recomputes incrementally (design §7, M2).
 //!
 //! P2 covers item *signatures* only — no scopes, no bodies, no resolution yet.
+//! P3 adds [`resolve`]: single-file lexical name resolution.
+
+pub mod resolve;
 
 use rowan::ast::SyntaxNodePtr;
 use rowan::TextRange;
