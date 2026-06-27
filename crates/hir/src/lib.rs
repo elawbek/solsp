@@ -5,7 +5,9 @@
 //!
 //! P2 covers item *signatures* only — no scopes, no bodies, no resolution yet.
 //! P3 adds [`resolve`]: single-file lexical name resolution.
+//! P7 adds [`imports`]: import-directive extraction for cross-file resolution.
 
+pub mod imports;
 pub mod resolve;
 
 use rowan::ast::SyntaxNodePtr;

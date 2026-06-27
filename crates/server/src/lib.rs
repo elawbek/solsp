@@ -149,9 +149,19 @@ fn goto_definition(
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
-    let target = solsp_ide::navigation::goto_definition(&root, offset)?;
-    let range = to_proto::range(li, target);
-    Some(GotoDefinitionResponse::Scalar(Location { uri, range }))
+    // 1. same-file resolution.
+    if let Some(target) = solsp_ide::navigation::goto_definition(&root, offset) {
+        let range = to_proto::range(li, target);
+        return Some(GotoDefinitionResponse::Scalar(Location { uri, range }));
+    }
+    // 2. an imported top-level symbol → jump into the target file.
+    let name = solsp_ide::navigation::name_at(&root, offset)?;
+    let (target_uri, range) = cross_file_target(state, &uri, &root, &name)?;
+    let tli = state.line_index(&target_uri)?;
+    Some(GotoDefinitionResponse::Scalar(Location {
+        uri: target_uri,
+        range: to_proto::range(tli, range),
+    }))
 }
 
 /// `textDocument/hover` → the definition's signature + kind as markdown (or `None`).
@@ -162,14 +172,85 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
-    let info = solsp_ide::navigation::hover(&root, offset)?;
-    Some(Hover {
+    // 1. same-file hover.
+    if let Some(info) = solsp_ide::navigation::hover(&root, offset) {
+        return Some(markup_hover(
+            info.contents,
+            Some(to_proto::range(li, info.range)),
+        ));
+    }
+    // 2. an imported top-level symbol → hover from the target file.
+    let name = solsp_ide::navigation::name_at(&root, offset)?;
+    for imp in solsp_hir::imports::imports(&root) {
+        let Some(export) = exported_name(&imp.kind, &name) else {
+            continue;
+        };
+        let Some(target_uri) = state::resolve_import_uri(&uri, &imp.path) else {
+            continue;
+        };
+        let Some(tfile) = state.file(&target_uri) else {
+            continue;
+        };
+        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        if let Some(info) = solsp_ide::navigation::hover_top_level(&troot, &export) {
+            // The hovered identifier is in *this* file; report no range (the target
+            // range would be in the wrong document) and let the client highlight it.
+            return Some(markup_hover(info.contents, None));
+        }
+    }
+    None
+}
+
+/// Find an imported top-level symbol `name` referenced in `root`: returns the target
+/// file URI and the byte range (in that file) of the declaration's name.
+fn cross_file_target(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    name: &str,
+) -> Option<(Url, rowan::TextRange)> {
+    for imp in solsp_hir::imports::imports(root) {
+        let Some(export) = exported_name(&imp.kind, name) else {
+            continue;
+        };
+        let Some(target_uri) = state::resolve_import_uri(uri, &imp.path) else {
+            continue;
+        };
+        let Some(tfile) = state.file(&target_uri) else {
+            continue;
+        };
+        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        if let Some(range) = solsp_ide::navigation::goto_top_level(&troot, &export) {
+            return Some((target_uri, range));
+        }
+    }
+    None
+}
+
+/// The target-file export name a local `name` refers to under an import's binding, or
+/// `None` if this import does not bind it. Namespace imports (`* as N`) are skipped —
+/// `N.member` access needs member resolution (a later step).
+fn exported_name(kind: &solsp_hir::imports::ImportKind, name: &str) -> Option<String> {
+    use solsp_hir::imports::ImportKind;
+    match kind {
+        ImportKind::Glob => Some(name.to_string()),
+        ImportKind::Named(list) => list
+            .iter()
+            .find(|n| n.local() == name)
+            .map(|n| n.name.clone()),
+        ImportKind::Namespace(_) => None,
+    }
+}
+
+/// Wrap markdown text (and an optional range) into an LSP `Hover`.
+fn markup_hover(value: String, range: Option<lsp_types::Range>) -> Hover {
+    Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
-            value: info.contents,
+            value,
         }),
-        range: Some(to_proto::range(li, info.range)),
-    })
+        range,
+    }
 }
 
 /// Handle a notification: open/change update the store and republish diagnostics;
@@ -186,6 +267,7 @@ fn handle_notification(
             };
             let uri = params.text_document.uri;
             state.set(&uri, params.text_document.text);
+            state.load_import_graph(&uri); // pull imported files into the db
             publish_diagnostics(connection, state, &uri)?;
         }
         DidChangeTextDocument::METHOD => {
@@ -203,6 +285,7 @@ fn handle_notification(
                 apply_change(&mut text, change);
             }
             state.set(&uri, text);
+            state.load_import_graph(&uri); // imports may have changed
             publish_diagnostics(connection, state, &uri)?;
         }
         DidCloseTextDocument::METHOD => {

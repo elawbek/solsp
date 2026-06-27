@@ -39,6 +39,12 @@ pub struct Definition {
     pub full_ptr: AstPtr,
 }
 
+/// A top-level declaration of `root` named `name` (contract/function/struct/etc.).
+/// Used to resolve an imported symbol against the target file's tree (M2 P7).
+pub fn top_level_definition(root: &SyntaxNode, name: &str) -> Option<Definition> {
+    find_named_decl(root.children(), name)
+}
+
 /// Resolve a `NAME_REF` (or `NAME`) node to its definition within the same file.
 /// Returns `None` for builtins/unknowns (and anything needing imports/inheritance).
 pub fn resolve(reference: &SyntaxNode) -> Option<Definition> {

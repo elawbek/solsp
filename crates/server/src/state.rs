@@ -3,7 +3,8 @@
 //! `parse` and downstream queries recompute only what changed. A per-file
 //! [`LineIndex`] is cached alongside for fast position ↔ byte mapping.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 
 use lsp_types::Url;
 use salsa::Setter;
@@ -64,4 +65,61 @@ impl ServerState {
         let file = self.file(uri)?;
         Some(file.text(&self.db).clone())
     }
+
+    /// Load a file from disk into the db if it is not already tracked (a disk-loaded
+    /// file behaves like an opened one for queries; an editor `didOpen` later replaces
+    /// it). No-op on read failure.
+    fn ensure_loaded(&mut self, uri: &Url) {
+        if self.files.contains_key(uri.as_str()) {
+            return;
+        }
+        if let Ok(path) = uri.to_file_path() {
+            if let Ok(text) = fs::read_to_string(&path) {
+                self.set(uri, text);
+            }
+        }
+    }
+
+    /// Follow `root_uri`'s relative-import graph and load every reachable file from
+    /// disk into the db, so cross-file resolution can read them. Visited-guarded, so
+    /// import cycles terminate.
+    pub fn load_import_graph(&mut self, root_uri: &Url) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue = vec![root_uri.clone()];
+        while let Some(uri) = queue.pop() {
+            if !seen.insert(uri.to_string()) {
+                continue;
+            }
+            for target in self.import_targets(&uri) {
+                self.ensure_loaded(&target);
+                queue.push(target);
+            }
+        }
+    }
+
+    /// The relative-import target URIs of a tracked file (empty if untracked).
+    fn import_targets(&self, uri: &Url) -> Vec<Url> {
+        let Some(file) = self.file(uri) else {
+            return Vec::new();
+        };
+        let root = solsp_base_db::parse(&self.db, file).syntax();
+        solsp_hir::imports::imports(&root)
+            .iter()
+            .filter_map(|imp| resolve_import_uri(uri, &imp.path))
+            .collect()
+    }
+}
+
+/// Resolve a relative import path (`./X.sol`, `../lib/Y.sol`) against the importing
+/// file's URI into the target file URI. Returns `None` for non-relative specifiers
+/// (remappings / bare package paths need a configured resolver — a later step) or if
+/// the target does not exist on disk.
+pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
+    if !(path.starts_with("./") || path.starts_with("../")) {
+        return None;
+    }
+    let base_path = base.to_file_path().ok()?;
+    let dir = base_path.parent()?;
+    let canonical = fs::canonicalize(dir.join(path)).ok()?;
+    Url::from_file_path(canonical).ok()
 }

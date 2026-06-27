@@ -660,6 +660,7 @@ dependencies = [
  "serde",
  "serde_json",
  "solsp-base-db",
+ "solsp-hir",
  "solsp-ide",
  "solsp-syntax",
 ]

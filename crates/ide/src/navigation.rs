@@ -13,6 +13,31 @@ pub fn goto_definition(root: &SyntaxNode, offset: TextSize) -> Option<TextRange>
     Some(name_range(root, &def))
 }
 
+/// The identifier text at `offset`, if any (used to look a name up across files).
+pub fn name_at(root: &SyntaxNode, offset: TextSize) -> Option<String> {
+    root.token_at_offset(offset)
+        .find(|t| t.kind() == SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())
+}
+
+/// Go-to-def target for a top-level symbol `name` in `root` (a possibly different
+/// file). Used to jump to an imported declaration (M2 P7).
+pub fn goto_top_level(root: &SyntaxNode, name: &str) -> Option<TextRange> {
+    let def = solsp_hir::resolve::top_level_definition(root, name)?;
+    Some(name_range(root, &def))
+}
+
+/// Hover for a top-level symbol `name` in `root` (a possibly different file). Like
+/// [`hover`], but addressed by name rather than cursor offset (cross-file, M2 P7).
+pub fn hover_top_level(root: &SyntaxNode, name: &str) -> Option<Hover> {
+    let def = solsp_hir::resolve::top_level_definition(root, name)?;
+    let range = name_range(root, &def);
+    Some(Hover {
+        contents: hover_markdown(root, &def),
+        range,
+    })
+}
+
 /// Hover information: a markdown string plus the range of the hovered identifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hover {
@@ -24,16 +49,22 @@ pub struct Hover {
 /// `(kind) name` caption. `None` if nothing resolves.
 pub fn hover(root: &SyntaxNode, offset: TextSize) -> Option<Hover> {
     let def = definition_at(root, offset)?;
+    let contents = hover_markdown(root, &def);
+    let range = ident_range_at(root, offset).unwrap_or_else(|| name_range(root, &def));
+    Some(Hover { contents, range })
+}
+
+/// The hover markdown for a definition: a `solidity` code block with its signature
+/// line plus a `(kind) name` caption.
+fn hover_markdown(root: &SyntaxNode, def: &Definition) -> String {
     let decl = def.full_ptr.to_node(root);
     let decl_text = decl.text().to_string();
     let signature = first_line(&decl_text);
-    let contents = format!(
+    format!(
         "```solidity\n{signature}\n```\n\n*({label})* `{name}`",
         label = def_label(def.kind),
         name = def.name,
-    );
-    let range = ident_range_at(root, offset).unwrap_or_else(|| name_range(root, &def));
-    Some(Hover { contents, range })
+    )
 }
 
 /// The precise identifier range of a definition's name (the `IDENT` token, not the
