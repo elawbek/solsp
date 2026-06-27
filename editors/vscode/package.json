@@ -54,7 +54,7 @@
       "editor.semanticTokenColorCustomizations": {
         "enabled": true,
         "rules": {
-          "decorator:solidity": "#b22222"
+          "decorator:solidity": "#cd5c5c"
         }
       }
     }
