@@ -786,22 +786,41 @@ fn positional_arg_hover(
     } else {
         format!("expected: {etype} {ename}")
     };
-    // passed type: the value's declared type, if the argument resolves to a declaration.
-    let body = match positional_passed_type(root, offset) {
+    // passed type: the type of the argument value.
+    let body = match positional_passed_type(state, uri, root, &arg, offset) {
         Some(p) => format!("```solidity\npassed:   {p}\n{expected}\n```"),
         None => format!("```solidity\n{expected}\n```"),
     };
     Some(markup_hover(body, None))
 }
 
-/// The declared type of the value at `offset`, when it resolves to a same-file
-/// declaration (local/param/state-var).
+/// The type of an argument value, as a string: a simple variable's declared type, a
+/// member access `a.b`'s member type (possibly cross-file), or a user-typed call/index
+/// result.
 fn positional_passed_type(
+    state: &ServerState,
+    uri: &Url,
     root: &solsp_syntax::SyntaxNode,
+    arg: &solsp_syntax::SyntaxNode,
     offset: rowan::TextSize,
 ) -> Option<String> {
-    let def = solsp_hir::resolve::definition_at(root, offset)?;
-    type_text(&def.full_ptr.to_node(root))
+    // 1. a same-file declaration the value refers to → its declared type.
+    if let Some(def) = solsp_hir::resolve::definition_at(root, offset) {
+        if let Some(t) = type_text(&def.full_ptr.to_node(root)) {
+            return Some(t);
+        }
+    }
+    // 2. a member-access argument (`a.b`) → the member's declared type (may be cross-file).
+    if let Some((turi, def)) = member_resolve(state, uri, root, offset) {
+        if let Some(t) =
+            parse_root(state, &turi).and_then(|tr| type_text(&def.full_ptr.to_node(&tr)))
+        {
+            return Some(t);
+        }
+    }
+    // 3. otherwise the inferred user type of the whole expression (call/index → a type).
+    let (_, tdef) = receiver_type(state, uri, root, arg, false)?;
+    solsp_hir::resolve::contract_def_name(&tdef)
 }
 
 /// Resolve the callee of the call whose named-argument list is `nal` to its declaration.

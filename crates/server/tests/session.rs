@@ -1460,6 +1460,65 @@ fn signature_help_and_positional_arg_hover() {
 }
 
 #[test]
+fn positional_hover_passed_type_for_member_argument() {
+    let uri = Url::parse("file:///pm.sol").unwrap();
+    let src = "struct S { uint256 amount; }\n\
+               contract C { S s; function sink(uint256 a) internal {} \
+               function f() public { sink(s.amount); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    // hover over `amount` in `sink(s.amount)` (a member-access argument) → both types.
+    let line1 = src.lines().nth(1).unwrap();
+    let ch = line1.find("s.amount").unwrap() as u32 + 2; // the `amount` member
+    send_request(
+        &client,
+        2,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 1,
+                    character: ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(m) = hov.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        m.value.contains("passed:   uint256"),
+        "hover was {:?}",
+        m.value
+    );
+    assert!(
+        m.value.contains("expected: uint256 a"),
+        "hover was {:?}",
+        m.value
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn signature_help_on_inherited_internal_method() {
     use std::fs;
 
