@@ -2331,8 +2331,8 @@ fn nested_struct_type_resolves_within_contract() {
 #[test]
 fn argument_type_mismatch_is_diagnosed() {
     let uri = Url::parse("file:///tc.sol").unwrap();
-    // `takesAddr(s)` passes a string where an address is expected; the valid calls
-    // (contract -> address, a literal, a cast) must NOT be flagged.
+    // `takesAddr(s)` (string) and `takesAddr(a)` (a contract — not implicitly an address)
+    // are both errors; only the explicit `address(a)` cast is valid.
     let src = "contract A {}\n\
                contract C { function takesAddr(address x) public {} \
                function f() public { string memory s; A a; \
@@ -2355,9 +2355,8 @@ fn argument_type_mismatch_is_diagnosed() {
         .iter()
         .filter(|d| d.message.contains("convertible"))
         .collect();
-    // exactly one: the `string` argument to an `address` parameter.
-    assert_eq!(type_warnings.len(), 1, "{:?}", diags.diagnostics);
-    assert!(type_warnings[0].message.contains("address"));
+    // two: the `string` and the uncast contract; the `address(a)` cast is fine.
+    assert_eq!(type_warnings.len(), 2, "{:?}", diags.diagnostics);
     // a type mismatch is an error, not a warning.
     assert_eq!(
         type_warnings[0].severity,

@@ -1514,10 +1514,6 @@ fn def_detail(k: solsp_hir::resolve::DefKind) -> &'static str {
     }
 }
 
-/// Latency cap for one type-check pass; calls past it are left unchecked rather than
-/// blocking the main loop on slow cross-file resolution.
-const TYPE_CHECK_BUDGET_MS: u64 = 750;
-
 /// A callable's overloads, each as its parameter `(name, type)` list.
 type Overloads = Vec<Vec<(String, String)>>;
 
@@ -1533,21 +1529,14 @@ fn type_check_diagnostics(
     use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAMED_ARG_LIST};
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::time::Instant;
     let mut out = Vec::new();
     // per-run caches: the same callee text resolves to the same overloads, and the same
     // (subtype, base) pair has a stable answer. Without this, a big forge-std-heavy test
     // file re-walked huge cheatcode files once per call and took tens of seconds.
     let mut callee_cache: HashMap<String, Option<Overloads>> = HashMap::new();
     let subtype_memo: RefCell<HashMap<(String, String), bool>> = RefCell::new(HashMap::new());
-    // a hard latency cap: cross-file resolution of dependency-heavy files (forge-std) can
-    // be slow, and this runs on the main loop — better to check fewer calls than to block.
-    let deadline = Instant::now() + std::time::Duration::from_millis(TYPE_CHECK_BUDGET_MS);
 
     for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
-        if Instant::now() >= deadline {
-            break;
-        }
         // the arguments: positional (`key = None`) or named (`key = Some`).
         let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
             if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {
@@ -1560,6 +1549,11 @@ fn type_check_diagnostics(
         let Some(callee) = call.first_child() else {
             continue;
         };
+        // skip cheatcode / logging calls (`vm.*`, `console.*`): resolving them walks huge
+        // forge-std files for no benefit, and they dominate test files.
+        if is_cheatcode_receiver(&callee) {
+            continue;
+        }
         // every overload's parameter list, resolved once per distinct callee text.
         let key = callee.text().to_string();
         if !callee_cache.contains_key(&key) {
@@ -1653,6 +1647,19 @@ fn type_check_diagnostics(
         }
     }
     out
+}
+
+/// Whether a callee is a member call on a forge-std cheatcode / logging handle
+/// (`vm.*`, `console.*`, `console2.*`) — cheap to detect and not worth type-checking.
+fn is_cheatcode_receiver(callee: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::MEMBER_EXPR;
+    if callee.kind() != MEMBER_EXPR {
+        return false;
+    }
+    callee
+        .first_child()
+        .and_then(|recv| solsp_hir::resolve::receiver_name(&recv))
+        .is_some_and(|n| matches!(n.as_str(), "vm" | "console" | "console2"))
 }
 
 /// Every overload's parameter list (`(name, type)` pairs) for a call's callee, resolved

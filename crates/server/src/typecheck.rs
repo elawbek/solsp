@@ -12,8 +12,8 @@
 //! - integers: `uintN` → `uintM` and `intN` → `intM` when `M ≥ N` (widening only; no
 //!   signedness change, no narrowing).
 //! - `address payable` → `address`.
-//! - a contract type → `address` (an instance is usable where an address is expected),
-//!   and → a base contract / implemented interface (via the inheritance predicate).
+//! - a contract type → a base contract / implemented interface (via the inheritance
+//!   predicate). NOT → `address`: Solidity ≥0.5 requires an explicit `address(c)`.
 //! - number literals → any integer type; the literal `0`-family is also accepted for
 //!   `address`/`bytesN` (literal value fitting isn't tracked, so we allow it).
 //! - string literals → `string` / `bytes` / `bytesN`.
@@ -120,9 +120,8 @@ pub fn implicitly_convertible(from: &Ty, to: &Ty, is_base: &dyn Fn(&str, &str) -
         // integers widen within the same signedness.
         (Uint(a), Uint(b)) | (Int(a), Int(b)) => b >= a,
 
-        // address payable is an address; a contract is usable as an address.
+        // address payable is an address (a contract is NOT — `address(c)` is required).
         (AddressPayable, Address) => true,
-        (User(_), Address | AddressPayable) => true,
 
         // a contract implicitly converts to a base contract / implemented interface.
         (User(a), User(b)) => a == b || is_base(a, b),
@@ -179,8 +178,8 @@ mod tests {
             &parse_ty("Base"),
             &is_base
         ));
-        // a contract is usable as an address.
-        assert!(implicitly_convertible(
+        // a contract is NOT implicitly an address — `address(c)` is required.
+        assert!(!implicitly_convertible(
             &parse_ty("Roles"),
             &parse_ty("address"),
             &never_base
