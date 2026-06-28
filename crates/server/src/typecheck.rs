@@ -48,8 +48,10 @@ pub enum Ty {
     /// A user-defined type by name (contract / interface / struct / enum / user value
     /// type), possibly qualified (`A.B`) — the last segment is kept.
     User(String),
-    /// A number / string / bool literal whose precise type is left open.
+    /// A decimal number literal — convertible to integer types only.
     NumberLiteral,
+    /// A hex number literal (`0x…`) — also a valid `address` / `bytesN` value.
+    HexLiteral,
     StringLiteral,
     BoolLiteral,
     /// Anything we could not classify — always treated as convertible.
@@ -126,9 +128,11 @@ pub fn implicitly_convertible(from: &Ty, to: &Ty, is_base: &dyn Fn(&str, &str) -
         // a contract implicitly converts to a base contract / implemented interface.
         (User(a), User(b)) => a == b || is_base(a, b),
 
-        // literals.
-        (NumberLiteral, Uint(_) | Int(_) | Address | AddressPayable) => true,
-        (NumberLiteral, BytesN(_) | Bytes) => true, // `0`/hex literal, fit untracked
+        // literals. A decimal number goes to integers and fixed bytes (the `… = 0` zeroing
+        // idiom is common and valid), but NOT to `address` — `address a = 1` is an error and
+        // needs `address(1)`. A hex literal is additionally a valid address value.
+        (NumberLiteral, Uint(_) | Int(_) | BytesN(_) | Bytes) => true,
+        (HexLiteral, Uint(_) | Int(_) | Address | AddressPayable | BytesN(_) | Bytes) => true,
         (StringLiteral, StringT | Bytes | BytesN(_)) => true,
         (BoolLiteral, Bool) => true,
 
@@ -209,5 +213,17 @@ mod tests {
         ));
         assert!(ok(&Ty::NumberLiteral, "uint8"));
         assert!(ok(&Ty::StringLiteral, "bytes"));
+    }
+
+    #[test]
+    fn number_literal_is_not_an_address() {
+        let conv = |a: &Ty, b: &str| implicitly_convertible(a, &parse_ty(b), &never_base);
+        // a decimal literal: integers and fixed bytes (the `… = 0` idiom), but not address.
+        assert!(conv(&Ty::NumberLiteral, "uint256"));
+        assert!(conv(&Ty::NumberLiteral, "bytes32"));
+        assert!(!conv(&Ty::NumberLiteral, "address"));
+        // a hex literal is also a valid address / bytes value.
+        assert!(conv(&Ty::HexLiteral, "address"));
+        assert!(conv(&Ty::HexLiteral, "bytes20"));
     }
 }

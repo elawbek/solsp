@@ -1838,7 +1838,7 @@ fn ty_label(ty: &typecheck::Ty) -> String {
         Array(inner) | FixedArray(inner) => format!("{}[]", ty_label(inner)),
         Mapping => "mapping".into(),
         User(n) => n.clone(),
-        NumberLiteral | StringLiteral | BoolLiteral => "literal".into(),
+        NumberLiteral | HexLiteral | StringLiteral | BoolLiteral => "literal".into(),
         Unknown => "?".into(),
     }
 }
@@ -2178,7 +2178,15 @@ fn infer_arg_ty(
                 .children_with_tokens()
                 .filter_map(|e| e.into_token())
                 .find(|t| !matches!(t.kind(), WHITESPACE | COMMENT));
-            match tok.map(|t| t.kind()) {
+            match tok.as_ref().map(|t| t.kind()) {
+                // a hex literal (`0x…`) may also be an address / fixed-bytes value.
+                Some(NUMBER)
+                    if tok.as_ref().is_some_and(|t| {
+                        t.text().starts_with("0x") || t.text().starts_with("0X")
+                    }) =>
+                {
+                    typecheck::Ty::HexLiteral
+                }
                 Some(NUMBER) => typecheck::Ty::NumberLiteral,
                 Some(STRING) => typecheck::Ty::StringLiteral,
                 Some(TRUE_KW | FALSE_KW) => typecheck::Ty::BoolLiteral,
