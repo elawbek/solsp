@@ -1805,6 +1805,11 @@ fn assignment_diagnostics(
             }
             _ => continue,
         };
+        // a number literal that overflows the target integer type (`uint8 x = 300`).
+        if let Some(msg) = literal_range_error(&value, &target) {
+            out.push(type_mismatch(li, &value, &msg));
+            continue;
+        }
         let value_ty = infer_arg_ty(state, uri, root, &value);
         if matches!(target, typecheck::Ty::Unknown) || matches!(value_ty, typecheck::Ty::Unknown) {
             continue;
@@ -1822,6 +1827,48 @@ fn assignment_diagnostics(
         }
     }
     out
+}
+
+/// An error message if `value` is a plain integer literal that does not fit the integer
+/// `target` type. `None` for non-integer targets, non-literal values, or values we can't
+/// evaluate (scientific notation, units, hex beyond `u128`).
+fn literal_range_error(value: &solsp_syntax::SyntaxNode, target: &typecheck::Ty) -> Option<String> {
+    let (signed, bits) = match target {
+        typecheck::Ty::Uint(b) => (false, *b),
+        typecheck::Ty::Int(b) => (true, *b),
+        _ => return None,
+    };
+    if bits >= 128 {
+        return None; // a `u128` literal value can't overflow uint128+/int128+
+    }
+    let v = literal_u128(value)?;
+    let max = if signed {
+        (1u128 << (bits - 1)) - 1
+    } else {
+        (1u128 << bits) - 1
+    };
+    (v > max).then(|| format!("literal `{v}` does not fit in `{}`", ty_label(target)))
+}
+
+/// A plain (decimal or hex) integer literal's value, or `None` for non-number literals,
+/// scientific notation / fractions / units, or values exceeding `u128`.
+fn literal_u128(value: &solsp_syntax::SyntaxNode) -> Option<u128> {
+    use solsp_syntax::SyntaxKind::{LITERAL_EXPR, NUMBER};
+    if value.kind() != LITERAL_EXPR {
+        return None;
+    }
+    let tok = value
+        .children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == NUMBER)?;
+    let text = tok.text().replace('_', "");
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u128::from_str_radix(hex, 16).ok()
+    } else if text.contains(['.', 'e', 'E']) {
+        None // scientific / fractional — skip
+    } else {
+        text.parse::<u128>().ok()
+    }
 }
 
 /// Type-check `return expr;` against the enclosing function's single declared return type,
@@ -1881,6 +1928,10 @@ fn return_type_diagnostics(
             continue;
         };
         let target = typecheck::parse_ty(&ty);
+        if let Some(msg) = literal_range_error(&value, &target) {
+            out.push(type_mismatch(li, &value, &msg));
+            continue;
+        }
         let value_ty = infer_arg_ty(state, uri, root, &value);
         if matches!(target, typecheck::Ty::Unknown) || matches!(value_ty, typecheck::Ty::Unknown) {
             continue;
