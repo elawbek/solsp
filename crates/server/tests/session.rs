@@ -3010,6 +3010,41 @@ fn unreachable_code_is_diagnosed() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn state_write_in_view_is_diagnosed() {
+    let uri = Url::parse("file:///mut.sol").unwrap();
+    // writing the state variable `x` in a `view` function is an error; the non-view write
+    // and the local write are fine.
+    let src = "contract C { uint256 x; \
+               function bad() public view { x = 1; } \
+               function ok() public { x = 1; } \
+               function ok2() public view returns (uint256) { uint256 y = x; return y; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let errs: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("write to state"))
+        .collect();
+    assert_eq!(errs.len(), 1, "{:?}", diags.diagnostics);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]

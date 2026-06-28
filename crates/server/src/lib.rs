@@ -2147,6 +2147,59 @@ fn binary_op_diagnostics(
     out
 }
 
+/// Flag a state-variable write inside a `view` or `pure` function (which may not modify
+/// state). The write target's base must name a state variable.
+fn mutability_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::{ASSIGN_EXPR, FUNCTION_DEF, NAME_REF, PURE_KW, VIEW_KW};
+    let mut out = Vec::new();
+    for asn in root.descendants().filter(|n| n.kind() == ASSIGN_EXPR) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        // inside a view/pure function?
+        let Some(func) = asn.ancestors().find(|n| n.kind() == FUNCTION_DEF) else {
+            continue;
+        };
+        let read_only = func
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| matches!(t.kind(), VIEW_KW | PURE_KW));
+        if !read_only {
+            continue;
+        }
+        // the write target's base identifier.
+        let Some(lhs) = asn.first_child() else {
+            continue;
+        };
+        let base = if lhs.kind() == NAME_REF {
+            lhs.clone()
+        } else {
+            let Some(b) = lhs.descendants().find(|n| n.kind() == NAME_REF) else {
+                continue;
+            };
+            b
+        };
+        // a write whose base is a state variable mutates storage.
+        if let Some(def) = resolve_receiver_def(state, uri, root, &base) {
+            if def.kind == DefKind::StateVariable {
+                out.push(type_mismatch(
+                    li,
+                    &lhs,
+                    "cannot write to state in a `view`/`pure` function",
+                ));
+            }
+        }
+    }
+    out
+}
+
 /// Flag statements that follow a `return` / `revert` / `break` / `continue` in the same
 /// block — they can never run.
 fn unreachable_diagnostics(
@@ -3497,6 +3550,7 @@ fn publish_diagnostics(
                 diags.extend(binary_op_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(comparison_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(unreachable_diagnostics(&root, li, deadline));
+                diags.extend(mutability_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }
