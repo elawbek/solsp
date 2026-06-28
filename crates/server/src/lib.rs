@@ -7,7 +7,7 @@ use anyhow::Result;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _, PublishDiagnostics,
+    Notification as _,
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
@@ -16,13 +16,14 @@ use lsp_types::request::{
 use lsp_types::{
     CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, DocumentSymbolParams,
     DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    Location, ParameterInformation, ParameterLabel, PublishDiagnosticsParams, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelp, SignatureHelpParams, SignatureInformation, Url,
+    Location, ParameterInformation, ParameterLabel, SemanticTokensParams, SemanticTokensResult,
+    SignatureHelp, SignatureHelpParams, SignatureInformation, Url,
 };
 
 mod builtins;
 mod capabilities;
 mod completion_items;
+mod diagnostics;
 mod protocol;
 pub mod state;
 pub mod to_proto;
@@ -35,6 +36,7 @@ use builtins::{
     synthetic_members,
 };
 use completion_items::completion_items_from;
+use diagnostics::{publish_diagnostics, send_diagnostics};
 use protocol::{apply_change, extract_err_response, extract_notification, markup_hover};
 use state::ServerState;
 
@@ -3257,62 +3259,5 @@ fn handle_notification(
         }
         _ => {}
     }
-    Ok(())
-}
-
-/// Compute and publish diagnostics for a document (empty list if missing). The semantic
-/// type-check (slow, cross-file) runs only when `semantic` is set — on open/save and the
-/// background sweep, not on every keystroke. `budget` bounds the type-check for the
-/// background sweep; an open/save pass passes `None` and runs to completion.
-fn publish_diagnostics(
-    connection: &Connection,
-    state: &ServerState,
-    uri: &Url,
-    semantic: bool,
-    budget: Option<std::time::Duration>,
-) -> Result<()> {
-    let diagnostics = match (state.file(uri), state.line_index(uri)) {
-        (Some(file), Some(li)) => {
-            let parse = solsp_base_db::parse(state.db(), file);
-            let mut diags =
-                to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
-            // semantic checks only on a syntactically clean file (a broken tree mid-edit is
-            // noise). A shared deadline bounds the whole semantic pass on the background
-            // sweep; an open/save pass passes `None` and runs to completion.
-            if semantic && parse.errors().is_empty() {
-                let deadline = budget.map(|b| std::time::Instant::now() + b);
-                let root = parse.syntax();
-                diags.extend(undefined_name_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(type_check_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(assignment_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(return_type_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(cast_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(binary_op_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(comparison_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(unreachable_diagnostics(&root, li, deadline));
-                diags.extend(mutability_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(unused_import_diagnostics(&root, li, deadline));
-                diags.extend(unused_local_diagnostics(&root, li, deadline));
-            }
-            diags
-        }
-        _ => Vec::new(),
-    };
-    send_diagnostics(connection, uri.clone(), diagnostics)
-}
-
-/// Send a `textDocument/publishDiagnostics` notification.
-fn send_diagnostics(
-    connection: &Connection,
-    uri: Url,
-    diagnostics: Vec<lsp_types::Diagnostic>,
-) -> Result<()> {
-    let params = PublishDiagnosticsParams {
-        uri,
-        diagnostics,
-        version: None,
-    };
-    let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
-    connection.sender.send(Message::Notification(not))?;
     Ok(())
 }
