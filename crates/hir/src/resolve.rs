@@ -735,6 +735,11 @@ fn find_local(block: &SyntaxNode, name: &str) -> Option<Definition> {
 
 /// Build a [`Definition`] for a top-level/member declaration node, or `None` if it is
 /// not a named declaration we resolve.
+/// The [`Definition`] a declaration node represents (`None` if it is not a declaration).
+pub fn definition(node: &SyntaxNode) -> Option<Definition> {
+    def_for_decl(node)
+}
+
 fn def_for_decl(node: &SyntaxNode) -> Option<Definition> {
     use SyntaxKind::*;
     let kind = match node.kind() {

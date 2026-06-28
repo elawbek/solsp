@@ -241,6 +241,17 @@ fn goto_definition(
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
+    // 0. an overloaded call where argument *types* (not just count) pick the overload —
+    //    must run before same-file arity-only resolution, which would pick the wrong one.
+    if let Some((turi, def)) = typed_overload_target(state, &uri, &root, offset) {
+        let troot = parse_root(state, &turi)?;
+        let tli = state.line_index(&turi)?;
+        let range = to_proto::range(tli, def_name_range(&troot, &def));
+        return Some(GotoDefinitionResponse::Scalar(Location {
+            uri: turi,
+            range,
+        }));
+    }
     // 1. same-file resolution.
     if let Some(target) = solsp_ide::navigation::goto_definition(&root, offset) {
         let range = to_proto::range(li, target);
@@ -301,6 +312,14 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     // 0. a named-argument key (`f({ owner_: … })`) → its parameter/field type.
     if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
         return Some(h);
+    }
+    // 0b. an overloaded call resolved by argument types → the matching overload.
+    if let Some((turi, def)) = typed_overload_target(state, &uri, &root, offset) {
+        let troot = parse_root(state, &turi)?;
+        return Some(markup_hover(
+            solsp_ide::navigation::hover_text(&troot, &def),
+            None,
+        ));
     }
     // 1. same-file hover.
     if let Some(info) = solsp_ide::navigation::hover(&root, offset) {
@@ -1809,6 +1828,63 @@ fn return_type_diagnostics(
         }
     }
     out
+}
+
+/// When the cursor is on the callee of an overloaded call, pick the overload by argument
+/// types (not just count) — returns the matching overload only when exactly one accepts the
+/// arguments, so ambiguous/un-inferrable cases fall back to the default arity resolution.
+fn typed_overload_target(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAME_REF};
+    let nr = root
+        .token_at_offset(offset)
+        .find_map(|t| t.parent_ancestors().find(|n| n.kind() == NAME_REF))?;
+    let call = nr.ancestors().find(|n| n.kind() == CALL_EXPR)?;
+    let callee = call.first_child()?;
+    // the cursor must be on the callee, not inside an argument.
+    if !callee.text_range().contains(offset) {
+        return None;
+    }
+    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    if def.kind != DefKind::Function {
+        return None;
+    }
+    let droot = parse_root(state, &def_uri)?;
+    let def_node = def.full_ptr.to_node(&droot);
+    let name = callee_display_name(&callee)?;
+    let candidates = signature_candidates(&def, &def_node, &name, &droot);
+    if candidates.len() < 2 {
+        return None; // not overloaded — nothing to disambiguate
+    }
+    let args: Vec<_> = call
+        .children()
+        .find(|n| n.kind() == ARG_LIST)?
+        .children()
+        .collect();
+    let arg_tys: Vec<typecheck::Ty> = args
+        .iter()
+        .map(|a| infer_arg_ty(state, uri, root, a))
+        .collect();
+    let is_base = |a: &str, b: &str| is_subtype(state, uri, root, a, b);
+    let accepts = |node: &solsp_syntax::SyntaxNode| {
+        let params = named_arg_fields(DefKind::Function, node);
+        params.len() == args.len()
+            && params.iter().zip(&arg_tys).all(|((_, p), a)| {
+                typecheck::implicitly_convertible(a, &typecheck::parse_ty(p), &is_base)
+            })
+    };
+    let mut matches = candidates.iter().filter(|(_, node)| accepts(node));
+    let (_, node) = matches.next()?;
+    if matches.next().is_some() {
+        return None; // ambiguous (e.g. un-inferrable args accept several) — fall back
+    }
+    let def = solsp_hir::resolve::definition(node)?;
+    Some((def_uri, def))
 }
 
 /// Flag invalid explicit casts to address: `address(X)` / `payable(X)` where `X` names a

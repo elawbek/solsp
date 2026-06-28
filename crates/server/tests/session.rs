@@ -2719,6 +2719,64 @@ fn invalid_address_cast_of_function_is_diagnosed() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn goto_def_picks_overload_by_argument_types() {
+    let uri = Url::parse("file:///ov.sol").unwrap();
+    // two same-arity overloads; the call's `bytes32` arguments must select the bytes32 one,
+    // not the first-declared uint256 one.
+    let src = "contract C { \
+               function eq(uint256 a, uint256 b) internal pure {} \
+               function eq(bytes32 a, bytes32 b) internal pure {} \
+               function f(bytes32 x, bytes32 y) internal pure { eq(x, y); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    // go-to-def on the `eq` callee inside `f`.
+    let call_pos = src.rfind("eq(x, y)").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: call_pos,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp: GotoDefinitionResponse =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = resp else {
+        panic!("expected a scalar location")
+    };
+    // the resolved name sits on the bytes32 overload, after the uint256 one.
+    let target = loc.range.start.character as usize;
+    assert!(
+        src[target..].starts_with("eq") && src[..target].contains("uint256 a, uint256 b"),
+        "resolved to offset {target}, expected the bytes32 overload"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
