@@ -2323,34 +2323,60 @@ fn resolve_type_by_name(
     type_name: &str,
     context: Option<&solsp_syntax::SyntaxNode>,
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
+    // resolving a type name cross-file is hot and repeats across a file's many uses of the
+    // same type, so memoize it keyed by (file, name, enclosing contract).
+    let key = (
+        uri.to_string(),
+        type_name.to_string(),
+        context.and_then(enclosing_contract).map(|c| c.text_range()),
+    );
+    let resolved = match state.cached_type(&key) {
+        Some(hit) => hit,
+        None => {
+            let r = resolve_type_def_by_name(state, uri, root, type_name, context);
+            state.cache_type(key, r.clone());
+            r
+        }
+    };
+    let (turi, def) = resolved?;
+    let troot = parse_root(state, &turi)?;
+    Some((turi, def.full_ptr.to_node(&troot)))
+}
+
+/// The uncached resolution behind [`resolve_type_by_name`], returning the definition (the
+/// node is rebuilt by the caller from the cache).
+fn resolve_type_def_by_name(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    type_name: &str,
+    context: Option<&solsp_syntax::SyntaxNode>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
     // 1. a contract-nested type visible where the name is used (its enclosing contract +
     //    cross-file bases) — these shadow file scope.
     if let Some(contract) = context.and_then(enclosing_contract) {
         if let Some(def) = member_lookup(state, uri, &contract, type_name, None) {
             if is_type_kind(def.kind) {
-                return Some((uri.clone(), def.full_ptr.to_node(root)));
+                return Some((uri.clone(), def));
             }
         }
         if let Some((turi, def)) = inherited_member(state, uri, root, &contract, type_name, None) {
             if is_type_kind(def.kind) {
-                let troot = parse_root(state, &turi)?;
-                return Some((turi, def.full_ptr.to_node(&troot)));
+                return Some((turi, def));
             }
         }
     }
-    // 2. a top-level type in this file.
-    if let Some(def) = solsp_hir::resolve::top_level_definition(root, type_name, None) {
-        if is_type_kind(def.kind) {
-            return Some((uri.clone(), def.full_ptr.to_node(root)));
+    // 2. a top-level type in this file (via the cached file index).
+    if let Some(index) = state.file_index(uri) {
+        if let Some(def) = solsp_hir::resolve::select_named(&index.defs, type_name, None, root) {
+            if is_type_kind(def.kind) {
+                return Some((uri.clone(), def));
+            }
         }
     }
     // 3. an imported type.
     let (turi, def) = cross_file_definition(state, uri, root, type_name, None)?;
-    if is_type_kind(def.kind) {
-        let troot = parse_root(state, &turi)?;
-        return Some((turi, def.full_ptr.to_node(&troot)));
-    }
-    None
+    is_type_kind(def.kind).then_some((turi, def))
 }
 
 fn is_type_kind(kind: solsp_hir::resolve::DefKind) -> bool {

@@ -50,12 +50,21 @@ pub struct ServerState {
     /// byte range within its file. Dropped per-file on `set`. `member_in_type` otherwise
     /// re-walks the whole type on every `obj.member` access.
     member_cache: RefCell<MemberCache>,
+    /// Resolved type names. Cleared wholesale on any `set` (an entry may point into the
+    /// edited file from any querying file), so it acts within an edit epoch.
+    type_cache: RefCell<TypeCache>,
 }
 
 /// A contract's cached member list (own body + same-file C3 bases, in lookup order).
 type MemberDefs = Rc<Vec<Definition>>;
 /// Per-file, per-contract (by byte range) member lists.
 type MemberCache = HashMap<String, HashMap<rowan::TextRange, MemberDefs>>;
+
+/// Key for a resolved type name: the querying file, the name, and the enclosing contract
+/// (by range) of the use site — the only context that changes how a name resolves.
+pub type TypeKey = (String, String, Option<rowan::TextRange>);
+/// A resolved type name → the file it lives in and its definition (`None` = unresolved).
+type TypeCache = HashMap<TypeKey, Option<(Url, Definition)>>;
 
 impl ServerState {
     /// Open or replace a document with `text`: update its salsa input (reusing the
@@ -64,9 +73,11 @@ impl ServerState {
     pub fn set(&mut self, uri: &Url, text: String) {
         let key = uri.to_string();
         let line_index = LineIndex::new(&text);
-        // the file's tree changes → its cached indexes are stale.
+        // the file's tree changes → its cached indexes are stale, and any resolved type
+        // pointing into it (from anywhere) too.
         self.index_cache.borrow_mut().remove(&key);
         self.member_cache.borrow_mut().remove(&key);
+        self.type_cache.borrow_mut().clear();
         if let Some(file) = self.files.get(&key).map(|e| e.file) {
             file.set_text(&mut self.db).to(text);
             self.files.insert(key, FileEntry { file, line_index });
@@ -98,6 +109,17 @@ impl ServerState {
         });
         self.index_cache.borrow_mut().insert(key, idx.clone());
         Some(idx)
+    }
+
+    /// A resolved type-name lookup from the cache: outer `Option` = cache hit, inner =
+    /// the resolution (`None` = resolved-to-nothing, cached too).
+    pub fn cached_type(&self, key: &TypeKey) -> Option<Option<(Url, Definition)>> {
+        self.type_cache.borrow().get(key).cloned()
+    }
+
+    /// Record a resolved type-name lookup.
+    pub fn cache_type(&self, key: TypeKey, value: Option<(Url, Definition)>) {
+        self.type_cache.borrow_mut().insert(key, value);
     }
 
     /// The cached member list of a contract `type_def` living in file `uri` (own body +
