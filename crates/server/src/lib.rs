@@ -2096,6 +2096,62 @@ fn binary_op_diagnostics(
     out
 }
 
+/// Flag a comparison (`< > <= >= == !=`) between incompatible operand types — e.g.
+/// `address < uint`. Only fires when both operands are concrete, non-literal, and neither
+/// is convertible to the other (literals and un-inferrable operands are left alone).
+fn comparison_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{BIN_EXPR, EQ2, GT, GT_EQ, LT, LT_EQ, NEQ};
+    let mut out = Vec::new();
+    for bin in root.descendants().filter(|n| n.kind() == BIN_EXPR) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let is_cmp = bin
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| matches!(t.kind(), LT | GT | LT_EQ | GT_EQ | EQ2 | NEQ));
+        if !is_cmp {
+            continue;
+        }
+        let operands: Vec<_> = bin.children().collect();
+        let [lhs, rhs] = operands.as_slice() else {
+            continue;
+        };
+        let lt = infer_arg_ty(state, uri, root, lhs);
+        let rt = infer_arg_ty(state, uri, root, rhs);
+        // skip literals (flexible) and anything un-inferrable.
+        if is_flexible_ty(&lt) || is_flexible_ty(&rt) {
+            continue;
+        }
+        if !types_compatible(state, uri, root, &lt, &rt)
+            && !types_compatible(state, uri, root, &rt, &lt)
+        {
+            out.push(type_mismatch(
+                li,
+                &bin,
+                &format!("cannot compare `{}` and `{}`", ty_label(&lt), ty_label(&rt),),
+            ));
+        }
+    }
+    out
+}
+
+/// A type too flexible / unknown to drive a comparison-compatibility check: a literal or
+/// an un-inferrable value.
+fn is_flexible_ty(ty: &typecheck::Ty) -> bool {
+    use typecheck::Ty::*;
+    matches!(
+        ty,
+        Unknown | NumberLiteral | HexLiteral | StringLiteral | BoolLiteral
+    )
+}
+
 /// A type that supports no arithmetic / bitwise / shift operator (so using it as such an
 /// operand is an error). Integers, literals, `bytesN`, and `Unknown` are left alone.
 fn is_non_arithmetic_type(ty: &typecheck::Ty) -> bool {
@@ -3359,6 +3415,7 @@ fn publish_diagnostics(
                 diags.extend(return_type_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(cast_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(binary_op_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(comparison_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }
