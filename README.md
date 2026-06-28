@@ -20,6 +20,16 @@ editors/
   vscode/   solsp-vscode  — VS Code client that launches solsp-server
 ```
 
+`crates/server` is split into small protocol/feature helpers around the main LSP
+loop:
+
+- `capabilities`, `protocol`, `to_proto` — LSP wire-level helpers
+- `state` — tracked document store, salsa database, import loading
+- `builtins`, `completion_items`, `named_args`, `using_for`, `import_surface` —
+  completion/navigation support code
+- `diagnostics`, `typecheck`, `syntax_utils` — diagnostics plumbing and shared
+  semantic helpers
+
 ## Status
 
 Prototype language server with:
@@ -40,4 +50,13 @@ are generally skipped rather than reported, to avoid noisy false positives.
 ```sh
 cargo build            # builds the workspace (syntax, ide, server)
 cargo test             # parser snapshots, ide unit tests, server integration
+```
+
+## Development checks
+
+```sh
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+npm run compile --prefix editors/vscode
 ```
