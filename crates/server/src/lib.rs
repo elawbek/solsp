@@ -8,8 +8,8 @@ use lsp_server::{
     Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
 };
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, Notification as _,
-    PublishDiagnostics,
+    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
+    Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
@@ -38,8 +38,15 @@ use state::ServerState;
 /// and semantic tokens (full-document) with our legend.
 pub fn server_capabilities() -> ServerCapabilities {
     ServerCapabilities {
-        text_document_sync: Some(TextDocumentSyncCapability::Kind(
-            TextDocumentSyncKind::INCREMENTAL,
+        // incremental sync, plus save notifications so the semantic type-check can run on
+        // save (it is too slow to run on every keystroke).
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            lsp_types::TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save: Some(lsp_types::TextDocumentSyncSaveOptions::Supported(true)),
+                ..Default::default()
+            },
         )),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
@@ -1507,6 +1514,13 @@ fn def_detail(k: solsp_hir::resolve::DefKind) -> &'static str {
     }
 }
 
+/// Latency cap for one type-check pass; calls past it are left unchecked rather than
+/// blocking the main loop on slow cross-file resolution.
+const TYPE_CHECK_BUDGET_MS: u64 = 750;
+
+/// A callable's overloads, each as its parameter `(name, type)` list.
+type Overloads = Vec<Vec<(String, String)>>;
+
 /// Type-check the positional call arguments in `root`: an argument whose inferred type is
 /// not implicitly convertible to the parameter type yields a diagnostic. Conservative —
 /// anything un-inferrable is left alone (see [`crate::typecheck`]).
@@ -1516,10 +1530,24 @@ fn type_check_diagnostics(
     root: &solsp_syntax::SyntaxNode,
     li: &solsp_ide::LineIndex,
 ) -> Vec<lsp_types::Diagnostic> {
-    use solsp_hir::resolve::DefKind;
     use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAMED_ARG_LIST};
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    use std::time::Instant;
     let mut out = Vec::new();
+    // per-run caches: the same callee text resolves to the same overloads, and the same
+    // (subtype, base) pair has a stable answer. Without this, a big forge-std-heavy test
+    // file re-walked huge cheatcode files once per call and took tens of seconds.
+    let mut callee_cache: HashMap<String, Option<Overloads>> = HashMap::new();
+    let subtype_memo: RefCell<HashMap<(String, String), bool>> = RefCell::new(HashMap::new());
+    // a hard latency cap: cross-file resolution of dependency-heavy files (forge-std) can
+    // be slow, and this runs on the main loop — better to check fewer calls than to block.
+    let deadline = Instant::now() + std::time::Duration::from_millis(TYPE_CHECK_BUDGET_MS);
+
     for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
+        if Instant::now() >= deadline {
+            break;
+        }
         // the arguments: positional (`key = None`) or named (`key = Some`).
         let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
             if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {
@@ -1532,28 +1560,21 @@ fn type_check_diagnostics(
         let Some(callee) = call.first_child() else {
             continue;
         };
-        // resolve to a callable declaration; skip casts/types/builtins/unresolved.
-        let Some((def_uri, def)) = resolve_named_callee(state, uri, root, &callee) else {
-            continue;
-        };
-        if !matches!(
-            def.kind,
-            DefKind::Function | DefKind::Event | DefKind::Error
-        ) {
-            continue;
+        // every overload's parameter list, resolved once per distinct callee text.
+        let key = callee.text().to_string();
+        if !callee_cache.contains_key(&key) {
+            let v = resolve_callee_overloads(state, uri, root, &callee);
+            callee_cache.insert(key.clone(), v);
         }
-        let Some(droot) = parse_root(state, &def_uri) else {
+        let Some(all_overloads) = callee_cache.get(&key).and_then(|v| v.as_ref()) else {
             continue;
         };
-        let def_node = def.full_ptr.to_node(&droot);
-        let name = callee_display_name(&callee).unwrap_or_default();
-        // every overload whose parameter count matches the call.
-        let overloads: Vec<Vec<(String, String)>> =
-            signature_candidates(&def, &def_node, &name, &droot)
-                .into_iter()
-                .map(|(_, n)| named_arg_fields(DefKind::Function, &n))
-                .filter(|params| params.len() == args.len())
-                .collect();
+        // those of the matching arity (a small set; cloning keeps the rest simple).
+        let overloads: Vec<Vec<(String, String)>> = all_overloads
+            .iter()
+            .filter(|params| params.len() == args.len())
+            .cloned()
+            .collect();
         if overloads.is_empty() {
             continue; // no overload of this arity — an arity issue, not a type one
         }
@@ -1562,7 +1583,15 @@ fn type_check_diagnostics(
             .iter()
             .map(|(_, v)| infer_arg_ty(state, uri, root, v))
             .collect();
-        let is_base = |a: &str, b: &str| is_subtype(state, uri, root, a, b);
+        let is_base = |a: &str, b: &str| {
+            let k = (a.to_string(), b.to_string());
+            if let Some(&v) = subtype_memo.borrow().get(&k) {
+                return v;
+            }
+            let v = is_subtype(state, uri, root, a, b);
+            subtype_memo.borrow_mut().insert(k, v);
+            v
+        };
         // the parameter type an argument targets — by name for a named arg, else by
         // position. `None` if a named key doesn't match any parameter.
         let param_for = |params: &[(String, String)], i: usize| -> Option<String> {
@@ -1612,6 +1641,7 @@ fn type_check_diagnostics(
             }
         } else {
             // overloaded and none matched → one diagnostic on the call.
+            let name = callee_display_name(&callee).unwrap_or_default();
             let span = call
                 .children()
                 .find(|n| matches!(n.kind(), ARG_LIST | NAMED_ARG_LIST));
@@ -1623,6 +1653,33 @@ fn type_check_diagnostics(
         }
     }
     out
+}
+
+/// Every overload's parameter list (`(name, type)` pairs) for a call's callee, resolved
+/// once per distinct callee. `None` for casts/types/builtins/unresolved/non-callables.
+fn resolve_callee_overloads(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    callee: &solsp_syntax::SyntaxNode,
+) -> Option<Overloads> {
+    use solsp_hir::resolve::DefKind;
+    let (def_uri, def) = resolve_named_callee(state, uri, root, callee)?;
+    if !matches!(
+        def.kind,
+        DefKind::Function | DefKind::Event | DefKind::Error
+    ) {
+        return None;
+    }
+    let droot = parse_root(state, &def_uri)?;
+    let def_node = def.full_ptr.to_node(&droot);
+    let name = callee_display_name(callee)?;
+    Some(
+        signature_candidates(&def, &def_node, &name, &droot)
+            .into_iter()
+            .map(|(_, n)| named_arg_fields(DefKind::Function, &n))
+            .collect(),
+    )
 }
 
 /// The `(key, value)` pairs of a `NAMED_ARG_LIST` (`{ a: x, b: y }`).
@@ -2381,7 +2438,7 @@ fn handle_notification(
             let uri = params.text_document.uri;
             state.set(&uri, params.text_document.text);
             state.load_import_graph(&uri); // pull imported files into the db
-            publish_diagnostics(connection, state, &uri)?;
+            publish_diagnostics(connection, state, &uri, true)?;
         }
         DidChangeTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidChangeTextDocument>(not) else {
@@ -2399,7 +2456,14 @@ fn handle_notification(
             }
             state.set(&uri, text);
             state.load_import_graph(&uri); // imports may have changed
-            publish_diagnostics(connection, state, &uri)?;
+                                           // syntax-only while typing; the slow semantic pass runs on open/save.
+            publish_diagnostics(connection, state, &uri, false)?;
+        }
+        DidSaveTextDocument::METHOD => {
+            let Some(params) = extract_notification::<DidSaveTextDocument>(not) else {
+                return Ok(());
+            };
+            publish_diagnostics(connection, state, &params.text_document.uri, true)?;
         }
         DidCloseTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidCloseTextDocument>(not) else {
@@ -2457,16 +2521,22 @@ where
     }
 }
 
-/// Compute and publish diagnostics for an open document (empty list if missing).
-fn publish_diagnostics(connection: &Connection, state: &ServerState, uri: &Url) -> Result<()> {
+/// Compute and publish diagnostics for an open document (empty list if missing). The
+/// semantic type-check (slow, cross-file) runs only when `semantic` is set — on open/save,
+/// not on every keystroke — so typing stays responsive.
+fn publish_diagnostics(
+    connection: &Connection,
+    state: &ServerState,
+    uri: &Url,
+    semantic: bool,
+) -> Result<()> {
     let diagnostics = match (state.file(uri), state.line_index(uri)) {
         (Some(file), Some(li)) => {
             let parse = solsp_base_db::parse(state.db(), file);
             let mut diags =
                 to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
-            // semantic checks only on a syntactically clean file (a broken tree mid-edit
-            // would produce noise).
-            if parse.errors().is_empty() {
+            // type-check only a syntactically clean file (a broken tree mid-edit is noise).
+            if semantic && parse.errors().is_empty() {
                 diags.extend(type_check_diagnostics(state, uri, &parse.syntax(), li));
             }
             diags

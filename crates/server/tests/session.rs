@@ -221,10 +221,11 @@ fn incremental_edit_updates_diagnostics() {
 
     send_request(&client, 1, "initialize", InitializeParams::default());
     let resp = next_response(&client);
-    // server advertises INCREMENTAL sync
+    // server advertises INCREMENTAL sync plus save notifications
     let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     let sync = serde_json::to_value(init.capabilities.text_document_sync.unwrap()).unwrap();
-    assert_eq!(sync, serde_json::json!(2)); // TextDocumentSyncKind::INCREMENTAL
+    assert_eq!(sync["change"], serde_json::json!(2)); // TextDocumentSyncKind::INCREMENTAL
+    assert_eq!(sync["save"], serde_json::json!(true));
     send_notification(&client, "initialized", lsp_types::InitializedParams {});
 
     let uri = Url::parse("file:///C.sol").unwrap();
