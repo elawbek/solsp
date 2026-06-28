@@ -2,7 +2,7 @@
 
 use lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
 
-use super::trigger_signature_help;
+use crate::protocol::trigger_signature_help;
 
 /// Build completion items from definitions, keeping the first of each name (inner scopes
 /// come first, so a local shadows an inherited member of the same name).

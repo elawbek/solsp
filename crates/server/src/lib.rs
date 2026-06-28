@@ -14,11 +14,10 @@ use lsp_types::request::{
     SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverParams, Location, ParameterInformation, ParameterLabel, PublishDiagnosticsParams,
-    SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    SignatureInformation, Url,
+    CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    Location, ParameterInformation, ParameterLabel, PublishDiagnosticsParams, SemanticTokensParams,
+    SemanticTokensResult, SignatureHelp, SignatureHelpParams, SignatureInformation, Url,
 };
 
 mod builtins;
@@ -1373,17 +1372,6 @@ fn collect_inherited_members(
         }
     }
     out
-}
-
-/// A client command that re-opens signature help after a callable snippet is inserted. The
-/// snippet writes the `(` itself, so the `(` signature-help trigger character never fires;
-/// this nudges the client to request signature help with the cursor sitting inside the parens.
-fn trigger_signature_help() -> Command {
-    Command {
-        title: "Signature help".to_string(),
-        command: "editor.action.triggerParameterHints".to_string(),
-        arguments: None,
-    }
 }
 
 /// Flag identifiers used as values that resolve to no declaration anywhere — typo'd or

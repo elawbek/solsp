@@ -2,7 +2,7 @@
 
 use lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
 
-use super::trigger_signature_help;
+use crate::protocol::trigger_signature_help;
 
 /// Build completion items from `(name, detail, is_method)` triples — synthetic builtin
 /// members. Methods insert call parens.

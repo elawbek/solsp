@@ -6,6 +6,17 @@ use solsp_ide::LineIndex;
 
 use crate::to_proto;
 
+/// A client command that re-opens signature help after a callable snippet is inserted. The
+/// snippet writes the `(` itself, so the `(` signature-help trigger character never fires;
+/// this nudges the client to request signature help with the cursor sitting inside the parens.
+pub(crate) fn trigger_signature_help() -> lsp_types::Command {
+    lsp_types::Command {
+        title: "Signature help".to_string(),
+        command: "editor.action.triggerParameterHints".to_string(),
+        arguments: None,
+    }
+}
+
 /// Wrap markdown text (and an optional range) into an LSP `Hover`.
 pub(super) fn markup_hover(value: String, range: Option<lsp_types::Range>) -> Hover {
     Hover {
