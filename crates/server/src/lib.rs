@@ -8,12 +8,12 @@ use lsp_server::{
     Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
 };
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _, PublishDiagnostics,
+    DidChangeConfiguration, DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument,
+    DidSaveTextDocument, Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
-    Request as _, SemanticTokensFullRequest, SignatureHelpRequest,
+    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRefreshRequest,
+    InlayHintRequest, Request as _, SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
     Command, CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams,
@@ -73,6 +73,9 @@ pub fn server_capabilities() -> ServerCapabilities {
         ..Default::default()
     }
 }
+
+/// Monotonic id source for server-initiated requests (e.g. inlay-hint refresh).
+static NEXT_REQUEST_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
@@ -3345,6 +3348,26 @@ fn handle_notification(
                 return Ok(());
             };
             publish_diagnostics(connection, state, &params.text_document.uri, true, None)?;
+        }
+        DidChangeConfiguration::METHOD => {
+            // live settings update (no reload). The client sends `{ inlayHints: "<mode>" }`.
+            let Some(params) = extract_notification::<DidChangeConfiguration>(not) else {
+                return Ok(());
+            };
+            if let Some(mode) = params.settings.get("inlayHints").and_then(|v| v.as_str()) {
+                state.set_inlay_hints(state::InlayHintMode::parse(mode));
+                // ask the editor to re-query inlay hints so the change shows immediately.
+                let id = lsp_server::RequestId::from(
+                    NEXT_REQUEST_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                );
+                connection
+                    .sender
+                    .send(Message::Request(lsp_server::Request::new(
+                        id,
+                        InlayHintRefreshRequest::METHOD.to_string(),
+                        serde_json::Value::Null,
+                    )))?;
+            }
         }
         DidCloseTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidCloseTextDocument>(not) else {
