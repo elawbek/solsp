@@ -2025,6 +2025,64 @@ fn def_kind_noun(kind: solsp_hir::resolve::DefKind) -> &'static str {
     }
 }
 
+/// Flag arithmetic / bitwise / shift operators applied to a non-numeric operand — e.g.
+/// Utils.sol `… >> address(1)`. Comparisons (`==`, `<`) and logical operators are not
+/// checked (addresses are comparable).
+fn binary_op_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{
+        AMP, BIN_EXPR, CARET, MINUS, PERCENT, PIPE, PLUS, SHL, SHR, SLASH, STAR, STAR2,
+    };
+    let mut out = Vec::new();
+    for bin in root.descendants().filter(|n| n.kind() == BIN_EXPR) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let is_arith = bin
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| {
+                matches!(
+                    t.kind(),
+                    PLUS | MINUS | STAR | SLASH | PERCENT | STAR2 | AMP | PIPE | CARET | SHL | SHR
+                )
+            });
+        if !is_arith {
+            continue; // a comparison / logical operator — not type-restricted here
+        }
+        for operand in bin.children() {
+            let ty = infer_arg_ty(state, uri, root, &operand);
+            if is_non_arithmetic_type(&ty) {
+                out.push(type_mismatch(
+                    li,
+                    &operand,
+                    &format!(
+                        "`{}` of type `{}` cannot be used in an arithmetic or bitwise expression",
+                        arg_text(&operand),
+                        ty_label(&ty),
+                    ),
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// A type that supports no arithmetic / bitwise / shift operator (so using it as such an
+/// operand is an error). Integers, literals, `bytesN`, and `Unknown` are left alone.
+fn is_non_arithmetic_type(ty: &typecheck::Ty) -> bool {
+    use typecheck::Ty::*;
+    matches!(
+        ty,
+        Address | AddressPayable | Bool | StringT | User(_) | Array(_) | FixedArray(_) | Mapping
+    )
+}
+
 /// Whether a value of type `from` is implicitly convertible to `to`, resolving user-type
 /// inheritance through the caller's file.
 fn types_compatible(
@@ -3274,6 +3332,7 @@ fn publish_diagnostics(
                 diags.extend(assignment_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(return_type_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(cast_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(binary_op_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }
