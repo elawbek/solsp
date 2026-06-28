@@ -1922,7 +1922,19 @@ fn return_type_diagnostics(
             continue; // tuple element types are not checked individually here
         }
         if ret_params.len() != 1 {
-            continue; // a single value for a multi-value return (e.g. a tuple-returning call)
+            // a single value can fill multiple returns only if it is a (tuple-returning)
+            // call; anything else returns one value where several are declared.
+            if value.kind() != solsp_syntax::SyntaxKind::CALL_EXPR {
+                out.push(type_mismatch(
+                    li,
+                    &value,
+                    &format!(
+                        "returns 1 value, but the function declares {}",
+                        ret_params.len(),
+                    ),
+                ));
+            }
+            continue;
         }
         let Some(ty) = type_text(&ret_params[0]) else {
             continue;
@@ -2336,7 +2348,15 @@ fn unreachable_diagnostics(
             continue;
         };
         if let Some(dead) = stmts.get(term + 1) {
-            out.push(type_mismatch(li, dead, "unreachable code"));
+            // unreachable code is a warning, not an error.
+            out.push(lsp_types::Diagnostic {
+                range: to_proto::range(li, dead.text_range()),
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                source: Some("solsp".to_string()),
+                message: "unreachable code".to_string(),
+                tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+                ..Default::default()
+            });
         }
     }
     out
@@ -2358,43 +2378,60 @@ fn comparison_diagnostics(
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
         }
-        let is_cmp = bin
+        let ordered = bin
             .children_with_tokens()
             .filter_map(|e| e.into_token())
-            .any(|t| matches!(t.kind(), LT | GT | LT_EQ | GT_EQ | EQ2 | NEQ));
-        if !is_cmp {
-            continue;
-        }
+            .find_map(|t| match t.kind() {
+                LT | GT | LT_EQ | GT_EQ => Some(true),
+                EQ2 | NEQ => Some(false),
+                _ => None,
+            });
+        let Some(ordered) = ordered else {
+            continue; // not a comparison operator
+        };
         let operands: Vec<_> = bin.children().collect();
         let [lhs, rhs] = operands.as_slice() else {
             continue;
         };
         let lt = infer_arg_ty(state, uri, root, lhs);
         let rt = infer_arg_ty(state, uri, root, rhs);
-        // skip literals (flexible) and anything un-inferrable.
-        if is_flexible_ty(&lt) || is_flexible_ty(&rt) {
+        // skip only un-inferrable operands; literals are kept — `types_compatible` knows a
+        // number literal pairs with integers but not with `address`/`bool`.
+        if matches!(lt, typecheck::Ty::Unknown) || matches!(rt, typecheck::Ty::Unknown) {
             continue;
         }
+        // cross-type: the operands aren't convertible to a common type (`address < uint`).
         if !types_compatible(state, uri, root, &lt, &rt)
             && !types_compatible(state, uri, root, &rt, &lt)
         {
             out.push(type_mismatch(
                 li,
                 &bin,
-                &format!("cannot compare `{}` and `{}`", ty_label(&lt), ty_label(&rt),),
+                &format!("cannot compare `{}` and `{}`", ty_label(&lt), ty_label(&rt)),
+            ));
+            continue;
+        }
+        // an ordered comparison (`< > <= >=`) needs ordered operands (`bytes`, `bool`,
+        // structs, … support only `==`/`!=`, if anything).
+        if ordered && (!is_ordered_comparable(&lt) || !is_ordered_comparable(&rt)) {
+            let bad = if is_ordered_comparable(&lt) { &rt } else { &lt };
+            out.push(type_mismatch(
+                li,
+                &bin,
+                &format!("`{}` does not support ordered comparison", ty_label(bad)),
             ));
         }
     }
     out
 }
 
-/// A type too flexible / unknown to drive a comparison-compatibility check: a literal or
-/// an un-inferrable value.
-fn is_flexible_ty(ty: &typecheck::Ty) -> bool {
+/// Whether a type supports the ordered comparison operators `< > <= >=` (integers,
+/// `address`, `bytesN`, number literals). `bytes`/`string`/`bool`/user types do not.
+fn is_ordered_comparable(ty: &typecheck::Ty) -> bool {
     use typecheck::Ty::*;
     matches!(
         ty,
-        Unknown | NumberLiteral | HexLiteral | StringLiteral | BoolLiteral
+        Uint(_) | Int(_) | Address | AddressPayable | BytesN(_) | NumberLiteral | HexLiteral
     )
 }
 
