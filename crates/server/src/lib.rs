@@ -1663,6 +1663,59 @@ fn assignment_diagnostics(
     out
 }
 
+/// Type-check `return expr;` against the enclosing function's single declared return type,
+/// flagging an `expr` not implicitly convertible to it. Tuple returns and un-inferrable
+/// expressions are left alone.
+fn return_type_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{FUNCTION_DEF, PARAM, PARAM_LIST, RETURN_STMT};
+    let mut out = Vec::new();
+    for ret in root.descendants().filter(|n| n.kind() == RETURN_STMT) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let Some(value) = ret.children().next() else {
+            continue; // `return;` with no value
+        };
+        let Some(func) = ret.ancestors().find(|n| n.kind() == FUNCTION_DEF) else {
+            continue;
+        };
+        // the second parameter list is `returns (...)`.
+        let Some(returns) = func.children().filter(|n| n.kind() == PARAM_LIST).nth(1) else {
+            continue;
+        };
+        let ret_params: Vec<_> = returns.children().filter(|n| n.kind() == PARAM).collect();
+        if ret_params.len() != 1 {
+            continue; // a tuple return — skip
+        }
+        let Some(ty) = type_text(&ret_params[0]) else {
+            continue;
+        };
+        let target = typecheck::parse_ty(&ty);
+        let value_ty = infer_arg_ty(state, uri, root, &value);
+        if matches!(target, typecheck::Ty::Unknown) || matches!(value_ty, typecheck::Ty::Unknown) {
+            continue;
+        }
+        if !types_compatible(state, uri, root, &value_ty, &target) {
+            out.push(type_mismatch(
+                li,
+                &value,
+                &format!(
+                    "returned value of type `{}` is not implicitly convertible to `{}`",
+                    arg_text(&value),
+                    ty_label(&target),
+                ),
+            ));
+        }
+    }
+    out
+}
+
 /// Whether a value of type `from` is implicitly convertible to `to`, resolving user-type
 /// inheritance through the caller's file.
 fn types_compatible(
@@ -2902,6 +2955,7 @@ fn publish_diagnostics(
                 diags.extend(undefined_name_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(type_check_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(assignment_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(return_type_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }
