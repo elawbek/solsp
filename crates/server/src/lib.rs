@@ -4,9 +4,7 @@
 //! transport (design §5, §6).
 
 use anyhow::Result;
-use lsp_server::{
-    Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
-};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
     Notification as _, PublishDiagnostics,
@@ -18,15 +16,14 @@ use lsp_types::request::{
 use lsp_types::{
     Command, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, InsertTextFormat, Location, MarkupContent, MarkupKind,
-    ParameterInformation, ParameterLabel, PublishDiagnosticsParams, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelp, SignatureHelpParams, SignatureInformation,
-    TextDocumentContentChangeEvent, Url,
+    Hover, HoverParams, InsertTextFormat, Location, ParameterInformation, ParameterLabel,
+    PublishDiagnosticsParams, SemanticTokensParams, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, SignatureInformation, Url,
 };
-use solsp_ide::LineIndex;
 
 mod builtins;
 mod capabilities;
+mod protocol;
 pub mod state;
 pub mod to_proto;
 pub mod typecheck;
@@ -37,6 +34,7 @@ use builtins::{
     builtin_items, builtin_member_items, is_builtin_name, is_fixed_bytes, is_integer_type_name,
     synthetic_members,
 };
+use protocol::{apply_change, extract_err_response, extract_notification, markup_hover};
 use state::ServerState;
 
 /// Run the main loop until the client shuts the connection down. Assumes the
@@ -3285,17 +3283,6 @@ fn def_name_range(
         .unwrap_or_else(|| name_node.text_range())
 }
 
-/// Wrap markdown text (and an optional range) into an LSP `Hover`.
-fn markup_hover(value: String, range: Option<lsp_types::Range>) -> Hover {
-    Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value,
-        }),
-        range,
-    }
-}
-
 /// Handle a notification: open/change update the store and republish diagnostics;
 /// close drops the doc and clears its diagnostics. Unknown notifications are ignored.
 fn handle_notification(
@@ -3364,47 +3351,6 @@ fn handle_notification(
     Ok(())
 }
 
-/// Apply one LSP content change to `text`. A change with a `range` splices the
-/// replacement over those bytes (range is in UTF-16 line/col, mapped via a fresh
-/// `LineIndex` over the current text); a change without a range replaces the whole
-/// document. Out-of-range edits are ignored rather than panicking.
-fn apply_change(text: &mut String, change: TextDocumentContentChangeEvent) {
-    let Some(range) = change.range else {
-        *text = change.text;
-        return;
-    };
-    let li = LineIndex::new(text);
-    let (Some(start), Some(end)) = (
-        to_proto::offset(&li, range.start),
-        to_proto::offset(&li, range.end),
-    ) else {
-        return;
-    };
-    let (start, end) = (u32::from(start) as usize, u32::from(end) as usize);
-    if start <= end && end <= text.len() {
-        text.replace_range(start..end, &change.text);
-    }
-}
-
-/// Extract a notification's params, or `None` (logging) on malformed params. Crucial:
-/// a bad notification must NOT abort the main loop — unlike a request, it has no id to
-/// answer, so we skip it rather than propagate the error out of `run`.
-fn extract_notification<N>(not: Notification) -> Option<N::Params>
-where
-    N: lsp_types::notification::Notification,
-{
-    match not.extract::<N::Params>(N::METHOD) {
-        Ok(params) => Some(params),
-        Err(e) => {
-            eprintln!(
-                "solsp: ignoring malformed {} notification: {e:?}",
-                N::METHOD
-            );
-            None
-        }
-    }
-}
-
 /// Compute and publish diagnostics for a document (empty list if missing). The semantic
 /// type-check (slow, cross-file) runs only when `semantic` is set — on open/save and the
 /// background sweep, not on every keystroke. `budget` bounds the type-check for the
@@ -3460,22 +3406,4 @@ fn send_diagnostics(
     let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
     connection.sender.send(Message::Notification(not))?;
     Ok(())
-}
-
-/// Turn an `extract` failure into a JSON-RPC error response under the request's own
-/// id (captured by the caller, since `JsonError` does not carry it).
-fn extract_err_response(id: RequestId, err: ExtractError<Request>) -> Response {
-    let (code, message) = match err {
-        // Unreachable here — the caller already matched the method — but mapped for
-        // completeness.
-        ExtractError::MethodMismatch(req) => (
-            ErrorCode::MethodNotFound,
-            format!("method mismatch: {}", req.method),
-        ),
-        ExtractError::JsonError { method, error } => (
-            ErrorCode::InvalidParams,
-            format!("invalid params for {method}: {error}"),
-        ),
-    };
-    Response::new_err(id, code as i32, message)
 }
