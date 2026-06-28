@@ -1686,7 +1686,7 @@ fn undefined_name_diagnostics(
     li: &solsp_ide::LineIndex,
     deadline: Option<std::time::Instant>,
 ) -> Vec<lsp_types::Diagnostic> {
-    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
+    use solsp_syntax::SyntaxKind::{COLON_EQ, NAME_REF, PATH_EXPR, YUL_ASSIGNMENT, YUL_PATH};
     let mut out = Vec::new();
     for nr in root.descendants().filter(|n| n.kind() == NAME_REF) {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1703,7 +1703,54 @@ fn undefined_name_diagnostics(
             out.push(type_mismatch(li, &nr, &format!("`{name}` is not defined")));
         }
     }
+    // Yul assignment targets (`x := …`): the left side names a variable (a Yul `let` or a
+    // Solidity variable in scope), never a builtin, so an unresolved one is undefined.
+    for asn in root.descendants().filter(|n| n.kind() == YUL_ASSIGNMENT) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let Some(eq) = asn
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .find(|t| t.kind() == COLON_EQ)
+            .map(|t| t.text_range().start())
+        else {
+            continue;
+        };
+        // names declared via `let` anywhere in the enclosing assembly — Yul scoping
+        // (for-init, nested blocks) isn't fully modeled by `resolve`, so trust a `let`.
+        let yul_lets = enclosing_yul_lets(&asn);
+        // each target path before `:=`; its first segment is the variable.
+        for path in asn
+            .children()
+            .filter(|n| n.kind() == YUL_PATH && n.text_range().end() <= eq)
+        {
+            let Some(seg) = path.descendants().find(|n| n.kind() == NAME_REF) else {
+                continue;
+            };
+            let Some(name) = nameref_text(&seg) else {
+                continue;
+            };
+            if !yul_lets.contains(&name) && !name_defined(state, uri, root, &seg, &name) {
+                out.push(type_mismatch(li, &seg, &format!("`{name}` is not defined")));
+            }
+        }
+    }
     out
+}
+
+/// Names declared with `let` anywhere in the assembly block enclosing `node` — used to
+/// avoid false "undefined" on Yul locals whose scoping `resolve` doesn't fully model.
+fn enclosing_yul_lets(node: &solsp_syntax::SyntaxNode) -> std::collections::HashSet<String> {
+    use solsp_syntax::SyntaxKind::{NAME, YUL_BLOCK, YUL_VAR_DECL};
+    let Some(top) = node.ancestors().filter(|n| n.kind() == YUL_BLOCK).last() else {
+        return std::collections::HashSet::new();
+    };
+    top.descendants()
+        .filter(|n| n.kind() == YUL_VAR_DECL)
+        .flat_map(|d| d.children().filter(|c| c.kind() == NAME))
+        .filter_map(|nm| nameref_text(&nm))
+        .collect()
 }
 
 /// Type-check assignments: a simple assignment `lhs = rhs` and a local declaration with an

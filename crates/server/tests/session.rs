@@ -2777,6 +2777,43 @@ fn goto_def_picks_overload_by_argument_types() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn undefined_yul_assignment_target_is_diagnosed() {
+    let uri = Url::parse("file:///yul.sol").unwrap();
+    // `result` is assigned in assembly but the return value is unnamed (no such variable);
+    // the Yul local `m` and the named return in `ok` must not be flagged.
+    let src = "contract C { \
+               function bad(uint256 value) internal pure returns (uint256) { \
+               assembly { result := value let m := value m := add(m, 1) } } \
+               function ok(uint256 v) internal pure returns (uint256 r) { \
+               assembly { r := v } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let undefined: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("not defined"))
+        .collect();
+    assert_eq!(undefined.len(), 1, "{:?}", diags.diagnostics);
+    assert!(undefined[0].message.contains("result"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
