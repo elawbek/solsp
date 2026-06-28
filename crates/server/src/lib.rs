@@ -76,7 +76,20 @@ pub fn server_capabilities() -> ServerCapabilities {
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
 pub fn run(connection: &Connection) -> Result<()> {
+    run_with_root(connection, None)
+}
+
+/// Like [`run`], but first pre-loads every `.sol` file under `workspace_root` so the first
+/// open of any file is already parsed (its imports too). The main binary passes the
+/// editor's workspace root; tests pass `None`.
+pub fn run_with_root(
+    connection: &Connection,
+    workspace_root: Option<std::path::PathBuf>,
+) -> Result<()> {
     let mut state = ServerState::default();
+    if let Some(root) = workspace_root {
+        state.scan_workspace(&root);
+    }
     for msg in &connection.receiver {
         match msg {
             Message::Request(req) => {
