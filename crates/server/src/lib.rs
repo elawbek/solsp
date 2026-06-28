@@ -2258,18 +2258,6 @@ fn type_check_diagnostics(
         let Some(all_overloads) = callee_cache.get(&key).and_then(|v| v.as_ref()) else {
             continue;
         };
-        if all_overloads
-            .iter()
-            .any(|o| o.iter().any(|(n, _)| n == "validAddress"))
-        {
-            let t0 = infer_arg_ty(state, uri, root, &args[0].1);
-            eprintln!(
-                "DBG validAddress callee={:?} arg={:?} ty={:?}",
-                key,
-                args[0].1.text().to_string(),
-                t0
-            );
-        }
         // those of the matching arity (a small set; cloning keeps the rest simple).
         let overloads: Vec<Vec<(String, String)>> = all_overloads
             .iter()
@@ -2277,7 +2265,22 @@ fn type_check_diagnostics(
             .cloned()
             .collect();
         if overloads.is_empty() {
-            continue; // no overload of this arity — an arity issue, not a type one
+            // no overload takes this many arguments — an arity error.
+            let name = callee_display_name(&callee).unwrap_or_default();
+            let counts: Vec<String> = all_overloads.iter().map(|p| p.len().to_string()).collect();
+            let span = call
+                .children()
+                .find(|n| matches!(n.kind(), ARG_LIST | NAMED_ARG_LIST));
+            out.push(type_mismatch(
+                li,
+                span.as_ref().unwrap_or(&call),
+                &format!(
+                    "`{name}` expects {} argument(s), but {} given",
+                    counts.join(" or "),
+                    args.len(),
+                ),
+            ));
+            continue;
         }
         // infer the argument types once; `Unknown` args never contribute a mismatch.
         let arg_tys: Vec<typecheck::Ty> = args
