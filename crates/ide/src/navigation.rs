@@ -102,10 +102,12 @@ fn hover_markdown(root: &SyntaxNode, def: &Definition) -> String {
 /// declaration if it has none), with comments dropped and whitespace collapsed — so a
 /// multi-line function header renders on one line. A trailing `;` is removed.
 fn signature(decl: &SyntaxNode) -> String {
-    use SyntaxKind::{BLOCK, COMMENT, WHITESPACE};
+    use SyntaxKind::{BLOCK, COMMENT, CONTRACT_BODY, WHITESPACE};
+    // stop at the body: a function `BLOCK` or a contract/interface/library `CONTRACT_BODY`
+    // (otherwise a contract-like declaration's whole body is dumped into the hover).
     let end = decl
         .children()
-        .find(|n| n.kind() == BLOCK)
+        .find(|n| matches!(n.kind(), BLOCK | CONTRACT_BODY))
         .map(|b| b.text_range().start())
         .unwrap_or_else(|| decl.text_range().end());
     let mut out = String::new();
@@ -235,6 +237,26 @@ mod tests {
             h.contents
         );
         assert!(!h.contents.contains("return true"), "body must be excluded");
+    }
+
+    #[test]
+    fn hover_on_contract_like_shows_header_not_body() {
+        let src = "interface IFoo is IBar {\n\
+                function a() external;\n\
+                function b() external view returns (uint256);\n\
+            }\n\
+            contract C { IFoo foo; }";
+        let root = parse(src).syntax();
+        let h = hover(&root, at(src, "IFoo foo")).unwrap();
+        assert!(
+            h.contents.contains("interface IFoo is IBar"),
+            "{}",
+            h.contents
+        );
+        assert!(
+            !h.contents.contains("function a()"),
+            "body must be excluded"
+        );
     }
 
     #[test]
