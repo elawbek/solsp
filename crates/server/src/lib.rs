@@ -16,62 +16,28 @@ use lsp_types::request::{
     SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams,
-    CompletionResponse, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InsertTextFormat, Location, MarkupContent, MarkupKind, OneOf, ParameterInformation,
-    ParameterLabel, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SignatureInformation, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    Command, CompletionItem, CompletionItemKind, CompletionParams, CompletionResponse,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverContents, HoverParams, InsertTextFormat, Location, MarkupContent, MarkupKind,
+    ParameterInformation, ParameterLabel, PublishDiagnosticsParams, SemanticTokensParams,
+    SemanticTokensResult, SignatureHelp, SignatureHelpParams, SignatureInformation,
+    TextDocumentContentChangeEvent, Url,
 };
 use solsp_ide::LineIndex;
 
+mod builtins;
+mod capabilities;
 pub mod state;
 pub mod to_proto;
 pub mod typecheck;
 
-use state::ServerState;
+pub use capabilities::server_capabilities;
 
-/// What the server advertises at `initialize`: full-text sync, an outline provider,
-/// and semantic tokens (full-document) with our legend.
-pub fn server_capabilities() -> ServerCapabilities {
-    ServerCapabilities {
-        // incremental sync, plus save notifications so the semantic type-check can run on
-        // save (it is too slow to run on every keystroke).
-        text_document_sync: Some(TextDocumentSyncCapability::Options(
-            lsp_types::TextDocumentSyncOptions {
-                open_close: Some(true),
-                change: Some(TextDocumentSyncKind::INCREMENTAL),
-                save: Some(lsp_types::TextDocumentSyncSaveOptions::Supported(true)),
-                ..Default::default()
-            },
-        )),
-        document_symbol_provider: Some(OneOf::Left(true)),
-        definition_provider: Some(OneOf::Left(true)),
-        hover_provider: Some(HoverProviderCapability::Simple(true)),
-        completion_provider: Some(CompletionOptions {
-            // `.` triggers member completion; bare-identifier completion is implicit.
-            trigger_characters: Some(vec![".".to_string()]),
-            ..Default::default()
-        }),
-        signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-            retrigger_characters: None,
-            work_done_progress_options: WorkDoneProgressOptions::default(),
-        }),
-        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
-            SemanticTokensOptions {
-                work_done_progress_options: WorkDoneProgressOptions::default(),
-                legend: to_proto::legend(),
-                range: None,
-                full: Some(SemanticTokensFullOptions::Bool(true)),
-            },
-        )),
-        ..Default::default()
-    }
-}
+use builtins::{
+    builtin_items, builtin_member_items, is_builtin_name, is_fixed_bytes, is_integer_type_name,
+    synthetic_members,
+};
+use state::ServerState;
 
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
@@ -561,37 +527,6 @@ fn resolve_receiver_def(
     }
 }
 
-/// Build completion items from `(name, detail, is_method)` triples — synthetic builtin
-/// members. Methods insert call parens.
-fn synthetic_members(items: &[(&str, &str, bool)]) -> Vec<CompletionItem> {
-    items
-        .iter()
-        .map(|&(name, detail, method)| {
-            let (insert_text, insert_text_format) = if method {
-                (Some(format!("{name}($0)")), Some(InsertTextFormat::SNIPPET))
-            } else {
-                (None, None)
-            };
-            CompletionItem {
-                kind: Some(if method {
-                    CompletionItemKind::METHOD
-                } else {
-                    CompletionItemKind::FIELD
-                }),
-                detail: Some(if detail.is_empty() {
-                    "builtin".to_string()
-                } else {
-                    detail.to_string()
-                }),
-                insert_text,
-                insert_text_format,
-                label: name.to_string(),
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
 /// Members of `type(X)`: integer `min`/`max`, enum `min`/`max`, or a contract/interface's
 /// `name`/`creationCode`/`runtimeCode`/`interfaceId`. `None` if the receiver isn't `type(X)`.
 fn type_expr_members(
@@ -770,15 +705,6 @@ fn receiver_decl(
     }
 }
 
-fn is_integer_type_name(n: &str) -> bool {
-    let rest = n.strip_prefix("uint").or_else(|| n.strip_prefix("int"));
-    matches!(rest, Some(d) if d.is_empty() || d.parse::<u16>().is_ok())
-}
-
-fn is_fixed_bytes(n: &str) -> bool {
-    matches!(n.strip_prefix("bytes").map(str::parse::<u8>), Some(Ok(w)) if (1..=32).contains(&w))
-}
-
 /// Parse a `USING_DIRECTIVE` into `(library, target)` — `target` is `None` for `for *`.
 /// The `using { f, g } for T` form (no single library) is skipped.
 fn parse_using(node: &solsp_syntax::SyntaxNode) -> Option<(String, Option<String>)> {
@@ -916,46 +842,6 @@ fn is_instance_receiver(
     !resolved.map(|d| is_type_kind(d.kind)).unwrap_or(false)
 }
 
-/// Members of a builtin global object when the receiver is `block`/`tx`/`msg`/`abi`.
-fn builtin_member_items(receiver: &solsp_syntax::SyntaxNode) -> Option<Vec<CompletionItem>> {
-    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
-    if !matches!(receiver.kind(), PATH_EXPR | NAME_REF) {
-        return None; // only a bare global, not a chain/call
-    }
-    let name = solsp_hir::resolve::receiver_name(receiver)?;
-    // `(member, type, is_method)` — real types so hover and completion show them.
-    let members: &[(&str, &str, bool)] = match name.as_str() {
-        "block" => &[
-            ("basefee", "uint256", false),
-            ("blobbasefee", "uint256", false),
-            ("chainid", "uint256", false),
-            ("coinbase", "address payable", false),
-            ("difficulty", "uint256", false),
-            ("gaslimit", "uint256", false),
-            ("number", "uint256", false),
-            ("prevrandao", "uint256", false),
-            ("timestamp", "uint256", false),
-        ],
-        "tx" => &[("gasprice", "uint256", false), ("origin", "address", false)],
-        "msg" => &[
-            ("data", "bytes calldata", false),
-            ("sender", "address", false),
-            ("sig", "bytes4", false),
-            ("value", "uint256", false),
-        ],
-        "abi" => &[
-            ("decode", "", true),
-            ("encode", "bytes memory", true),
-            ("encodeCall", "bytes memory", true),
-            ("encodePacked", "bytes memory", true),
-            ("encodeWithSelector", "bytes memory", true),
-            ("encodeWithSignature", "bytes memory", true),
-        ],
-        _ => return None,
-    };
-    Some(synthetic_members(members))
-}
-
 /// Completion for a bare identifier: every name visible at the cursor — locals, params,
 /// the enclosing contract's members (incl. cross-file inherited), and file top-level.
 fn scope_completion(
@@ -1001,100 +887,6 @@ fn namespace_alias_items(root: &solsp_syntax::SyntaxNode) -> Vec<CompletionItem>
             _ => None,
         })
         .collect()
-}
-
-/// Solidity keywords, elementary types, and global builtins — always available as
-/// bare-identifier completions.
-fn builtin_items() -> Vec<CompletionItem> {
-    use CompletionItemKind as K;
-    const KEYWORDS: &[&str] = &[
-        "if",
-        "else",
-        "for",
-        "while",
-        "do",
-        "return",
-        "break",
-        "continue",
-        "emit",
-        "try",
-        "catch",
-        "new",
-        "delete",
-        "using",
-        "unchecked",
-        "assembly",
-        "is",
-        "virtual",
-        "override",
-        "public",
-        "private",
-        "internal",
-        "external",
-        "view",
-        "pure",
-        "payable",
-        "memory",
-        "storage",
-        "calldata",
-        "constant",
-        "immutable",
-        "returns",
-        "function",
-        "modifier",
-        "struct",
-        "enum",
-        "event",
-        "error",
-        "mapping",
-        "contract",
-        "interface",
-        "library",
-        "import",
-        "pragma",
-        "abstract",
-        "indexed",
-        "anonymous",
-    ];
-    const TYPES: &[&str] = &[
-        "address", "bool", "string", "bytes", "uint", "uint8", "uint16", "uint32", "uint64",
-        "uint128", "uint256", "int", "int128", "int256", "bytes1", "bytes4", "bytes20", "bytes32",
-    ];
-    const GLOBALS: &[&str] = &["msg", "block", "tx", "abi", "this", "super", "type", "now"];
-    const FUNCS: &[&str] = &[
-        "require",
-        "assert",
-        "revert",
-        "keccak256",
-        "sha256",
-        "ripemd160",
-        "ecrecover",
-        "addmod",
-        "mulmod",
-        "selfdestruct",
-        "blockhash",
-        "gasleft",
-    ];
-    let item = |label: &str, kind: CompletionItemKind, detail: &str| CompletionItem {
-        kind: Some(kind),
-        detail: Some(detail.to_string()),
-        label: label.to_string(),
-        ..Default::default()
-    };
-    // a builtin function inserts `name()` with the cursor between the parens, and asks the
-    // client to pop signature help there (the `(` is inserted, not typed, so it triggers nothing).
-    let func = |label: &str| CompletionItem {
-        insert_text: Some(format!("{label}($0)")),
-        insert_text_format: Some(InsertTextFormat::SNIPPET),
-        command: Some(trigger_signature_help()),
-        ..item(label, K::FUNCTION, "builtin")
-    };
-    let mut out = Vec::with_capacity(KEYWORDS.len() + TYPES.len() + GLOBALS.len() + FUNCS.len());
-    out.extend(KEYWORDS.iter().map(|&k| item(k, K::KEYWORD, "keyword")));
-    out.extend(TYPES.iter().map(|&t| item(t, K::TYPE_PARAMETER, "type")));
-    out.extend(GLOBALS.iter().map(|&g| item(g, K::VARIABLE, "builtin")));
-    out.extend(FUNCS.iter().map(|&f| func(f)));
-    out
 }
 
 /// Every symbol the file's imports bring into scope (so `new Roles(` offers `Roles`):
@@ -2508,63 +2300,6 @@ fn name_defined(
         }
     }
     cross_file_definition(state, uri, root, name, None).is_some()
-}
-
-/// Whether `name` is a Solidity builtin usable as a value: a global object, a builtin
-/// function, an elementary type (also a cast callee), `payable`, or a unit literal.
-fn is_builtin_name(name: &str) -> bool {
-    const NAMES: &[&str] = &[
-        // the modifier-body placeholder `_;`
-        "_",
-        // globals
-        "msg",
-        "block",
-        "tx",
-        "abi",
-        "this",
-        "super",
-        "type",
-        "now",
-        "blobhash",
-        // builtin functions
-        "require",
-        "assert",
-        "revert",
-        "keccak256",
-        "sha256",
-        "ripemd160",
-        "ecrecover",
-        "addmod",
-        "mulmod",
-        "selfdestruct",
-        "blockhash",
-        "gasleft",
-        "payable",
-        "sha3",
-        // elementary type names (cast callees)
-        "address",
-        "bool",
-        "string",
-        "bytes",
-        "byte",
-        // unit suffixes (lexed as identifiers after a literal)
-        "wei",
-        "gwei",
-        "ether",
-        "seconds",
-        "minutes",
-        "hours",
-        "days",
-        "weeks",
-        "years",
-        "finney",
-        "szabo",
-    ];
-    NAMES.contains(&name)
-        || is_integer_type_name(name)
-        || is_fixed_bytes(name)
-        || name.starts_with("ufixed")
-        || name.starts_with("fixed")
 }
 
 /// A callable's overloads, each as its parameter `(name, type)` list.

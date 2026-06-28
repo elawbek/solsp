@@ -2,7 +2,8 @@
 
 Language server for Solidity, written from scratch in Rust in the
 rust-analyzer style: a hand-written parser produces a lossless CST (rowan),
-features are pure functions over the tree, and the server speaks LSP over stdio.
+analysis is layered over the tree and a salsa-backed source database, and the
+server speaks LSP over stdio.
 
 Design and roadmap live in `docs/superpowers/specs/` (gitignored — local only).
 
@@ -10,17 +11,29 @@ Design and roadmap live in `docs/superpowers/specs/` (gitignored — local only)
 
 ```
 crates/
-  syntax/   solsp-syntax  — lexer -> parser -> CST (rowan) -> typed AST   (pure)
-  ide/      solsp-ide     — diagnostics, document symbols, semantic tokens
-  server/   solsp-server  — LSP over stdio (the binary)
+  syntax/   solsp-syntax  — lexer -> parser -> CST (rowan) -> typed AST (pure)
+  base-db/  solsp-base-db — salsa inputs and tracked parse query
+  hir/      solsp-hir     — item model, imports, scopes, name resolution
+  ide/      solsp-ide     — diagnostics, document symbols, semantic tokens, navigation
+  server/   solsp-server  — LSP over stdio, project state, cross-file features
 editors/
-  zed/      solsp-zed     — Zed extension (wasm; built separately)
+  vscode/   solsp-vscode  — VS Code client that launches solsp-server
 ```
 
 ## Status
 
-M1 (MVP) in progress: syntax diagnostics + document symbols + semantic tokens.
-No name resolution yet (M2), no types/completion yet (M3). See the design doc.
+Prototype language server with:
+
+- syntax diagnostics, document symbols, semantic tokens
+- go-to-definition and hover for same-file and imported symbols
+- scope and member completion, including selected Solidity builtins
+- signature help and overload selection for common call forms
+- cross-file imports, remappings, namespace imports, re-exports, and inheritance
+- conservative semantic diagnostics for undefined names, type mismatches, returns,
+  casts, comparisons, unreachable code, mutability, and unused imports/locals
+
+The implementation is still intentionally conservative: unknown or unmodeled types
+are generally skipped rather than reported, to avoid noisy false positives.
 
 ## Build
 
