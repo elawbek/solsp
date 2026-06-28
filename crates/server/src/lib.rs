@@ -2147,6 +2147,35 @@ fn binary_op_diagnostics(
     out
 }
 
+/// Flag statements that follow a `return` / `revert` / `break` / `continue` in the same
+/// block — they can never run.
+fn unreachable_diagnostics(
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{BLOCK, BREAK_STMT, CONTINUE_STMT, RETURN_STMT, REVERT_STMT};
+    let mut out = Vec::new();
+    for block in root.descendants().filter(|n| n.kind() == BLOCK) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let stmts: Vec<_> = block.children().collect();
+        let Some(term) = stmts.iter().position(|s| {
+            matches!(
+                s.kind(),
+                RETURN_STMT | REVERT_STMT | BREAK_STMT | CONTINUE_STMT
+            )
+        }) else {
+            continue;
+        };
+        if let Some(dead) = stmts.get(term + 1) {
+            out.push(type_mismatch(li, dead, "unreachable code"));
+        }
+    }
+    out
+}
+
 /// Flag a comparison (`< > <= >= == !=`) between incompatible operand types — e.g.
 /// `address < uint`. Only fires when both operands are concrete, non-literal, and neither
 /// is convertible to the other (literals and un-inferrable operands are left alone).
@@ -3467,6 +3496,7 @@ fn publish_diagnostics(
                 diags.extend(cast_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(binary_op_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(comparison_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(unreachable_diagnostics(&root, li, deadline));
             }
             diags
         }
