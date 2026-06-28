@@ -1834,7 +1834,9 @@ fn return_type_diagnostics(
     li: &solsp_ide::LineIndex,
     deadline: Option<std::time::Instant>,
 ) -> Vec<lsp_types::Diagnostic> {
-    use solsp_syntax::SyntaxKind::{FUNCTION_DEF, PARAM, PARAM_LIST, RETURN_STMT};
+    use solsp_syntax::SyntaxKind::{
+        COMMA, FUNCTION_DEF, PARAM, PARAM_LIST, RETURN_STMT, TUPLE_EXPR,
+    };
     let mut out = Vec::new();
     for ret in root.descendants().filter(|n| n.kind() == RETURN_STMT) {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1851,8 +1853,29 @@ fn return_type_diagnostics(
             continue;
         };
         let ret_params: Vec<_> = returns.children().filter(|n| n.kind() == PARAM).collect();
+        // an explicit tuple `return (a, b)` must have as many elements as declared returns.
+        if value.kind() == TUPLE_EXPR {
+            let elems = value
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == COMMA)
+                .count()
+                + 1;
+            if elems != ret_params.len() {
+                out.push(type_mismatch(
+                    li,
+                    &value,
+                    &format!(
+                        "returns {} value(s), but the function declares {}",
+                        elems,
+                        ret_params.len(),
+                    ),
+                ));
+            }
+            continue; // tuple element types are not checked individually here
+        }
         if ret_params.len() != 1 {
-            continue; // a tuple return — skip
+            continue; // a single value for a multi-value return (e.g. a tuple-returning call)
         }
         let Some(ty) = type_text(&ret_params[0]) else {
             continue;
