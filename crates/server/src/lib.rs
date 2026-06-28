@@ -1811,6 +1811,83 @@ fn return_type_diagnostics(
     out
 }
 
+/// Flag invalid explicit casts to address: `address(X)` / `payable(X)` where `X` names a
+/// non-value (a function, library, type, …) rather than a castable value — e.g.
+/// `address(roles)` where `roles` is a function, not an instance.
+fn cast_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAME_REF, PATH_EXPR};
+    let mut out = Vec::new();
+    for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let Some(callee) = call.first_child() else {
+            continue;
+        };
+        if !matches!(
+            callee_display_name(&callee).as_deref(),
+            Some("address" | "payable")
+        ) {
+            continue;
+        }
+        let Some(arg_list) = call.children().find(|n| n.kind() == ARG_LIST) else {
+            continue;
+        };
+        let args: Vec<_> = arg_list.children().collect();
+        // only a single bare-name operand (`address(roles)`, not `address(x.y)`/`address(0)`).
+        let [arg] = args.as_slice() else { continue };
+        if !matches!(arg.kind(), PATH_EXPR | NAME_REF) {
+            continue;
+        }
+        let Some(def) = resolve_receiver_def(state, uri, root, arg) else {
+            continue; // unresolved or a builtin (`this`) — leave alone
+        };
+        if !is_value_kind(def.kind) {
+            out.push(type_mismatch(
+                li,
+                arg,
+                &format!(
+                    "cannot convert {} `{}` to an address",
+                    def_kind_noun(def.kind),
+                    arg_text(arg),
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// Whether a definition names a value (so it can be cast/used as one), as opposed to a
+/// type, function, or other non-value declaration.
+fn is_value_kind(kind: solsp_hir::resolve::DefKind) -> bool {
+    use solsp_hir::resolve::DefKind::{Field, Local, Parameter, StateVariable, Variant};
+    matches!(kind, StateVariable | Parameter | Local | Field | Variant)
+}
+
+/// A short noun for a definition kind, for diagnostic messages.
+fn def_kind_noun(kind: solsp_hir::resolve::DefKind) -> &'static str {
+    use solsp_hir::resolve::DefKind::*;
+    match kind {
+        Function => "function",
+        Modifier => "modifier",
+        Event => "event",
+        Error => "error",
+        Contract => "contract",
+        Interface => "interface",
+        Library => "library",
+        Struct => "struct",
+        Enum => "enum",
+        UserType => "type",
+        _ => "value",
+    }
+}
+
 /// Whether a value of type `from` is implicitly convertible to `to`, resolving user-type
 /// inheritance through the caller's file.
 fn types_compatible(
@@ -3059,6 +3136,7 @@ fn publish_diagnostics(
                 diags.extend(type_check_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(assignment_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(return_type_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(cast_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }

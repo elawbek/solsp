@@ -2683,6 +2683,42 @@ fn hover_on_builtin_members() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn invalid_address_cast_of_function_is_diagnosed() {
+    let uri = Url::parse("file:///cast.sol").unwrap();
+    // `address(roles)` casts the function `roles`, which is invalid; `address(r)` (an
+    // instance) and `address(this)` are fine.
+    let src = "contract R {} \
+               contract C { R r; \
+               function roles() external view returns (address) { return address(roles); } \
+               function g() external view returns (address) { return address(r); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let casts: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("cannot convert"))
+        .collect();
+    assert_eq!(casts.len(), 1, "{:?}", diags.diagnostics);
+    assert!(casts[0].message.contains("function"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
