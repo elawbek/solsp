@@ -325,6 +325,11 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
             None,
         ));
     }
+    // 2c. a builtin / synthetic member (`msg.sender`, `tx.gasprice`, `address(x).balance`,
+    //     `arr.length`, `MyError.selector`, `type(X).max`) — show its type.
+    if let Some(h) = builtin_member_hover(state, &uri, &root, offset) {
+        return Some(h);
+    }
     // 3. an imported top-level symbol (followed transitively through re-exports) → hover
     //    from the target file. The hovered identifier is in *this* file, so report no
     //    range and let the client highlight it.
@@ -451,6 +456,37 @@ fn member_completion(
     Some(Vec::new())
 }
 
+/// Hover for a builtin / synthetic member (`msg.sender`, `address(x).balance`,
+/// `arr.length`, `MyError.selector`, `type(X).max`, …): finds the hovered member among the
+/// receiver's synthetic members and reports its type.
+fn builtin_member_hover(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<Hover> {
+    use solsp_syntax::SyntaxKind::NAME_REF;
+    let nr = root
+        .token_at_offset(offset)
+        .find_map(|t| t.parent_ancestors().find(|n| n.kind() == NAME_REF))?;
+    let (receiver, member) = solsp_hir::resolve::member_access(&nr)?;
+    let items = builtin_member_items(&receiver)
+        .into_iter()
+        .chain(value_type_builtin_members(state, uri, root, &receiver))
+        .chain(type_expr_members(state, uri, root, &receiver))
+        .chain(selector_member(state, uri, root, &receiver))
+        .flatten();
+    let item = items.into_iter().find(|i| i.label == member)?;
+    let text = match item.detail.as_deref() {
+        Some(d) if !d.is_empty() => format!("{member}: {d}"),
+        _ => member.clone(),
+    };
+    Some(markup_hover(
+        format!("```solidity\n{text}\n```\n\n*(builtin)*"),
+        None,
+    ))
+}
+
 /// `.selector` on an error/function (`bytes4`) or event (`bytes32`) receiver, when the
 /// receiver resolves to such a declaration.
 fn selector_member(
@@ -552,7 +588,8 @@ fn type_expr_members(
     let pt = receiver.children().find(|n| n.kind() == PATH_TYPE)?;
     let name = solsp_hir::resolve::path_type_segments(&pt).pop()?;
     if is_integer_type_name(&name) {
-        return Some(synthetic_members(&[("min", "", false), ("max", "", false)]));
+        let minmax = vec![("min", name.as_str(), false), ("max", name.as_str(), false)];
+        return Some(synthetic_members(&minmax));
     }
     if let Some((_, tdef)) = resolve_path_type(state, uri, root, &pt) {
         return Some(match tdef.kind() {
@@ -855,50 +892,37 @@ fn builtin_member_items(receiver: &solsp_syntax::SyntaxNode) -> Option<Vec<Compl
         return None; // only a bare global, not a chain/call
     }
     let name = solsp_hir::resolve::receiver_name(receiver)?;
-    let (members, kind): (&[&str], CompletionItemKind) = match name.as_str() {
-        "block" => (
-            &[
-                "basefee",
-                "blobbasefee",
-                "chainid",
-                "coinbase",
-                "difficulty",
-                "gaslimit",
-                "number",
-                "prevrandao",
-                "timestamp",
-            ],
-            CompletionItemKind::FIELD,
-        ),
-        "tx" => (&["gasprice", "origin"], CompletionItemKind::FIELD),
-        "msg" => (
-            &["data", "sender", "sig", "value"],
-            CompletionItemKind::FIELD,
-        ),
-        "abi" => (
-            &[
-                "decode",
-                "encode",
-                "encodeCall",
-                "encodePacked",
-                "encodeWithSelector",
-                "encodeWithSignature",
-            ],
-            CompletionItemKind::FUNCTION,
-        ),
+    // `(member, type, is_method)` — real types so hover and completion show them.
+    let members: &[(&str, &str, bool)] = match name.as_str() {
+        "block" => &[
+            ("basefee", "uint256", false),
+            ("blobbasefee", "uint256", false),
+            ("chainid", "uint256", false),
+            ("coinbase", "address payable", false),
+            ("difficulty", "uint256", false),
+            ("gaslimit", "uint256", false),
+            ("number", "uint256", false),
+            ("prevrandao", "uint256", false),
+            ("timestamp", "uint256", false),
+        ],
+        "tx" => &[("gasprice", "uint256", false), ("origin", "address", false)],
+        "msg" => &[
+            ("data", "bytes calldata", false),
+            ("sender", "address", false),
+            ("sig", "bytes4", false),
+            ("value", "uint256", false),
+        ],
+        "abi" => &[
+            ("decode", "", true),
+            ("encode", "bytes memory", true),
+            ("encodeCall", "bytes memory", true),
+            ("encodePacked", "bytes memory", true),
+            ("encodeWithSelector", "bytes memory", true),
+            ("encodeWithSignature", "bytes memory", true),
+        ],
         _ => return None,
     };
-    Some(
-        members
-            .iter()
-            .map(|&m| CompletionItem {
-                kind: Some(kind),
-                detail: Some("builtin".to_string()),
-                label: m.to_string(),
-                ..Default::default()
-            })
-            .collect(),
-    )
+    Some(synthetic_members(members))
 }
 
 /// Completion for a bare identifier: every name visible at the cursor — locals, params,
