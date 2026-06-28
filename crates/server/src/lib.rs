@@ -87,10 +87,39 @@ pub fn run_with_root(
     workspace_root: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let mut state = ServerState::default();
-    if let Some(root) = workspace_root {
-        state.scan_workspace(&root);
-    }
-    for msg in &connection.receiver {
+    // Files to pre-load, drained a batch at a time between messages so the project warms
+    // in the background without blocking the loop (the db is `!Send`, so this cooperative
+    // scan replaces a true worker thread). A real request always wins over scanning.
+    let mut scan_queue = workspace_root
+        .map(|root| state::collect_sol_files(&root))
+        .unwrap_or_default();
+    let mut scan_pos = 0usize;
+    const SCAN_BATCH: usize = 32;
+
+    loop {
+        let msg = if scan_pos < scan_queue.len() {
+            match connection.receiver.try_recv() {
+                Ok(msg) => msg,
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // idle: warm the next batch, then loop to re-check for messages.
+                    let end = (scan_pos + SCAN_BATCH).min(scan_queue.len());
+                    for uri in &scan_queue[scan_pos..end] {
+                        state.ensure_loaded(uri);
+                    }
+                    scan_pos = end;
+                    if scan_pos >= scan_queue.len() {
+                        scan_queue = Vec::new(); // done — free the list
+                    }
+                    continue;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
+            }
+        } else {
+            match connection.receiver.recv() {
+                Ok(msg) => msg,
+                Err(_) => return Ok(()),
+            }
+        };
         match msg {
             Message::Request(req) => {
                 if connection.handle_shutdown(&req)? {
@@ -118,7 +147,6 @@ pub fn run_with_root(
             Message::Response(_resp) => {}
         }
     }
-    Ok(())
 }
 
 /// Answer a request, or reply `MethodNotFound` for anything we do not handle. Both

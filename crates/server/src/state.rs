@@ -184,39 +184,10 @@ impl ServerState {
         Some(file.text(&self.db).clone())
     }
 
-    /// Pre-load every `.sol` file under `root` into the db so the first open of any file
-    /// (and its imports) is already parsed. Build/dependency-output dirs are skipped;
-    /// `lib/` (forge dependencies) is kept since imports reach into it.
-    pub fn scan_workspace(&mut self, root: &Path) {
-        let mut stack = vec![root.to_path_buf()];
-        while let Some(dir) = stack.pop() {
-            let Ok(entries) = fs::read_dir(&dir) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let name = entry.file_name();
-                    let name = name.to_string_lossy();
-                    if name.starts_with('.')
-                        || matches!(name.as_ref(), "node_modules" | "out" | "cache" | "target")
-                    {
-                        continue;
-                    }
-                    stack.push(path);
-                } else if path.extension().is_some_and(|e| e == "sol") {
-                    if let Some(uri) = file_uri(path) {
-                        self.ensure_loaded(&uri);
-                    }
-                }
-            }
-        }
-    }
-
     /// Load a file from disk into the db if it is not already tracked (a disk-loaded
     /// file behaves like an opened one for queries; an editor `didOpen` later replaces
-    /// it). No-op on read failure.
-    fn ensure_loaded(&mut self, uri: &Url) {
+    /// it). No-op on read failure or if already tracked.
+    pub fn ensure_loaded(&mut self, uri: &Url) {
         if self.files.contains_key(uri.as_str()) {
             return;
         }
@@ -255,6 +226,37 @@ impl ServerState {
             .filter_map(|imp| resolve_import_uri(uri, &imp.path))
             .collect()
     }
+}
+
+/// Enumerate every `.sol` file under `root` (not loading them). Build/dependency-output
+/// dirs and hidden dirs are skipped; `lib/` (forge dependencies) is kept since imports
+/// reach into it. Used to pre-warm the whole project incrementally.
+pub fn collect_sol_files(root: &Path) -> Vec<Url> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with('.')
+                    || matches!(name.as_ref(), "node_modules" | "out" | "cache" | "target")
+                {
+                    continue;
+                }
+                stack.push(path);
+            } else if path.extension().is_some_and(|e| e == "sol") {
+                if let Some(uri) = file_uri(path) {
+                    out.push(uri);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Resolve an import path against the importing file's URI into the target file URI,
