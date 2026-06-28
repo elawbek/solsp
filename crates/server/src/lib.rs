@@ -1563,6 +1563,18 @@ fn type_check_diagnostics(
         let Some(all_overloads) = callee_cache.get(&key).and_then(|v| v.as_ref()) else {
             continue;
         };
+        if all_overloads
+            .iter()
+            .any(|o| o.iter().any(|(n, _)| n == "validAddress"))
+        {
+            let t0 = infer_arg_ty(state, uri, root, &args[0].1);
+            eprintln!(
+                "DBG validAddress callee={:?} arg={:?} ty={:?}",
+                key,
+                args[0].1.text().to_string(),
+                t0
+            );
+        }
         // those of the matching arity (a small set; cloning keeps the rest simple).
         let overloads: Vec<Vec<(String, String)>> = all_overloads
             .iter()
@@ -2364,19 +2376,21 @@ fn cross_file_rec(
     if !visited.insert((uri.clone(), name.to_string())) {
         return None; // already searched this file for this name (import cycle)
     }
-    for imp in solsp_hir::imports::imports(root) {
+    let _ = root; // imports now come from the cached index, not a fresh tree walk
+    let index = state.file_index(uri)?;
+    for imp in &index.imports {
         let Some(export) = exported_name(&imp.kind, name) else {
             continue;
         };
-        let Some(target_uri) = state::resolve_import_uri(uri, &imp.path) else {
+        let Some(target_uri) = imp.target.clone() else {
             continue;
         };
-        let Some(tfile) = state.file(&target_uri) else {
+        let Some(tindex) = state.file_index(&target_uri) else {
             continue;
         };
-        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
+        let troot = parse_root(state, &target_uri)?;
         // a top-level declaration in the imported file…
-        if let Some(def) = solsp_hir::resolve::top_level_definition(&troot, &export, arity) {
+        if let Some(def) = solsp_hir::resolve::select_named(&tindex.defs, &export, arity, &troot) {
             return Some((target_uri, def));
         }
         // …or one the imported file itself re-exports (transitively).

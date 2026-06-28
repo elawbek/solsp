@@ -3,18 +3,38 @@
 //! `parse` and downstream queries recompute only what changed. A per-file
 //! [`LineIndex`] is cached alongside for fast position ↔ byte mapping.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use lsp_types::Url;
 use salsa::Setter;
 use solsp_base_db::{RootDatabase, SourceFile};
+use solsp_hir::imports::ImportKind;
+use solsp_hir::resolve::Definition;
 use solsp_ide::LineIndex;
 
 struct FileEntry {
     file: SourceFile,
     line_index: LineIndex,
+}
+
+/// One of a file's imports with its target already resolved to a URI (the filesystem
+/// lookup is the expensive part, so it is done once and cached).
+pub struct ResolvedImport {
+    pub kind: ImportKind,
+    pub target: Option<Url>,
+}
+
+/// A file's cross-file resolution surface, computed once and reused until the file
+/// changes: its top-level definitions and its resolved imports. Caching this turns the
+/// per-query tree walks and filesystem probes (which dominated big-file latency) into
+/// hashmap lookups.
+pub struct FileIndex {
+    pub defs: Vec<Definition>,
+    pub imports: Vec<ResolvedImport>,
 }
 
 /// All open documents plus the salsa database they live in. The main loop is
@@ -23,6 +43,9 @@ struct FileEntry {
 pub struct ServerState {
     db: RootDatabase,
     files: HashMap<String, FileEntry>,
+    /// Per-file [`FileIndex`] memo; an entry is dropped when its file is `set` (its tree
+    /// changed). `RefCell` because queries read through `&self`.
+    index_cache: RefCell<HashMap<String, Rc<FileIndex>>>,
 }
 
 impl ServerState {
@@ -32,6 +55,8 @@ impl ServerState {
     pub fn set(&mut self, uri: &Url, text: String) {
         let key = uri.to_string();
         let line_index = LineIndex::new(&text);
+        // the file's tree changes → its cached index is stale.
+        self.index_cache.borrow_mut().remove(&key);
         if let Some(file) = self.files.get(&key).map(|e| e.file) {
             file.set_text(&mut self.db).to(text);
             self.files.insert(key, FileEntry { file, line_index });
@@ -39,6 +64,30 @@ impl ServerState {
             let file = SourceFile::new(&self.db, key.clone(), text);
             self.files.insert(key, FileEntry { file, line_index });
         }
+    }
+
+    /// The cached [`FileIndex`] for a tracked file (built on first use). `None` if the
+    /// file is not tracked.
+    pub fn file_index(&self, uri: &Url) -> Option<Rc<FileIndex>> {
+        let key = uri.to_string();
+        if let Some(idx) = self.index_cache.borrow().get(&key) {
+            return Some(idx.clone());
+        }
+        let file = self.file(uri)?;
+        let root = solsp_base_db::parse(&self.db, file).syntax();
+        let imports = solsp_hir::imports::imports(&root)
+            .iter()
+            .map(|imp| ResolvedImport {
+                kind: imp.kind.clone(),
+                target: resolve_import_uri(uri, &imp.path),
+            })
+            .collect();
+        let idx = Rc::new(FileIndex {
+            defs: solsp_hir::resolve::file_definitions(&root),
+            imports,
+        });
+        self.index_cache.borrow_mut().insert(key, idx.clone());
+        Some(idx)
     }
 
     /// Drop a document (on `didClose`).

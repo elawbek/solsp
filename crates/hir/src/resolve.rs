@@ -75,6 +75,34 @@ pub fn top_level_definition(
     find_named_decl(root.children(), name, arity)
 }
 
+/// Pick the definition named `name` from a file's already-collected top-level `defs` (as
+/// from [`file_definitions`]), preferring an exact-arity function overload — the cached
+/// equivalent of [`top_level_definition`], avoiding a fresh tree walk. `root` is the tree
+/// the `defs` point into (for counting parameters).
+pub fn select_named(
+    defs: &[Definition],
+    name: &str,
+    arity: Option<usize>,
+    root: &SyntaxNode,
+) -> Option<Definition> {
+    let mut first: Option<&Definition> = None;
+    for def in defs {
+        if def.name != name {
+            continue;
+        }
+        if let Some(n) = arity {
+            if def.kind == DefKind::Function && param_count(&def.full_ptr.to_node(root)) == Some(n)
+            {
+                return Some(def.clone());
+            }
+        }
+        if first.is_none() {
+            first = Some(def);
+        }
+    }
+    first.cloned()
+}
+
 /// If `reference` (a `NAME_REF`) is the member side of a qualified access, return the
 /// receiver node and the member name. Handles both an expression member access
 /// (`recv.member` ⇒ `MEMBER_EXPR`) and a qualified *type* path (`Iface.NestedType` ⇒
