@@ -602,7 +602,7 @@ fn receiver_decl(
             let member = member_name(receiver)?;
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
             let troot = parse_root(state, &turi)?;
-            let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, None)?;
+            let mdef = member_lookup(state, &turi, &tdef, &member, None)?;
             Some(mdef.full_ptr.to_node(&troot))
         }
         _ => None,
@@ -682,8 +682,8 @@ fn using_member(
         if target.as_deref().is_none_or(|t| t == type_name) {
             if let Some((luri, lnode)) = resolve_type_by_name(state, uri, root, &lib, None) {
                 // the call's args plus the implicit receiver argument.
-                let def = solsp_hir::resolve::member_in_type(&lnode, member, arity.map(|a| a + 1))
-                    .or_else(|| solsp_hir::resolve::member_in_type(&lnode, member, None));
+                let def = member_lookup(state, &luri, &lnode, member, arity.map(|a| a + 1))
+                    .or_else(|| member_lookup(state, &luri, &lnode, member, None));
                 if let Some(def) = def {
                     return Some((luri, def));
                 }
@@ -1915,7 +1915,7 @@ fn member_resolve(
     }
 
     if let Some((type_uri, type_def)) = resolve_receiver_type(state, uri, root, &receiver) {
-        if let Some(def) = solsp_hir::resolve::member_in_type(&type_def, &member, arity) {
+        if let Some(def) = member_lookup(state, &type_uri, &type_def, &member, arity) {
             return Some((type_uri, def));
         }
         // the member may be inherited from a cross-file base of the receiver's type.
@@ -2010,7 +2010,7 @@ fn receiver_type(
             }
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
             let troot = parse_root(state, &turi)?;
-            let mdef = solsp_hir::resolve::member_in_type(&tdef, &member, None)?;
+            let mdef = member_lookup(state, &turi, &tdef, &member, None)?;
             member_value_type(state, &turi, &troot, &mdef, element)
         }
         PATH_EXPR | NAME_REF => {
@@ -2083,7 +2083,7 @@ fn resolve_callee(
             let member = member_name(callee)?;
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
             // same-file C3 first, then cross-file inheritance.
-            if let Some(mdef) = solsp_hir::resolve::member_in_type(&tdef, &member, arity) {
+            if let Some(mdef) = member_lookup(state, &turi, &tdef, &member, arity) {
                 return Some((turi, mdef));
             }
             let troot = parse_root(state, &turi)?;
@@ -2304,7 +2304,7 @@ fn resolve_path_type(
     let (first, rest) = segments.split_first()?;
     let (turi, mut type_def) = resolve_type_by_name(state, uri, root, first, Some(path_type))?;
     for seg in rest {
-        let member = solsp_hir::resolve::member_in_type(&type_def, seg, None)?;
+        let member = member_lookup(state, &turi, &type_def, seg, None)?;
         if !is_type_kind(member.kind) {
             return None;
         }
@@ -2326,7 +2326,7 @@ fn resolve_type_by_name(
     // 1. a contract-nested type visible where the name is used (its enclosing contract +
     //    cross-file bases) — these shadow file scope.
     if let Some(contract) = context.and_then(enclosing_contract) {
-        if let Some(def) = solsp_hir::resolve::member_in_type(&contract, type_name, None) {
+        if let Some(def) = member_lookup(state, uri, &contract, type_name, None) {
             if is_type_kind(def.kind) {
                 return Some((uri.clone(), def.full_ptr.to_node(root)));
             }
@@ -2412,6 +2412,29 @@ fn cross_file_rec(
         }
     }
     None
+}
+
+/// Look up `member` in a type, caching a contract's member list to avoid re-walking its
+/// body and same-file C3 bases on every access (the dominant member-resolution cost on
+/// big types). `type_uri` is the file `type_def` lives in. Only the common arity-free
+/// contract lookup is cached; struct/enum and overload-by-arity take the direct path,
+/// which preserves exact base-precedence semantics.
+fn member_lookup(
+    state: &ServerState,
+    type_uri: &Url,
+    type_def: &solsp_syntax::SyntaxNode,
+    member: &str,
+    arity: Option<usize>,
+) -> Option<solsp_hir::resolve::Definition> {
+    if arity.is_some() || type_def.kind() != solsp_syntax::SyntaxKind::CONTRACT_DEF {
+        return solsp_hir::resolve::member_in_type(type_def, member, arity);
+    }
+    // arity-free contract lookup = first member of that name in C3 order.
+    state
+        .member_index(type_uri, type_def)
+        .iter()
+        .find(|d| d.name == member)
+        .cloned()
 }
 
 /// The `NAME_REF` node of a receiver expression (`PATH_EXPR` → `NAME_REF`, or a bare

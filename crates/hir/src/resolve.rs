@@ -548,6 +548,29 @@ fn lookup_member(contract: &SyntaxNode, name: &str, arity: Option<usize>) -> Opt
     None
 }
 
+/// Every member a contract resolves through its own body and same-file C3 bases, in
+/// lookup order (the contract's own members first, then each base; a base's `private`
+/// members are excluded). The pre-collected form of [`lookup_member`] — pair with
+/// [`select_named`] for a cached member lookup that avoids re-walking the type per access.
+pub fn contract_member_defs(contract: &SyntaxNode) -> Vec<Definition> {
+    let Some(root) = contract.ancestors().last() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (i, c) in c3_linearize(contract, &root).into_iter().enumerate() {
+        let body = c.children().find(|n| n.kind() == SyntaxKind::CONTRACT_BODY);
+        for n in body.into_iter().flat_map(|b| b.children()) {
+            if i != 0 && is_private(&n) {
+                continue;
+            }
+            if let Some(def) = def_for_decl(&n) {
+                out.push(def);
+            }
+        }
+    }
+    out
+}
+
 /// The C3 linearization (MRO) of a contract: itself followed by its bases in the order
 /// member lookup should consult them. Resolves base names in file scope; unresolved or
 /// cyclic bases are dropped so the result is always finite.

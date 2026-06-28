@@ -46,7 +46,16 @@ pub struct ServerState {
     /// Per-file [`FileIndex`] memo; an entry is dropped when its file is `set` (its tree
     /// changed). `RefCell` because queries read through `&self`.
     index_cache: RefCell<HashMap<String, Rc<FileIndex>>>,
+    /// Per-contract member list (own body + same-file C3 bases), keyed by the contract's
+    /// byte range within its file. Dropped per-file on `set`. `member_in_type` otherwise
+    /// re-walks the whole type on every `obj.member` access.
+    member_cache: RefCell<MemberCache>,
 }
+
+/// A contract's cached member list (own body + same-file C3 bases, in lookup order).
+type MemberDefs = Rc<Vec<Definition>>;
+/// Per-file, per-contract (by byte range) member lists.
+type MemberCache = HashMap<String, HashMap<rowan::TextRange, MemberDefs>>;
 
 impl ServerState {
     /// Open or replace a document with `text`: update its salsa input (reusing the
@@ -55,8 +64,9 @@ impl ServerState {
     pub fn set(&mut self, uri: &Url, text: String) {
         let key = uri.to_string();
         let line_index = LineIndex::new(&text);
-        // the file's tree changes → its cached index is stale.
+        // the file's tree changes → its cached indexes are stale.
         self.index_cache.borrow_mut().remove(&key);
+        self.member_cache.borrow_mut().remove(&key);
         if let Some(file) = self.files.get(&key).map(|e| e.file) {
             file.set_text(&mut self.db).to(text);
             self.files.insert(key, FileEntry { file, line_index });
@@ -88,6 +98,28 @@ impl ServerState {
         });
         self.index_cache.borrow_mut().insert(key, idx.clone());
         Some(idx)
+    }
+
+    /// The cached member list of a contract `type_def` living in file `uri` (own body +
+    /// same-file C3 bases, in lookup order), built on first use.
+    pub fn member_index(&self, uri: &Url, type_def: &solsp_syntax::SyntaxNode) -> MemberDefs {
+        let key = uri.to_string();
+        let range = type_def.text_range();
+        if let Some(defs) = self
+            .member_cache
+            .borrow()
+            .get(&key)
+            .and_then(|m| m.get(&range))
+        {
+            return defs.clone();
+        }
+        let defs = Rc::new(solsp_hir::resolve::contract_member_defs(type_def));
+        self.member_cache
+            .borrow_mut()
+            .entry(key)
+            .or_default()
+            .insert(range, defs.clone());
+        defs
     }
 
     /// Drop a document (on `didClose`).
