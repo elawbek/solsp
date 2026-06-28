@@ -12,19 +12,19 @@ use lsp_types::notification::{
     Notification as _, PublishDiagnostics,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
-    SemanticTokensFullRequest, SignatureHelpRequest,
+    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, InlayHintRequest,
+    Request as _, SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
     Command, CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams,
     CompletionResponse, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InsertTextFormat, Location, MarkupContent, MarkupKind, OneOf, ParameterInformation,
-    ParameterLabel, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SignatureInformation, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability, InlayHint,
+    InlayHintKind, InlayHintLabel, InsertTextFormat, Location, MarkupContent, MarkupKind, OneOf,
+    ParameterInformation, ParameterLabel, PublishDiagnosticsParams, SemanticTokensFullOptions,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SignatureInformation, TextDocumentContentChangeEvent,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
 };
 use solsp_ide::LineIndex;
 
@@ -51,6 +51,7 @@ pub fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
+        inlay_hint_provider: Some(OneOf::Left(true)),
         completion_provider: Some(CompletionOptions {
             // `.` triggers member completion; bare-identifier completion is implicit.
             trigger_characters: Some(vec![".".to_string()]),
@@ -76,17 +77,19 @@ pub fn server_capabilities() -> ServerCapabilities {
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
 pub fn run(connection: &Connection) -> Result<()> {
-    run_with_root(connection, None)
+    run_with_root(connection, None, true)
 }
 
 /// Like [`run`], but first pre-loads every `.sol` file under `workspace_root` so the first
 /// open of any file is already parsed (its imports too). The main binary passes the
-/// editor's workspace root; tests pass `None`.
+/// editor's workspace root and the inlay-hint setting; tests pass `None` / `true`.
 pub fn run_with_root(
     connection: &Connection,
     workspace_root: Option<std::path::PathBuf>,
+    inlay_hints: bool,
 ) -> Result<()> {
     let mut state = ServerState::default();
+    state.set_inlay_hints(inlay_hints);
     // Project files to warm and diagnose in the background, one per idle tick so the whole
     // project's problems appear in the editor's tree without ever blocking the loop (the db
     // is `!Send`, so this cooperative scan replaces a worker thread). A real request always
@@ -190,6 +193,12 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
         SignatureHelpRequest::METHOD => {
             match req.extract::<SignatureHelpParams>(SignatureHelpRequest::METHOD) {
                 Ok((id, params)) => Response::new_ok(id, signature_help(state, params)),
+                Err(e) => extract_err_response(id, e),
+            }
+        }
+        InlayHintRequest::METHOD => {
+            match req.extract::<lsp_types::InlayHintParams>(InlayHintRequest::METHOD) {
+                Ok((id, params)) => Response::new_ok(id, inlay_hints(state, params)),
                 Err(e) => extract_err_response(id, e),
             }
         }
@@ -1461,6 +1470,102 @@ fn param_name_types(decl: &solsp_syntax::SyntaxNode) -> Vec<(String, String)> {
 
 /// The `(name, type)` of a `PARAM` / `STRUCT_FIELD`: its `NAME` and its type node's text
 /// (whitespace-normalized, data-location stripped).
+/// Parameter names of a function-like declaration, one per position, `None` for an unnamed
+/// parameter (`function f(uint256, address)`). Unlike [`param_name_types`], it keeps every
+/// position so a call's arguments align with it.
+fn param_names_positional(func: &solsp_syntax::SyntaxNode) -> Vec<Option<String>> {
+    use solsp_syntax::SyntaxKind::{NAME, PARAM, PARAM_LIST};
+    func.children()
+        .find(|n| n.kind() == PARAM_LIST)
+        .into_iter()
+        .flat_map(|pl| pl.children())
+        .filter(|n| n.kind() == PARAM)
+        .map(|p| {
+            p.children()
+                .find(|c| c.kind() == NAME)
+                .and_then(|n| node_ident(&n))
+        })
+        .collect()
+}
+
+/// `textDocument/inlayHint` → parameter-name hints before positional call arguments
+/// (`f(to: x, amount: 1)`). Toggleable via the server's inlay-hint setting; an unnamed
+/// parameter gets no hint, and a hint that just repeats the argument is omitted.
+fn inlay_hints(state: &ServerState, params: lsp_types::InlayHintParams) -> Option<Vec<InlayHint>> {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR};
+    if !state.inlay_hints_enabled() {
+        return Some(Vec::new());
+    }
+    let uri = params.text_document.uri;
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+    // tolerate an out-of-range request (clamp to the document).
+    let start = to_proto::offset(li, params.range.start).unwrap_or_default();
+    let end = to_proto::offset(li, params.range.end).unwrap_or_else(|| root.text_range().end());
+    let mut hints = Vec::new();
+    for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
+        let r = call.text_range();
+        if r.end() < start || r.start() > end {
+            continue; // outside the requested range
+        }
+        let Some(arg_list) = call.children().find(|n| n.kind() == ARG_LIST) else {
+            continue; // named-argument calls already show the names
+        };
+        let args: Vec<_> = arg_list.children().collect();
+        if args.is_empty() {
+            continue;
+        }
+        let Some(callee) = call.first_child() else {
+            continue;
+        };
+        let Some((duri, def)) = resolve_named_callee(state, &uri, &root, &callee) else {
+            continue; // a cast / builtin / unresolved — no parameter names
+        };
+        if !matches!(
+            def.kind,
+            DefKind::Function | DefKind::Event | DefKind::Error
+        ) {
+            continue;
+        }
+        let Some(droot) = parse_root(state, &duri) else {
+            continue;
+        };
+        let def_node = def.full_ptr.to_node(&droot);
+        let name = callee_display_name(&callee).unwrap_or_default();
+        // the overload whose parameter count matches the call.
+        let node = signature_candidates(&def, &def_node, &name, &droot)
+            .into_iter()
+            .map(|(_, n)| n)
+            .find(|n| param_names_positional(n).len() == args.len())
+            .unwrap_or(def_node);
+        let pnames = param_names_positional(&node);
+        if pnames.len() != args.len() {
+            continue; // arity mismatch — don't guess
+        }
+        for (arg, pname) in args.iter().zip(pnames) {
+            let Some(pname) = pname else {
+                continue; // an unnamed parameter — nothing to label
+            };
+            if arg.text().to_string().trim() == pname {
+                continue; // `f(amount)` for parameter `amount` — redundant
+            }
+            hints.push(InlayHint {
+                position: to_proto::range(li, arg.text_range()).start,
+                label: InlayHintLabel::String(format!("{pname}:")),
+                kind: Some(InlayHintKind::PARAMETER),
+                text_edits: None,
+                tooltip: None,
+                padding_left: None,
+                padding_right: Some(true),
+                data: None,
+            });
+        }
+    }
+    Some(hints)
+}
+
 fn named_type(decl: &solsp_syntax::SyntaxNode) -> Option<(String, String)> {
     use solsp_syntax::SyntaxKind::NAME;
     let name = decl

@@ -53,6 +53,8 @@ pub struct ServerState {
     /// Resolved type names. Cleared wholesale on any `set` (an entry may point into the
     /// edited file from any querying file), so it acts within an edit epoch.
     type_cache: RefCell<TypeCache>,
+    /// Whether parameter-name inlay hints are produced (off by client/editor request).
+    inlay_hints: bool,
 }
 
 /// A contract's cached member list (own body + same-file C3 bases, in lookup order).
@@ -166,6 +168,16 @@ impl ServerState {
     /// The salsa database (read-only access for queries).
     pub fn db(&self) -> &RootDatabase {
         &self.db
+    }
+
+    /// Enable or disable parameter-name inlay hints.
+    pub fn set_inlay_hints(&mut self, on: bool) {
+        self.inlay_hints = on;
+    }
+
+    /// Whether parameter-name inlay hints are produced.
+    pub fn inlay_hints_enabled(&self) -> bool {
+        self.inlay_hints
     }
 
     /// The `SourceFile` input handle for an open document.
