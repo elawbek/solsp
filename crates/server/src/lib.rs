@@ -1690,6 +1690,14 @@ fn infer_arg_ty(
             let Some(callee) = arg.first_child() else {
                 return typecheck::Ty::Unknown;
             };
+            // `new T[](n)` / `new T(...)` → the constructed type (the node after `new`).
+            if callee.kind() == NEW_EXPR {
+                return callee
+                    .children()
+                    .next()
+                    .map(|t| typecheck::parse_ty(&node_type_text(&t)))
+                    .unwrap_or(typecheck::Ty::Unknown);
+            }
             let Some(cname) = callee_display_name(&callee) else {
                 return typecheck::Ty::Unknown;
             };

@@ -2438,6 +2438,39 @@ fn mapping_argument_where_struct_expected_is_diagnosed() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn new_array_argument_is_not_a_false_positive() {
+    let uri = Url::parse("file:///nw.sol").unwrap();
+    // `new address[](0)` is an `address[]`, accepted by the `address[]` parameter — its
+    // type must not be inferred as the element type `address`.
+    let src = "contract C { function take(address[] memory xs) public {} \
+               function f() public { take(new address[](0)); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let errs: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("convertible"))
+        .collect();
+    assert!(errs.is_empty(), "{:?}", diags.diagnostics);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
