@@ -681,13 +681,25 @@ fn receiver_value_info(
         return Some((base_ty.strip_suffix("[]")?.trim().to_string(), storage));
     }
     if receiver.kind() == MEMBER_EXPR {
-        let recv_name = solsp_hir::resolve::receiver_name(&receiver.first_child()?);
+        // a builtin global member (`msg.sender`, `msg.data`, `tx.origin`, `block.coinbase`)
+        // → its declared type, so chains like `msg.data.length` resolve.
+        let recv = receiver.first_child()?;
         let member = member_name(receiver)?;
-        if matches!(
-            (recv_name.as_deref(), member.as_str()),
-            (Some("msg"), "sender") | (Some("tx"), "origin") | (Some("block"), "coinbase")
-        ) {
-            return Some(("address".to_string(), false));
+        if let Some(items) = builtin_member_items(&recv) {
+            if let Some(d) = items
+                .iter()
+                .find(|i| i.label == member)
+                .and_then(|i| i.detail.as_deref())
+                .filter(|d| !d.is_empty())
+            {
+                // drop a data location so the type model sees `bytes`, not `bytes calldata`.
+                let ty = d
+                    .trim_end_matches(" calldata")
+                    .trim_end_matches(" memory")
+                    .trim_end_matches(" storage")
+                    .to_string();
+                return Some((ty, false));
+            }
         }
     }
     let decl = receiver_decl(state, uri, root, receiver)?;
