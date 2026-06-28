@@ -49,9 +49,19 @@
           "description": "Trace the JSON-RPC traffic between VS Code and solsp-server (for debugging)."
         },
         "solsp.inlayHints.parameterNames": {
-          "type": "boolean",
-          "default": true,
-          "description": "Show parameter-name inlay hints before positional call arguments (e.g. `transfer(to: addr, amount: 1)`). Reload the window after changing."
+          "type": "string",
+          "enum": [
+            "all",
+            "skip-redundant",
+            "off"
+          ],
+          "enumDescriptions": [
+            "A hint before every positional argument.",
+            "Hints, except where the argument already repeats the parameter name.",
+            "No parameter-name hints."
+          ],
+          "default": "all",
+          "markdownDescription": "Parameter-name inlay hints before positional call arguments (e.g. `transfer(to: addr, amount: 1)`). Reload the window after changing."
         }
       }
     },

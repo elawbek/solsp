@@ -24,11 +24,11 @@ export function activate(context: vscode.ExtensionContext): void {
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "solidity" }],
     // Forwarded to the server at `initialize`; `solsp.inlayHints.parameterNames`
-    // (default true) toggles parameter-name inlay hints. Changing it needs a reload.
+    // (`all` / `skip-redundant` / `off`) sets the verbosity. Changing it needs a reload.
     initializationOptions: {
       inlayHints: vscode.workspace
         .getConfiguration("solsp")
-        .get<boolean>("inlayHints.parameterNames", true),
+        .get<string>("inlayHints.parameterNames", "all"),
     },
   };
 

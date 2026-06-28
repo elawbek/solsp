@@ -77,16 +77,16 @@ pub fn server_capabilities() -> ServerCapabilities {
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
 pub fn run(connection: &Connection) -> Result<()> {
-    run_with_root(connection, None, true)
+    run_with_root(connection, None, state::InlayHintMode::All)
 }
 
 /// Like [`run`], but first pre-loads every `.sol` file under `workspace_root` so the first
 /// open of any file is already parsed (its imports too). The main binary passes the
-/// editor's workspace root and the inlay-hint setting; tests pass `None` / `true`.
+/// editor's workspace root and the inlay-hint mode; tests pass `None` / `All`.
 pub fn run_with_root(
     connection: &Connection,
     workspace_root: Option<std::path::PathBuf>,
-    inlay_hints: bool,
+    inlay_hints: state::InlayHintMode,
 ) -> Result<()> {
     let mut state = ServerState::default();
     state.set_inlay_hints(inlay_hints);
@@ -1494,7 +1494,8 @@ fn param_names_positional(func: &solsp_syntax::SyntaxNode) -> Vec<Option<String>
 fn inlay_hints(state: &ServerState, params: lsp_types::InlayHintParams) -> Option<Vec<InlayHint>> {
     use solsp_hir::resolve::DefKind;
     use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR};
-    if !state.inlay_hints_enabled() {
+    let mode = state.inlay_hint_mode();
+    if mode == state::InlayHintMode::Off {
         return Some(Vec::new());
     }
     let uri = params.text_document.uri;
@@ -1548,8 +1549,10 @@ fn inlay_hints(state: &ServerState, params: lsp_types::InlayHintParams) -> Optio
             let Some(pname) = pname else {
                 continue; // an unnamed parameter — nothing to label
             };
-            if arg.text().to_string().trim() == pname {
-                continue; // `f(amount)` for parameter `amount` — redundant
+            // in skip-redundant mode, omit `f(amount)` for parameter `amount`.
+            if mode == state::InlayHintMode::SkipRedundant && arg.text().to_string().trim() == pname
+            {
+                continue;
             }
             hints.push(InlayHint {
                 position: to_proto::range(li, arg.text_range()).start,

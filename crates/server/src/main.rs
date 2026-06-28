@@ -22,13 +22,15 @@ fn main() -> Result<()> {
                 p.root_uri.as_ref().and_then(|u| u.to_file_path().ok())
             })
     });
-    // `initializationOptions: { inlayHints: bool }` toggles parameter-name hints (default on).
+    // `initializationOptions: { inlayHints: "all" | "skip-redundant" | "off" }` sets the
+    // parameter-name hint verbosity (default "all").
     let inlay_hints = params
         .as_ref()
         .and_then(|p| p.initialization_options.as_ref())
         .and_then(|o| o.get("inlayHints"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+        .and_then(|v| v.as_str())
+        .map(solsp_server::state::InlayHintMode::parse)
+        .unwrap_or(solsp_server::state::InlayHintMode::All);
     solsp_server::run_with_root(&connection, workspace_root, inlay_hints)?;
 
     // Drop the connection before joining: its `sender` feeds the stdio writer
