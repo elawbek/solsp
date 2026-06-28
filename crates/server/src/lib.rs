@@ -440,11 +440,70 @@ fn member_completion(
         items.extend(using_items);
         return Some(items);
     }
+    // `MyError.`/`MyEvent.`/`myFunc.` → the ABI `.selector`.
+    if let Some(items) = selector_member(state, uri, root, &receiver) {
+        return Some(items);
+    }
     // an elementary value with only `using L for T` functions (e.g. `uint256.toString`).
     if !using_items.is_empty() {
         return Some(using_items);
     }
     Some(Vec::new())
+}
+
+/// `.selector` on an error/function (`bytes4`) or event (`bytes32`) receiver, when the
+/// receiver resolves to such a declaration.
+fn selector_member(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<Vec<CompletionItem>> {
+    use solsp_hir::resolve::DefKind;
+    let def = resolve_receiver_def(state, uri, root, receiver)?;
+    let ty = match def.kind {
+        DefKind::Error | DefKind::Function => "bytes4",
+        DefKind::Event => "bytes32",
+        _ => return None,
+    };
+    Some(synthetic_members(&[("selector", ty, false)]))
+}
+
+/// Resolve a receiver expression to the declaration it names — a bare name (`MyError`,
+/// `myFunc`) or a qualified one (`Lib.MyError`). For looking up what kind of thing a
+/// receiver is, not its type.
+fn resolve_receiver_def(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<solsp_hir::resolve::Definition> {
+    use solsp_syntax::SyntaxKind::{MEMBER_EXPR, NAME_REF, PATH_EXPR};
+    match receiver.kind() {
+        PATH_EXPR | NAME_REF => {
+            let nr = receiver_name_ref(receiver)?;
+            if let Some(d) = solsp_hir::resolve::resolve(&nr) {
+                return Some(d);
+            }
+            let name = nameref_text(&nr)?;
+            if let Some(c) = enclosing_contract(receiver) {
+                if let Some((_, d)) = inherited_member(state, uri, root, &c, &name, None) {
+                    return Some(d);
+                }
+            }
+            cross_file_definition(state, uri, root, &name, None).map(|(_, d)| d)
+        }
+        // `A.B` → resolve the member `B` at its own offset.
+        MEMBER_EXPR => {
+            let member_nr = receiver
+                .children()
+                .filter(|n| n.kind() == NAME_REF)
+                .last()?;
+            let off = member_nr.text_range().start();
+            member_resolve(state, uri, root, off).map(|(_, d)| d)
+        }
+        _ => None,
+    }
 }
 
 /// Build completion items from `(name, detail, is_method)` triples — synthetic builtin

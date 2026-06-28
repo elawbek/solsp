@@ -5,12 +5,13 @@
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    CompletionParams, CompletionResponse, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverContents, HoverParams, InitializeParams, InitializeResult, Position,
-    PublishDiagnosticsParams, Range, SemanticTokensParams, SemanticTokensResult, SignatureHelp,
-    SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
-    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    CompletionItem, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
+    Position, PublishDiagnosticsParams, Range, SemanticTokensParams, SemanticTokensResult,
+    SignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier,
 };
 use std::thread;
 
@@ -2567,6 +2568,63 @@ fn return_type_mismatch_is_diagnosed() {
         .collect();
     assert_eq!(errs.len(), 1, "{:?}", diags.diagnostics);
     assert!(errs[0].message.contains("uint256"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn selector_completion_for_errors_and_events() {
+    let uri = Url::parse("file:///sel.sol").unwrap();
+    let src = "contract C { error MyError(uint256 x); event MyEvent(address a); \
+               function f() public { MyError.S1; MyEvent.S2; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let complete = |id: i32, marker: &str| -> Vec<CompletionItem> {
+        let ch = src.find(marker).unwrap() as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position {
+                        line: 0,
+                        character: ch,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+        );
+        match serde_json::from_value(next_response(&client).result.unwrap()).unwrap() {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+    };
+    let err = complete(2, "S1");
+    assert!(err
+        .iter()
+        .any(|i| i.label == "selector" && i.detail.as_deref() == Some("bytes4")));
+    let ev = complete(3, "S2");
+    assert!(ev
+        .iter()
+        .any(|i| i.label == "selector" && i.detail.as_deref() == Some("bytes32")));
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
