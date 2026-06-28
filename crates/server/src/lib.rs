@@ -1592,6 +1592,109 @@ fn undefined_name_diagnostics(
     out
 }
 
+/// Type-check assignments: a simple assignment `lhs = rhs` and a local declaration with an
+/// initializer `T x = rhs`, flagging an `rhs` not implicitly convertible to the target
+/// type. Conservative — an un-inferrable side is `Unknown` and never flagged.
+fn assignment_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{ASSIGN_EXPR, EQ, VAR_DECL, VAR_DECL_STMT};
+    let mut out = Vec::new();
+    for node in root.descendants() {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let (target, value) = match node.kind() {
+            // `lhs = rhs` (simple assignment only — compound `+=` needs numeric operands).
+            ASSIGN_EXPR => {
+                let op_is_eq = node
+                    .children_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .any(|t| t.kind() == EQ);
+                let exprs: Vec<_> = node.children().collect();
+                if !op_is_eq || exprs.len() != 2 {
+                    continue;
+                }
+                let lty = infer_arg_ty(state, uri, root, &exprs[0]);
+                (lty, exprs[1].clone())
+            }
+            // `T x = rhs` — a single (non-tuple) local declaration with an initializer.
+            VAR_DECL_STMT => {
+                // a tuple destructuring `(a, , uint x) = f()` is parenthesized and binds a
+                // function's tuple return; only one slot may be named, so skip by the paren.
+                let is_tuple = node
+                    .children_with_tokens()
+                    .filter_map(|e| e.into_token())
+                    .any(|t| t.kind() == solsp_syntax::SyntaxKind::L_PAREN);
+                let decls: Vec<_> = node.children().filter(|c| c.kind() == VAR_DECL).collect();
+                let Some(init) = node.children().find(|c| c.kind() != VAR_DECL) else {
+                    continue; // no initializer
+                };
+                if is_tuple || decls.len() != 1 {
+                    continue; // tuple destructuring — skip
+                }
+                let Some(ty) = type_text(&decls[0]) else {
+                    continue;
+                };
+                (typecheck::parse_ty(&ty), init)
+            }
+            _ => continue,
+        };
+        let value_ty = infer_arg_ty(state, uri, root, &value);
+        if matches!(target, typecheck::Ty::Unknown) || matches!(value_ty, typecheck::Ty::Unknown) {
+            continue;
+        }
+        if !types_compatible(state, uri, root, &value_ty, &target) {
+            out.push(type_mismatch(
+                li,
+                &value,
+                &format!(
+                    "value of type `{}` is not implicitly convertible to `{}`",
+                    arg_text(&value),
+                    ty_label(&target),
+                ),
+            ));
+        }
+    }
+    out
+}
+
+/// Whether a value of type `from` is implicitly convertible to `to`, resolving user-type
+/// inheritance through the caller's file.
+fn types_compatible(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    from: &typecheck::Ty,
+    to: &typecheck::Ty,
+) -> bool {
+    typecheck::implicitly_convertible(from, to, &|a, b| is_subtype(state, uri, root, a, b))
+}
+
+/// A readable Solidity name for a type in a diagnostic message.
+fn ty_label(ty: &typecheck::Ty) -> String {
+    use typecheck::Ty::*;
+    match ty {
+        Uint(n) => format!("uint{n}"),
+        Int(n) => format!("int{n}"),
+        Address => "address".into(),
+        AddressPayable => "address payable".into(),
+        Bool => "bool".into(),
+        StringT => "string".into(),
+        Bytes => "bytes".into(),
+        BytesN(n) => format!("bytes{n}"),
+        Array(inner) | FixedArray(inner) => format!("{}[]", ty_label(inner)),
+        Mapping => "mapping".into(),
+        User(n) => n.clone(),
+        NumberLiteral | StringLiteral | BoolLiteral => "literal".into(),
+        Unknown => "?".into(),
+    }
+}
+
 /// The identifier text of a `NAME_REF`.
 fn nameref_text(nr: &solsp_syntax::SyntaxNode) -> Option<String> {
     nr.children_with_tokens()
@@ -2798,6 +2901,7 @@ fn publish_diagnostics(
                 let root = parse.syntax();
                 diags.extend(undefined_name_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(type_check_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(assignment_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }
