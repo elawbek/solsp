@@ -87,26 +87,32 @@ pub fn run_with_root(
     workspace_root: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let mut state = ServerState::default();
-    // Files to pre-load, drained a batch at a time between messages so the project warms
-    // in the background without blocking the loop (the db is `!Send`, so this cooperative
-    // scan replaces a true worker thread). A real request always wins over scanning.
+    // Project files to warm and diagnose in the background, one per idle tick so the whole
+    // project's problems appear in the editor's tree without ever blocking the loop (the db
+    // is `!Send`, so this cooperative scan replaces a worker thread). A real request always
+    // preempts scanning; a file's own open/save still refreshes it.
     let mut scan_queue = workspace_root
         .map(|root| state::collect_sol_files(&root))
         .unwrap_or_default();
     let mut scan_pos = 0usize;
-    const SCAN_BATCH: usize = 32;
 
     loop {
         let msg = if scan_pos < scan_queue.len() {
             match connection.receiver.try_recv() {
                 Ok(msg) => msg,
                 Err(crossbeam_channel::TryRecvError::Empty) => {
-                    // idle: warm the next batch, then loop to re-check for messages.
-                    let end = (scan_pos + SCAN_BATCH).min(scan_queue.len());
-                    for uri in &scan_queue[scan_pos..end] {
-                        state.ensure_loaded(uri);
-                    }
-                    scan_pos = end;
+                    // idle: warm + diagnose the next file, then re-check for messages.
+                    let uri = scan_queue[scan_pos].clone();
+                    scan_pos += 1;
+                    state.ensure_loaded(&uri);
+                    state.load_import_graph(&uri);
+                    publish_diagnostics(
+                        connection,
+                        &state,
+                        &uri,
+                        true,
+                        Some(std::time::Duration::from_millis(150)),
+                    )?;
                     if scan_pos >= scan_queue.len() {
                         scan_queue = Vec::new(); // done — free the list
                     }
@@ -1566,10 +1572,14 @@ fn type_check_diagnostics(
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     li: &solsp_ide::LineIndex,
+    budget: Option<std::time::Duration>,
 ) -> Vec<lsp_types::Diagnostic> {
     use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAMED_ARG_LIST};
     use std::cell::RefCell;
     use std::collections::HashMap;
+    // a deadline bounds the background sweep (so one huge file can't stall the loop); an
+    // open/save pass passes `None` and runs to completion.
+    let deadline = budget.map(|b| std::time::Instant::now() + b);
     let mut out = Vec::new();
     // per-run caches: the same callee text resolves to the same overloads, and the same
     // (subtype, base) pair has a stable answer. Without this, a big forge-std-heavy test
@@ -1578,6 +1588,9 @@ fn type_check_diagnostics(
     let subtype_memo: RefCell<HashMap<(String, String), bool>> = RefCell::new(HashMap::new());
 
     for call in root.descendants().filter(|n| n.kind() == CALL_EXPR) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break; // background budget spent — the file's open/save pass will finish it
+        }
         // the arguments: positional (`key = None`) or named (`key = Some`).
         let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
             if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {
@@ -2549,7 +2562,7 @@ fn handle_notification(
             let uri = params.text_document.uri;
             state.set(&uri, params.text_document.text);
             state.load_import_graph(&uri); // pull imported files into the db
-            publish_diagnostics(connection, state, &uri, true)?;
+            publish_diagnostics(connection, state, &uri, true, None)?;
         }
         DidChangeTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidChangeTextDocument>(not) else {
@@ -2568,13 +2581,13 @@ fn handle_notification(
             state.set(&uri, text);
             state.load_import_graph(&uri); // imports may have changed
                                            // syntax-only while typing; the slow semantic pass runs on open/save.
-            publish_diagnostics(connection, state, &uri, false)?;
+            publish_diagnostics(connection, state, &uri, false, None)?;
         }
         DidSaveTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidSaveTextDocument>(not) else {
                 return Ok(());
             };
-            publish_diagnostics(connection, state, &params.text_document.uri, true)?;
+            publish_diagnostics(connection, state, &params.text_document.uri, true, None)?;
         }
         DidCloseTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidCloseTextDocument>(not) else {
@@ -2632,14 +2645,16 @@ where
     }
 }
 
-/// Compute and publish diagnostics for an open document (empty list if missing). The
-/// semantic type-check (slow, cross-file) runs only when `semantic` is set — on open/save,
-/// not on every keystroke — so typing stays responsive.
+/// Compute and publish diagnostics for a document (empty list if missing). The semantic
+/// type-check (slow, cross-file) runs only when `semantic` is set — on open/save and the
+/// background sweep, not on every keystroke. `budget` bounds the type-check for the
+/// background sweep; an open/save pass passes `None` and runs to completion.
 fn publish_diagnostics(
     connection: &Connection,
     state: &ServerState,
     uri: &Url,
     semantic: bool,
+    budget: Option<std::time::Duration>,
 ) -> Result<()> {
     let diagnostics = match (state.file(uri), state.line_index(uri)) {
         (Some(file), Some(li)) => {
@@ -2648,7 +2663,13 @@ fn publish_diagnostics(
                 to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
             // type-check only a syntactically clean file (a broken tree mid-edit is noise).
             if semantic && parse.errors().is_empty() {
-                diags.extend(type_check_diagnostics(state, uri, &parse.syntax(), li));
+                diags.extend(type_check_diagnostics(
+                    state,
+                    uri,
+                    &parse.syntax(),
+                    li,
+                    budget,
+                ));
             }
             diags
         }

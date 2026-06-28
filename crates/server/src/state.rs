@@ -228,9 +228,10 @@ impl ServerState {
     }
 }
 
-/// Enumerate every `.sol` file under `root` (not loading them). Build/dependency-output
-/// dirs and hidden dirs are skipped; `lib/` (forge dependencies) is kept since imports
-/// reach into it. Used to pre-warm the whole project incrementally.
+/// Enumerate every project-source `.sol` file under `root` (not loading them). Hidden,
+/// build-output, and dependency dirs (`lib`, `node_modules`, …) are skipped — those are
+/// loaded on demand for resolution but are not project sources to diagnose. Used to warm
+/// and diagnose the project incrementally.
 pub fn collect_sol_files(root: &Path) -> Vec<Url> {
     let mut out = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -244,7 +245,10 @@ pub fn collect_sol_files(root: &Path) -> Vec<Url> {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
                 if name.starts_with('.')
-                    || matches!(name.as_ref(), "node_modules" | "out" | "cache" | "target")
+                    || matches!(
+                        name.as_ref(),
+                        "node_modules" | "lib" | "out" | "cache" | "target"
+                    )
                 {
                     continue;
                 }
