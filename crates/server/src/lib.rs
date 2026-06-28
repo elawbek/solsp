@@ -1561,6 +1561,127 @@ fn def_detail(k: solsp_hir::resolve::DefKind) -> &'static str {
     }
 }
 
+/// Flag identifiers used as values that resolve to no declaration anywhere — typo'd or
+/// missing variables/functions. Conservative: a name reachable through any path (scope,
+/// inheritance, imports, builtins, same-file top level) is left alone, so a resolution gap
+/// never becomes a false "undefined".
+fn undefined_name_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
+    let mut out = Vec::new();
+    for nr in root.descendants().filter(|n| n.kind() == NAME_REF) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        // only a bare identifier used as a value (`x`, `foo`, `Lib`), not a member or type.
+        if nr.parent().map(|p| p.kind()) != Some(PATH_EXPR) {
+            continue;
+        }
+        let Some(name) = nameref_text(&nr) else {
+            continue;
+        };
+        if !name_defined(state, uri, root, &nr, &name) {
+            out.push(type_mismatch(li, &nr, &format!("`{name}` is not defined")));
+        }
+    }
+    out
+}
+
+/// The identifier text of a `NAME_REF`.
+fn nameref_text(nr: &solsp_syntax::SyntaxNode) -> Option<String> {
+    nr.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())
+}
+
+/// Whether `name` (used as a value at `nr`) resolves to any declaration — a builtin,
+/// something in scope, a same-file top-level, a cross-file import, or an inherited member.
+fn name_defined(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    nr: &solsp_syntax::SyntaxNode,
+    name: &str,
+) -> bool {
+    if is_builtin_name(name) {
+        return true;
+    }
+    if solsp_hir::resolve::resolve(nr).is_some()
+        || solsp_hir::resolve::top_level_definition(root, name, None).is_some()
+    {
+        return true;
+    }
+    if let Some(c) = enclosing_contract(nr) {
+        if inherited_member(state, uri, root, &c, name, None).is_some() {
+            return true;
+        }
+    }
+    cross_file_definition(state, uri, root, name, None).is_some()
+}
+
+/// Whether `name` is a Solidity builtin usable as a value: a global object, a builtin
+/// function, an elementary type (also a cast callee), `payable`, or a unit literal.
+fn is_builtin_name(name: &str) -> bool {
+    const NAMES: &[&str] = &[
+        // the modifier-body placeholder `_;`
+        "_",
+        // globals
+        "msg",
+        "block",
+        "tx",
+        "abi",
+        "this",
+        "super",
+        "type",
+        "now",
+        "blobhash",
+        // builtin functions
+        "require",
+        "assert",
+        "revert",
+        "keccak256",
+        "sha256",
+        "ripemd160",
+        "ecrecover",
+        "addmod",
+        "mulmod",
+        "selfdestruct",
+        "blockhash",
+        "gasleft",
+        "payable",
+        "sha3",
+        // elementary type names (cast callees)
+        "address",
+        "bool",
+        "string",
+        "bytes",
+        "byte",
+        // unit suffixes (lexed as identifiers after a literal)
+        "wei",
+        "gwei",
+        "ether",
+        "seconds",
+        "minutes",
+        "hours",
+        "days",
+        "weeks",
+        "years",
+        "finney",
+        "szabo",
+    ];
+    NAMES.contains(&name)
+        || is_integer_type_name(name)
+        || is_fixed_bytes(name)
+        || name.starts_with("ufixed")
+        || name.starts_with("fixed")
+}
+
 /// A callable's overloads, each as its parameter `(name, type)` list.
 type Overloads = Vec<Vec<(String, String)>>;
 
@@ -1572,14 +1693,11 @@ fn type_check_diagnostics(
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     li: &solsp_ide::LineIndex,
-    budget: Option<std::time::Duration>,
+    deadline: Option<std::time::Instant>,
 ) -> Vec<lsp_types::Diagnostic> {
     use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAMED_ARG_LIST};
     use std::cell::RefCell;
     use std::collections::HashMap;
-    // a deadline bounds the background sweep (so one huge file can't stall the loop); an
-    // open/save pass passes `None` and runs to completion.
-    let deadline = budget.map(|b| std::time::Instant::now() + b);
     let mut out = Vec::new();
     // per-run caches: the same callee text resolves to the same overloads, and the same
     // (subtype, base) pair has a stable answer. Without this, a big forge-std-heavy test
@@ -2672,15 +2790,14 @@ fn publish_diagnostics(
             let parse = solsp_base_db::parse(state.db(), file);
             let mut diags =
                 to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
-            // type-check only a syntactically clean file (a broken tree mid-edit is noise).
+            // semantic checks only on a syntactically clean file (a broken tree mid-edit is
+            // noise). A shared deadline bounds the whole semantic pass on the background
+            // sweep; an open/save pass passes `None` and runs to completion.
             if semantic && parse.errors().is_empty() {
-                diags.extend(type_check_diagnostics(
-                    state,
-                    uri,
-                    &parse.syntax(),
-                    li,
-                    budget,
-                ));
+                let deadline = budget.map(|b| std::time::Instant::now() + b);
+                let root = parse.syntax();
+                diags.extend(undefined_name_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(type_check_diagnostics(state, uri, &root, li, deadline));
             }
             diags
         }
