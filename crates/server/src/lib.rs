@@ -2147,6 +2147,67 @@ fn binary_op_diagnostics(
     out
 }
 
+/// Flag imported names that are never referenced in the file (`import { A } from "x"` where
+/// `A` appears nowhere else).
+fn unused_import_diagnostics(
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_hir::imports::ImportKind;
+    use solsp_syntax::SyntaxKind::{IDENT, IMPORT_DIRECTIVE};
+    let directives: Vec<_> = root
+        .descendants()
+        .filter(|n| n.kind() == IMPORT_DIRECTIVE)
+        .collect();
+    if directives.is_empty() {
+        return Vec::new();
+    }
+    // every identifier used OUTSIDE the import directives.
+    let used: std::collections::HashSet<String> = root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == IDENT)
+        .filter(|t| {
+            !directives
+                .iter()
+                .any(|d| d.text_range().contains_range(t.text_range()))
+        })
+        .map(|t| t.text().to_string())
+        .collect();
+
+    let mut out = Vec::new();
+    for (dir, imp) in directives.iter().zip(solsp_hir::imports::imports(root)) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let locals: Vec<String> = match imp.kind {
+            ImportKind::Named(names) => names.iter().map(|n| n.local().to_string()).collect(),
+            ImportKind::Namespace(n) => vec![n],
+            ImportKind::Glob => continue, // binds everything — can't tell what's used
+        };
+        for local in locals.iter().filter(|l| !used.contains(*l)) {
+            // flag the identifier inside the directive (the alias if there is one).
+            let span = dir
+                .descendants_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == IDENT && t.text() == local)
+                .last()
+                .map(|t| t.text_range())
+                .unwrap_or_else(|| dir.text_range());
+            out.push(lsp_types::Diagnostic {
+                range: to_proto::range(li, span),
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                source: Some("solsp".to_string()),
+                message: format!("`{local}` is imported but never used"),
+                tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+                ..Default::default()
+            });
+        }
+    }
+    out
+}
+
 /// Flag a state-variable write inside a `view` or `pure` function (which may not modify
 /// state). The write target's base must name a state variable.
 fn mutability_diagnostics(
@@ -3551,6 +3612,7 @@ fn publish_diagnostics(
                 diags.extend(comparison_diagnostics(state, uri, &root, li, deadline));
                 diags.extend(unreachable_diagnostics(&root, li, deadline));
                 diags.extend(mutability_diagnostics(state, uri, &root, li, deadline));
+                diags.extend(unused_import_diagnostics(&root, li, deadline));
             }
             diags
         }

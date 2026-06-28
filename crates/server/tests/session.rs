@@ -3045,6 +3045,40 @@ fn state_write_in_view_is_diagnosed() {
     server_thread.join().expect("server thread panicked");
 }
 
+#[test]
+fn unused_import_is_diagnosed() {
+    let uri = Url::parse("file:///ui.sol").unwrap();
+    // `Unused` is never referenced; `Used` (inheritance) and `A` (a type) are.
+    let src = "import { Used, Unused } from \"./x.sol\";\n\
+               import { Aliased as A } from \"./y.sol\";\n\
+               contract C is Used { A a; }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let errs: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.contains("imported but never used"))
+        .collect();
+    assert_eq!(errs.len(), 1, "{:?}", diags.diagnostics);
+    assert!(errs[0].message.contains("Unused"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]
