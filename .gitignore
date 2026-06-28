@@ -11,6 +11,9 @@
 # Local Claude Code tooling (hooks, agents, skills, settings) — not versioned
 /.claude/
 
+# Local Codex project skills — installed for this checkout, not versioned
+/.codex-local/
+
 # Agent-memory plugin store (SQLite db + embeddings/graph/index/markdown mirrors)
 # — canonical durable store, kept local, not versioned
 /.memory/

@@ -4,74 +4,51 @@
 //! transport (design §5, §6).
 
 use anyhow::Result;
-use lsp_server::{
-    Connection, ErrorCode, ExtractError, Message, Notification, Request, RequestId, Response,
-};
+use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::{
     DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _, PublishDiagnostics,
+    Notification as _,
 };
 use lsp_types::request::{
     Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
     SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
-    Command, CompletionItem, CompletionItemKind, CompletionOptions, CompletionParams,
-    CompletionResponse, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, HoverProviderCapability,
-    InsertTextFormat, Location, MarkupContent, MarkupKind, OneOf, ParameterInformation,
-    ParameterLabel, PublishDiagnosticsParams, SemanticTokensFullOptions, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SignatureInformation, TextDocumentContentChangeEvent, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkDoneProgressOptions,
+    CompletionItem, CompletionParams, CompletionResponse, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    Location, ParameterInformation, ParameterLabel, SemanticTokensParams, SemanticTokensResult,
+    SignatureHelp, SignatureHelpParams, SignatureInformation, Url,
 };
-use solsp_ide::LineIndex;
 
+mod builtins;
+mod capabilities;
+mod completion_items;
+mod diagnostics;
+mod import_surface;
+mod named_args;
+mod protocol;
 pub mod state;
+mod syntax_utils;
 pub mod to_proto;
 pub mod typecheck;
+mod using_for;
 
+pub use capabilities::server_capabilities;
+
+use builtins::{
+    builtin_items, builtin_member_items, is_builtin_name, is_fixed_bytes, is_integer_type_name,
+    synthetic_members,
+};
+use completion_items::completion_items_from;
+use diagnostics::{publish_diagnostics, send_diagnostics};
+use import_surface::{collect_file_exports, imported_symbols, namespace_alias_items};
+use named_args::{named_arg_completion, named_arg_fields, named_arg_hover};
+use protocol::{apply_change, extract_err_response, extract_notification, markup_hover};
 use state::ServerState;
-
-/// What the server advertises at `initialize`: full-text sync, an outline provider,
-/// and semantic tokens (full-document) with our legend.
-pub fn server_capabilities() -> ServerCapabilities {
-    ServerCapabilities {
-        // incremental sync, plus save notifications so the semantic type-check can run on
-        // save (it is too slow to run on every keystroke).
-        text_document_sync: Some(TextDocumentSyncCapability::Options(
-            lsp_types::TextDocumentSyncOptions {
-                open_close: Some(true),
-                change: Some(TextDocumentSyncKind::INCREMENTAL),
-                save: Some(lsp_types::TextDocumentSyncSaveOptions::Supported(true)),
-                ..Default::default()
-            },
-        )),
-        document_symbol_provider: Some(OneOf::Left(true)),
-        definition_provider: Some(OneOf::Left(true)),
-        hover_provider: Some(HoverProviderCapability::Simple(true)),
-        completion_provider: Some(CompletionOptions {
-            // `.` triggers member completion; bare-identifier completion is implicit.
-            trigger_characters: Some(vec![".".to_string()]),
-            ..Default::default()
-        }),
-        signature_help_provider: Some(SignatureHelpOptions {
-            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-            retrigger_characters: None,
-            work_done_progress_options: WorkDoneProgressOptions::default(),
-        }),
-        semantic_tokens_provider: Some(SemanticTokensServerCapabilities::SemanticTokensOptions(
-            SemanticTokensOptions {
-                work_done_progress_options: WorkDoneProgressOptions::default(),
-                legend: to_proto::legend(),
-                range: None,
-                full: Some(SemanticTokensFullOptions::Bool(true)),
-            },
-        )),
-        ..Default::default()
-    }
-}
+use syntax_utils::{
+    indexed_type_text, named_type, node_ident, node_type_text, param_name_types, type_text,
+};
+use using_for::{using_member, using_member_items};
 
 /// Run the main loop until the client shuts the connection down. Assumes the
 /// `initialize`/`initialized` handshake has already completed.
@@ -561,37 +538,6 @@ fn resolve_receiver_def(
     }
 }
 
-/// Build completion items from `(name, detail, is_method)` triples — synthetic builtin
-/// members. Methods insert call parens.
-fn synthetic_members(items: &[(&str, &str, bool)]) -> Vec<CompletionItem> {
-    items
-        .iter()
-        .map(|&(name, detail, method)| {
-            let (insert_text, insert_text_format) = if method {
-                (Some(format!("{name}($0)")), Some(InsertTextFormat::SNIPPET))
-            } else {
-                (None, None)
-            };
-            CompletionItem {
-                kind: Some(if method {
-                    CompletionItemKind::METHOD
-                } else {
-                    CompletionItemKind::FIELD
-                }),
-                detail: Some(if detail.is_empty() {
-                    "builtin".to_string()
-                } else {
-                    detail.to_string()
-                }),
-                insert_text,
-                insert_text_format,
-                label: name.to_string(),
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
 /// Members of `type(X)`: integer `min`/`max`, enum `min`/`max`, or a contract/interface's
 /// `name`/`creationCode`/`runtimeCode`/`interfaceId`. `None` if the receiver isn't `type(X)`.
 fn type_expr_members(
@@ -770,122 +716,6 @@ fn receiver_decl(
     }
 }
 
-fn is_integer_type_name(n: &str) -> bool {
-    let rest = n.strip_prefix("uint").or_else(|| n.strip_prefix("int"));
-    matches!(rest, Some(d) if d.is_empty() || d.parse::<u16>().is_ok())
-}
-
-fn is_fixed_bytes(n: &str) -> bool {
-    matches!(n.strip_prefix("bytes").map(str::parse::<u8>), Some(Ok(w)) if (1..=32).contains(&w))
-}
-
-/// Parse a `USING_DIRECTIVE` into `(library, target)` — `target` is `None` for `for *`.
-/// The `using { f, g } for T` form (no single library) is skipped.
-fn parse_using(node: &solsp_syntax::SyntaxNode) -> Option<(String, Option<String>)> {
-    use solsp_syntax::SyntaxKind::{FOR_KW, IDENT, STAR, USING_KW};
-    let toks: Vec<_> = node
-        .children_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| !matches!(t.kind(), solsp_syntax::SyntaxKind::WHITESPACE))
-        .collect();
-    let using_pos = toks.iter().position(|t| t.kind() == USING_KW)?;
-    let lib_tok = toks.get(using_pos + 1)?;
-    if lib_tok.kind() != IDENT {
-        return None; // `using { … } for T`
-    }
-    let for_pos = toks.iter().position(|t| t.kind() == FOR_KW)?;
-    let target_tok = toks.get(for_pos + 1)?;
-    let target = match target_tok.kind() {
-        STAR => None,
-        IDENT => Some(target_tok.text().to_string()),
-        _ => return None,
-    };
-    Some((lib_tok.text().to_string(), target))
-}
-
-/// The `using L for T` directives in scope at `node`: the enclosing contract's and the
-/// file's.
-fn using_directives(node: &solsp_syntax::SyntaxNode) -> Vec<(String, Option<String>)> {
-    use solsp_syntax::SyntaxKind::{CONTRACT_BODY, SOURCE_FILE, USING_DIRECTIVE};
-    node.ancestors()
-        .filter(|n| matches!(n.kind(), CONTRACT_BODY | SOURCE_FILE))
-        .flat_map(|n| n.children())
-        .filter(|c| c.kind() == USING_DIRECTIVE)
-        .filter_map(|c| parse_using(&c))
-        .collect()
-}
-
-/// The type name of a receiver value: a user type's name, or an elementary type's text.
-fn receiver_type_name(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    receiver: &solsp_syntax::SyntaxNode,
-) -> Option<String> {
-    if let Some((_, tdef)) = resolve_receiver_type(state, uri, root, receiver) {
-        return solsp_hir::resolve::contract_def_name(&tdef);
-    }
-    receiver_value_info(state, uri, root, receiver).map(|(t, _)| t)
-}
-
-/// Resolve `value.member` through a `using L for T` directive: the library function
-/// (the receiver is its implicit first argument). `None` if no directive attaches it.
-fn using_member(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    receiver: &solsp_syntax::SyntaxNode,
-    member: &str,
-    arity: Option<usize>,
-) -> Option<(Url, solsp_hir::resolve::Definition)> {
-    let type_name = receiver_type_name(state, uri, root, receiver)?;
-    for (lib, target) in using_directives(receiver) {
-        if target.as_deref().is_none_or(|t| t == type_name) {
-            if let Some((luri, lnode)) = resolve_type_by_name(state, uri, root, &lib, None) {
-                // the call's args plus the implicit receiver argument.
-                let def = member_lookup(state, &luri, &lnode, member, arity.map(|a| a + 1))
-                    .or_else(|| member_lookup(state, &luri, &lnode, member, None));
-                if let Some(def) = def {
-                    return Some((luri, def));
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Completion items for the library functions a `using L for T` directive attaches to the
-/// receiver's type.
-fn using_member_items(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    receiver: &solsp_syntax::SyntaxNode,
-) -> Vec<CompletionItem> {
-    let Some(type_name) = receiver_type_name(state, uri, root, receiver) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for (lib, target) in using_directives(receiver) {
-        if target.as_deref().is_none_or(|t| t == type_name) {
-            if let Some((luri, lnode)) = resolve_type_by_name(state, uri, root, &lib, None) {
-                let Some(lroot) = parse_root(state, &luri) else {
-                    continue;
-                };
-                let funcs: Vec<_> = solsp_hir::resolve::type_members(&lnode)
-                    .into_iter()
-                    .filter(|d| {
-                        d.kind == solsp_hir::resolve::DefKind::Function
-                            && !solsp_hir::resolve::is_private(&d.full_ptr.to_node(&lroot))
-                    })
-                    .collect();
-                out.extend(completion_items_from(funcs));
-            }
-        }
-    }
-    out
-}
-
 /// Whether a `CONTRACT_DEF` node is a `library`.
 fn is_library_node(c: &solsp_syntax::SyntaxNode) -> bool {
     c.children_with_tokens()
@@ -916,46 +746,6 @@ fn is_instance_receiver(
     !resolved.map(|d| is_type_kind(d.kind)).unwrap_or(false)
 }
 
-/// Members of a builtin global object when the receiver is `block`/`tx`/`msg`/`abi`.
-fn builtin_member_items(receiver: &solsp_syntax::SyntaxNode) -> Option<Vec<CompletionItem>> {
-    use solsp_syntax::SyntaxKind::{NAME_REF, PATH_EXPR};
-    if !matches!(receiver.kind(), PATH_EXPR | NAME_REF) {
-        return None; // only a bare global, not a chain/call
-    }
-    let name = solsp_hir::resolve::receiver_name(receiver)?;
-    // `(member, type, is_method)` — real types so hover and completion show them.
-    let members: &[(&str, &str, bool)] = match name.as_str() {
-        "block" => &[
-            ("basefee", "uint256", false),
-            ("blobbasefee", "uint256", false),
-            ("chainid", "uint256", false),
-            ("coinbase", "address payable", false),
-            ("difficulty", "uint256", false),
-            ("gaslimit", "uint256", false),
-            ("number", "uint256", false),
-            ("prevrandao", "uint256", false),
-            ("timestamp", "uint256", false),
-        ],
-        "tx" => &[("gasprice", "uint256", false), ("origin", "address", false)],
-        "msg" => &[
-            ("data", "bytes calldata", false),
-            ("sender", "address", false),
-            ("sig", "bytes4", false),
-            ("value", "uint256", false),
-        ],
-        "abi" => &[
-            ("decode", "", true),
-            ("encode", "bytes memory", true),
-            ("encodeCall", "bytes memory", true),
-            ("encodePacked", "bytes memory", true),
-            ("encodeWithSelector", "bytes memory", true),
-            ("encodeWithSignature", "bytes memory", true),
-        ],
-        _ => return None,
-    };
-    Some(synthetic_members(members))
-}
-
 /// Completion for a bare identifier: every name visible at the cursor — locals, params,
 /// the enclosing contract's members (incl. cross-file inherited), and file top-level.
 fn scope_completion(
@@ -984,279 +774,6 @@ fn scope_completion(
     let mut seen = std::collections::HashSet::new();
     items.retain(|i| seen.insert(i.label.clone()));
     items
-}
-
-/// A completion item for each `import * as N` namespace alias.
-fn namespace_alias_items(root: &solsp_syntax::SyntaxNode) -> Vec<CompletionItem> {
-    use solsp_hir::imports::ImportKind;
-    solsp_hir::imports::imports(root)
-        .into_iter()
-        .filter_map(|imp| match imp.kind {
-            ImportKind::Namespace(alias) => Some(CompletionItem {
-                kind: Some(CompletionItemKind::MODULE),
-                detail: Some("import namespace".to_string()),
-                label: alias,
-                ..Default::default()
-            }),
-            _ => None,
-        })
-        .collect()
-}
-
-/// Solidity keywords, elementary types, and global builtins — always available as
-/// bare-identifier completions.
-fn builtin_items() -> Vec<CompletionItem> {
-    use CompletionItemKind as K;
-    const KEYWORDS: &[&str] = &[
-        "if",
-        "else",
-        "for",
-        "while",
-        "do",
-        "return",
-        "break",
-        "continue",
-        "emit",
-        "try",
-        "catch",
-        "new",
-        "delete",
-        "using",
-        "unchecked",
-        "assembly",
-        "is",
-        "virtual",
-        "override",
-        "public",
-        "private",
-        "internal",
-        "external",
-        "view",
-        "pure",
-        "payable",
-        "memory",
-        "storage",
-        "calldata",
-        "constant",
-        "immutable",
-        "returns",
-        "function",
-        "modifier",
-        "struct",
-        "enum",
-        "event",
-        "error",
-        "mapping",
-        "contract",
-        "interface",
-        "library",
-        "import",
-        "pragma",
-        "abstract",
-        "indexed",
-        "anonymous",
-    ];
-    const TYPES: &[&str] = &[
-        "address", "bool", "string", "bytes", "uint", "uint8", "uint16", "uint32", "uint64",
-        "uint128", "uint256", "int", "int128", "int256", "bytes1", "bytes4", "bytes20", "bytes32",
-    ];
-    const GLOBALS: &[&str] = &["msg", "block", "tx", "abi", "this", "super", "type", "now"];
-    const FUNCS: &[&str] = &[
-        "require",
-        "assert",
-        "revert",
-        "keccak256",
-        "sha256",
-        "ripemd160",
-        "ecrecover",
-        "addmod",
-        "mulmod",
-        "selfdestruct",
-        "blockhash",
-        "gasleft",
-    ];
-    let item = |label: &str, kind: CompletionItemKind, detail: &str| CompletionItem {
-        kind: Some(kind),
-        detail: Some(detail.to_string()),
-        label: label.to_string(),
-        ..Default::default()
-    };
-    // a builtin function inserts `name()` with the cursor between the parens, and asks the
-    // client to pop signature help there (the `(` is inserted, not typed, so it triggers nothing).
-    let func = |label: &str| CompletionItem {
-        insert_text: Some(format!("{label}($0)")),
-        insert_text_format: Some(InsertTextFormat::SNIPPET),
-        command: Some(trigger_signature_help()),
-        ..item(label, K::FUNCTION, "builtin")
-    };
-    let mut out = Vec::with_capacity(KEYWORDS.len() + TYPES.len() + GLOBALS.len() + FUNCS.len());
-    out.extend(KEYWORDS.iter().map(|&k| item(k, K::KEYWORD, "keyword")));
-    out.extend(TYPES.iter().map(|&t| item(t, K::TYPE_PARAMETER, "type")));
-    out.extend(GLOBALS.iter().map(|&g| item(g, K::VARIABLE, "builtin")));
-    out.extend(FUNCS.iter().map(|&f| func(f)));
-    out
-}
-
-/// Every symbol the file's imports bring into scope (so `new Roles(` offers `Roles`):
-/// named imports under their local name, and glob imports' transitively re-exported
-/// top-level declarations.
-fn imported_symbols(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-) -> Vec<solsp_hir::resolve::Definition> {
-    use solsp_hir::imports::ImportKind;
-    let mut out = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    for imp in solsp_hir::imports::imports(root) {
-        let Some(turi) = state::resolve_import_uri(uri, &imp.path) else {
-            continue;
-        };
-        let Some(tfile) = state.file(&turi) else {
-            continue;
-        };
-        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        match &imp.kind {
-            ImportKind::Named(list) => {
-                for n in list {
-                    if let Some((_, mut def)) =
-                        solsp_hir::resolve::top_level_definition(&troot, &n.name, None)
-                            .map(|d| (turi.clone(), d))
-                            .or_else(|| cross_file_definition(state, &turi, &troot, &n.name, None))
-                    {
-                        def.name = n.local().to_string(); // the label is the local alias
-                        out.push(def);
-                    }
-                }
-            }
-            ImportKind::Glob => collect_file_exports(state, &turi, &troot, &mut visited, &mut out),
-            // `* as N` — `N.member` is member completion, not a bare name.
-            ImportKind::Namespace(_) => {}
-        }
-    }
-    out
-}
-
-/// Collect a file's top-level declarations plus everything it re-exports transitively
-/// (a glob import re-exports its own imports). Cycle-safe via `visited`.
-fn collect_file_exports(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    visited: &mut std::collections::HashSet<Url>,
-    out: &mut Vec<solsp_hir::resolve::Definition>,
-) {
-    use solsp_hir::imports::ImportKind;
-    if !visited.insert(uri.clone()) {
-        return;
-    }
-    out.extend(solsp_hir::resolve::file_definitions(root));
-    for imp in solsp_hir::imports::imports(root) {
-        let Some(turi) = state::resolve_import_uri(uri, &imp.path) else {
-            continue;
-        };
-        let Some(tfile) = state.file(&turi) else {
-            continue;
-        };
-        let troot = solsp_base_db::parse(state.db(), tfile).syntax();
-        match &imp.kind {
-            ImportKind::Glob => collect_file_exports(state, &turi, &troot, visited, out),
-            ImportKind::Named(list) => {
-                for n in list {
-                    if let Some((_, mut def)) =
-                        solsp_hir::resolve::top_level_definition(&troot, &n.name, None)
-                            .map(|d| (turi.clone(), d))
-                            .or_else(|| cross_file_definition(state, &turi, &troot, &n.name, None))
-                    {
-                        def.name = n.local().to_string();
-                        out.push(def);
-                    }
-                }
-            }
-            ImportKind::Namespace(_) => {}
-        }
-    }
-}
-
-/// Completion for the key side of a named-argument list (`f({ <here>: … })`): the
-/// parameter names of the callee function, the field names of a struct, or a contract's
-/// constructor parameters. `None` when not at a named-argument key.
-fn named_arg_completion(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    offset: rowan::TextSize,
-) -> Option<Vec<CompletionItem>> {
-    use solsp_syntax::SyntaxKind::*;
-    let node = root
-        .token_at_offset(offset)
-        .left_biased()
-        .and_then(|t| t.parent())?;
-    let nal = node.ancestors().find(|n| n.kind() == NAMED_ARG_LIST)?;
-    // bail in the value position (after a `:` on the current argument).
-    let mut last_delim = None;
-    for t in nal.children_with_tokens().filter_map(|e| e.into_token()) {
-        if t.text_range().start() >= offset {
-            break;
-        }
-        match t.kind() {
-            COLON => last_delim = Some(COLON),
-            COMMA | L_BRACE | L_PAREN => last_delim = Some(t.kind()),
-            _ => {}
-        }
-    }
-    if last_delim == Some(COLON) {
-        return None; // value position — let scope/member completion handle it
-    }
-    let (def_uri, def) = named_arg_target(state, uri, root, &nal)?;
-    let droot = parse_root(state, &def_uri)?;
-    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
-    // drop keys already supplied in this argument list (the direct NAME children).
-    let present: std::collections::HashSet<String> = nal
-        .children()
-        .filter(|n| n.kind() == NAME)
-        .filter_map(|n| node_ident(&n))
-        .collect();
-    Some(
-        fields
-            .into_iter()
-            .filter(|(name, _)| !present.contains(name))
-            .map(|(name, ty)| CompletionItem {
-                kind: Some(CompletionItemKind::FIELD),
-                detail: Some(ty), // the parameter/field type
-                label: name,
-                ..Default::default()
-            })
-            .collect(),
-    )
-}
-
-/// Hover over a named-argument key (`f({ owner_: … })`) → its parameter/field type,
-/// shown as `type name`.
-fn named_arg_hover(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    offset: rowan::TextSize,
-) -> Option<Hover> {
-    use solsp_syntax::SyntaxKind::{IDENT, NAME, NAMED_ARG_LIST};
-    let tok = root.token_at_offset(offset).find(|t| t.kind() == IDENT)?;
-    let name_node = tok.parent()?;
-    // a key is a NAME that is a direct child of the NAMED_ARG_LIST.
-    if name_node.kind() != NAME {
-        return None;
-    }
-    let nal = name_node.parent()?;
-    if nal.kind() != NAMED_ARG_LIST {
-        return None;
-    }
-    let key = node_ident(&name_node)?;
-    let (def_uri, def) = named_arg_target(state, uri, root, &nal)?;
-    let droot = parse_root(state, &def_uri)?;
-    let (_, ty) = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot))
-        .into_iter()
-        .find(|(n, _)| n == &key)?;
-    Some(markup_hover(format!("```solidity\n{ty} {key}\n```"), None))
 }
 
 /// `textDocument/signatureHelp` → the signature of the call the cursor is inside (a
@@ -1384,49 +901,6 @@ fn callee_display_name(callee: &solsp_syntax::SyntaxNode) -> Option<String> {
     }
 }
 
-/// Resolve the callee of the call whose named-argument list is `nal` to its declaration.
-fn named_arg_target(
-    state: &ServerState,
-    uri: &Url,
-    root: &solsp_syntax::SyntaxNode,
-    nal: &solsp_syntax::SyntaxNode,
-) -> Option<(Url, solsp_hir::resolve::Definition)> {
-    let callee = nal.parent()?.first_child()?;
-    resolve_named_callee(state, uri, root, &callee)
-}
-
-/// The `(name, type)` of each named argument a callee accepts: a function/constructor's
-/// parameters, or a struct's fields.
-fn named_arg_fields(
-    kind: solsp_hir::resolve::DefKind,
-    node: &solsp_syntax::SyntaxNode,
-) -> Vec<(String, String)> {
-    use solsp_hir::resolve::DefKind::*;
-    use solsp_syntax::SyntaxKind::{CONSTRUCTOR_DEF, STRUCT_FIELD};
-    match kind {
-        Function | Modifier | Event | Error => param_name_types(node),
-        Struct => node
-            .descendants()
-            .filter(|n| n.kind() == STRUCT_FIELD)
-            .filter_map(|f| named_type(&f))
-            .collect(),
-        Contract => node
-            .descendants()
-            .find(|n| n.kind() == CONSTRUCTOR_DEF)
-            .map(|c| param_name_types(&c))
-            .unwrap_or_default(),
-        _ => Vec::new(),
-    }
-}
-
-/// The identifier text of a `NAME`/`NAME_REF` node.
-fn node_ident(n: &solsp_syntax::SyntaxNode) -> Option<String> {
-    n.children_with_tokens()
-        .filter_map(|e| e.into_token())
-        .find(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
-        .map(|t| t.text().to_string())
-}
-
 /// Resolve a named-call callee to its declaration: `new T(...)` → the type `T`, else a
 /// function/struct/contract name or `obj.method`.
 fn resolve_named_callee(
@@ -1444,73 +918,6 @@ fn resolve_named_callee(
             .or_else(|| cross_file_definition(state, uri, root, &name, None));
     }
     resolve_callee(state, uri, root, callee, None)
-}
-
-/// The `(name, type)` of each parameter of a function/constructor (its first
-/// `PARAM_LIST`).
-fn param_name_types(decl: &solsp_syntax::SyntaxNode) -> Vec<(String, String)> {
-    use solsp_syntax::SyntaxKind::{PARAM, PARAM_LIST};
-    decl.children()
-        .find(|n| n.kind() == PARAM_LIST)
-        .into_iter()
-        .flat_map(|pl| pl.children())
-        .filter(|n| n.kind() == PARAM)
-        .filter_map(|p| named_type(&p))
-        .collect()
-}
-
-/// The `(name, type)` of a `PARAM` / `STRUCT_FIELD`: its `NAME` and its type node's text
-/// (whitespace-normalized, data-location stripped).
-fn named_type(decl: &solsp_syntax::SyntaxNode) -> Option<(String, String)> {
-    use solsp_syntax::SyntaxKind::NAME;
-    let name = decl
-        .children()
-        .find(|n| n.kind() == NAME)
-        .and_then(|n| node_ident(&n))?;
-    Some((name, type_text(decl).unwrap_or_default()))
-}
-
-/// The declared type of a `PARAM` / `STRUCT_FIELD` / `VAR_DECL` / state-variable node:
-/// its first non-`NAME` child node's text (whitespace-normalized; a data-location
-/// keyword is a token between the type node and the name, so it is excluded).
-fn type_text(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
-    let ty = decl
-        .children()
-        .find(|n| n.kind() != solsp_syntax::SyntaxKind::NAME)?;
-    Some(node_type_text(&ty))
-}
-
-/// The element/value type text of an array or mapping declaration (`T[]` → `T`,
-/// `mapping(K => V)` → `V`, including when `V` is itself a mapping). `None` for other types.
-fn indexed_type_text(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
-    use solsp_syntax::SyntaxKind::{ARRAY_TYPE, MAPPING_TYPE, NAME, PATH_TYPE};
-    let is_type = |k| matches!(k, PATH_TYPE | ARRAY_TYPE | MAPPING_TYPE);
-    let ty = decl.children().find(|n| n.kind() != NAME)?;
-    match ty.kind() {
-        ARRAY_TYPE => ty
-            .children()
-            .find(|n| is_type(n.kind()))
-            .map(|n| node_type_text(&n)),
-        // a mapping's value is its last type child (`=> V`).
-        MAPPING_TYPE => ty
-            .children()
-            .filter(|n| is_type(n.kind()))
-            .last()
-            .map(|n| node_type_text(&n)),
-        _ => None,
-    }
-}
-
-/// The text of a type node with comment trivia dropped and whitespace normalized, so a
-/// `// note\n  address` type node reads as `address`.
-fn node_type_text(ty: &solsp_syntax::SyntaxNode) -> String {
-    let text: String = ty
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| t.kind() != solsp_syntax::SyntaxKind::COMMENT)
-        .map(|t| t.text().to_string())
-        .collect();
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// The receiver expression of a `receiver.member` access at `offset`, when the cursor is
@@ -1581,98 +988,6 @@ fn collect_inherited_members(
         }
     }
     out
-}
-
-/// Build completion items from definitions, keeping the first of each name (inner scopes
-/// come first, so a local shadows an inherited member of the same name).
-fn completion_items_from(defs: Vec<solsp_hir::resolve::Definition>) -> Vec<CompletionItem> {
-    let mut seen = std::collections::HashSet::new();
-    defs.into_iter()
-        .filter(|d| seen.insert(d.name.clone()))
-        .map(|d| {
-            let (insert_text, insert_text_format) = callable_snippet(&d.name, d.kind);
-            // a callable inserts `name()`; ask the client to pop signature help inside the parens.
-            let command = insert_text_format.map(|_| trigger_signature_help());
-            CompletionItem {
-                kind: Some(completion_kind(d.kind)),
-                // a value member shows its declared type; everything else its kind label.
-                detail: Some(
-                    d.ty.clone()
-                        .unwrap_or_else(|| def_detail(d.kind).to_string()),
-                ),
-                insert_text,
-                insert_text_format,
-                command,
-                label: d.name,
-                ..Default::default()
-            }
-        })
-        .collect()
-}
-
-/// For a callable (function/modifier/event/error), a snippet inserting `name()` with the
-/// cursor between the parentheses; `(None, None)` otherwise.
-fn callable_snippet(
-    name: &str,
-    kind: solsp_hir::resolve::DefKind,
-) -> (Option<String>, Option<InsertTextFormat>) {
-    use solsp_hir::resolve::DefKind::*;
-    if matches!(kind, Function | Modifier | Event | Error) {
-        (Some(format!("{name}($0)")), Some(InsertTextFormat::SNIPPET))
-    } else {
-        (None, None)
-    }
-}
-
-/// A client command that re-opens signature help after a callable snippet is inserted. The
-/// snippet writes the `(` itself, so the `(` signature-help trigger character never fires;
-/// this nudges the client to request signature help with the cursor sitting inside the parens.
-fn trigger_signature_help() -> Command {
-    Command {
-        title: "Signature help".to_string(),
-        command: "editor.action.triggerParameterHints".to_string(),
-        arguments: None,
-    }
-}
-
-fn completion_kind(k: solsp_hir::resolve::DefKind) -> CompletionItemKind {
-    use solsp_hir::resolve::DefKind::*;
-    match k {
-        Function => CompletionItemKind::FUNCTION,
-        Modifier => CompletionItemKind::FUNCTION,
-        StateVariable | Local | Parameter => CompletionItemKind::VARIABLE,
-        Field => CompletionItemKind::FIELD,
-        Variant => CompletionItemKind::ENUM_MEMBER,
-        Contract => CompletionItemKind::CLASS,
-        Interface => CompletionItemKind::INTERFACE,
-        Library => CompletionItemKind::MODULE,
-        Struct => CompletionItemKind::STRUCT,
-        Enum => CompletionItemKind::ENUM,
-        Event => CompletionItemKind::EVENT,
-        Error => CompletionItemKind::CONSTRUCTOR,
-        UserType => CompletionItemKind::TYPE_PARAMETER,
-    }
-}
-
-fn def_detail(k: solsp_hir::resolve::DefKind) -> &'static str {
-    use solsp_hir::resolve::DefKind::*;
-    match k {
-        Function => "function",
-        Modifier => "modifier",
-        StateVariable => "state variable",
-        Local => "local",
-        Parameter => "parameter",
-        Field => "field",
-        Variant => "enum variant",
-        Contract => "contract",
-        Interface => "interface",
-        Library => "library",
-        Struct => "struct",
-        Enum => "enum",
-        Event => "event",
-        Error => "error",
-        UserType => "type",
-    }
 }
 
 /// Flag identifiers used as values that resolve to no declaration anywhere — typo'd or
@@ -2508,63 +1823,6 @@ fn name_defined(
         }
     }
     cross_file_definition(state, uri, root, name, None).is_some()
-}
-
-/// Whether `name` is a Solidity builtin usable as a value: a global object, a builtin
-/// function, an elementary type (also a cast callee), `payable`, or a unit literal.
-fn is_builtin_name(name: &str) -> bool {
-    const NAMES: &[&str] = &[
-        // the modifier-body placeholder `_;`
-        "_",
-        // globals
-        "msg",
-        "block",
-        "tx",
-        "abi",
-        "this",
-        "super",
-        "type",
-        "now",
-        "blobhash",
-        // builtin functions
-        "require",
-        "assert",
-        "revert",
-        "keccak256",
-        "sha256",
-        "ripemd160",
-        "ecrecover",
-        "addmod",
-        "mulmod",
-        "selfdestruct",
-        "blockhash",
-        "gasleft",
-        "payable",
-        "sha3",
-        // elementary type names (cast callees)
-        "address",
-        "bool",
-        "string",
-        "bytes",
-        "byte",
-        // unit suffixes (lexed as identifiers after a literal)
-        "wei",
-        "gwei",
-        "ether",
-        "seconds",
-        "minutes",
-        "hours",
-        "days",
-        "weeks",
-        "years",
-        "finney",
-        "szabo",
-    ];
-    NAMES.contains(&name)
-        || is_integer_type_name(name)
-        || is_fixed_bytes(name)
-        || name.starts_with("ufixed")
-        || name.starts_with("fixed")
 }
 
 /// A callable's overloads, each as its parameter `(name, type)` list.
@@ -3550,17 +2808,6 @@ fn def_name_range(
         .unwrap_or_else(|| name_node.text_range())
 }
 
-/// Wrap markdown text (and an optional range) into an LSP `Hover`.
-fn markup_hover(value: String, range: Option<lsp_types::Range>) -> Hover {
-    Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value,
-        }),
-        range,
-    }
-}
-
 /// Handle a notification: open/change update the store and republish diagnostics;
 /// close drops the doc and clears its diagnostics. Unknown notifications are ignored.
 fn handle_notification(
@@ -3627,120 +2874,4 @@ fn handle_notification(
         _ => {}
     }
     Ok(())
-}
-
-/// Apply one LSP content change to `text`. A change with a `range` splices the
-/// replacement over those bytes (range is in UTF-16 line/col, mapped via a fresh
-/// `LineIndex` over the current text); a change without a range replaces the whole
-/// document. Out-of-range edits are ignored rather than panicking.
-fn apply_change(text: &mut String, change: TextDocumentContentChangeEvent) {
-    let Some(range) = change.range else {
-        *text = change.text;
-        return;
-    };
-    let li = LineIndex::new(text);
-    let (Some(start), Some(end)) = (
-        to_proto::offset(&li, range.start),
-        to_proto::offset(&li, range.end),
-    ) else {
-        return;
-    };
-    let (start, end) = (u32::from(start) as usize, u32::from(end) as usize);
-    if start <= end && end <= text.len() {
-        text.replace_range(start..end, &change.text);
-    }
-}
-
-/// Extract a notification's params, or `None` (logging) on malformed params. Crucial:
-/// a bad notification must NOT abort the main loop — unlike a request, it has no id to
-/// answer, so we skip it rather than propagate the error out of `run`.
-fn extract_notification<N>(not: Notification) -> Option<N::Params>
-where
-    N: lsp_types::notification::Notification,
-{
-    match not.extract::<N::Params>(N::METHOD) {
-        Ok(params) => Some(params),
-        Err(e) => {
-            eprintln!(
-                "solsp: ignoring malformed {} notification: {e:?}",
-                N::METHOD
-            );
-            None
-        }
-    }
-}
-
-/// Compute and publish diagnostics for a document (empty list if missing). The semantic
-/// type-check (slow, cross-file) runs only when `semantic` is set — on open/save and the
-/// background sweep, not on every keystroke. `budget` bounds the type-check for the
-/// background sweep; an open/save pass passes `None` and runs to completion.
-fn publish_diagnostics(
-    connection: &Connection,
-    state: &ServerState,
-    uri: &Url,
-    semantic: bool,
-    budget: Option<std::time::Duration>,
-) -> Result<()> {
-    let diagnostics = match (state.file(uri), state.line_index(uri)) {
-        (Some(file), Some(li)) => {
-            let parse = solsp_base_db::parse(state.db(), file);
-            let mut diags =
-                to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
-            // semantic checks only on a syntactically clean file (a broken tree mid-edit is
-            // noise). A shared deadline bounds the whole semantic pass on the background
-            // sweep; an open/save pass passes `None` and runs to completion.
-            if semantic && parse.errors().is_empty() {
-                let deadline = budget.map(|b| std::time::Instant::now() + b);
-                let root = parse.syntax();
-                diags.extend(undefined_name_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(type_check_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(assignment_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(return_type_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(cast_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(binary_op_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(comparison_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(unreachable_diagnostics(&root, li, deadline));
-                diags.extend(mutability_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(unused_import_diagnostics(&root, li, deadline));
-                diags.extend(unused_local_diagnostics(&root, li, deadline));
-            }
-            diags
-        }
-        _ => Vec::new(),
-    };
-    send_diagnostics(connection, uri.clone(), diagnostics)
-}
-
-/// Send a `textDocument/publishDiagnostics` notification.
-fn send_diagnostics(
-    connection: &Connection,
-    uri: Url,
-    diagnostics: Vec<lsp_types::Diagnostic>,
-) -> Result<()> {
-    let params = PublishDiagnosticsParams {
-        uri,
-        diagnostics,
-        version: None,
-    };
-    let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
-    connection.sender.send(Message::Notification(not))?;
-    Ok(())
-}
-
-/// Turn an `extract` failure into a JSON-RPC error response under the request's own
-/// id (captured by the caller, since `JsonError` does not carry it).
-fn extract_err_response(id: RequestId, err: ExtractError<Request>) -> Response {
-    let (code, message) = match err {
-        // Unreachable here — the caller already matched the method — but mapped for
-        // completeness.
-        ExtractError::MethodMismatch(req) => (
-            ErrorCode::MethodNotFound,
-            format!("method mismatch: {}", req.method),
-        ),
-        ExtractError::JsonError { method, error } => (
-            ErrorCode::InvalidParams,
-            format!("invalid params for {method}: {error}"),
-        ),
-    };
-    Response::new_err(id, code as i32, message)
 }
