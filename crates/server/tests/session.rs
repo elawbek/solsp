@@ -2722,12 +2722,12 @@ fn invalid_address_cast_of_function_is_diagnosed() {
 #[test]
 fn goto_def_picks_overload_by_argument_types() {
     let uri = Url::parse("file:///ov.sol").unwrap();
-    // two same-arity overloads; the call's `bytes32` arguments must select the bytes32 one,
-    // not the first-declared uint256 one.
+    // two same-arity overloads; the call's `bytes32` named arguments must select the bytes32
+    // one, not the first-declared uint256 one (named-arg matching by key).
     let src = "contract C { \
                function eq(uint256 a, uint256 b) internal pure {} \
                function eq(bytes32 a, bytes32 b) internal pure {} \
-               function f(bytes32 x, bytes32 y) internal pure { eq(x, y); } }";
+               function f(bytes32 x, bytes32 y) internal pure { eq({ a: x, b: y }); } }";
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
@@ -2742,7 +2742,7 @@ fn goto_def_picks_overload_by_argument_types() {
     let _ = next_notification(&client, "textDocument/publishDiagnostics");
 
     // go-to-def on the `eq` callee inside `f`.
-    let call_pos = src.rfind("eq(x, y)").unwrap() as u32;
+    let call_pos = src.rfind("eq({ a: x").unwrap() as u32;
     send_request(
         &client,
         2,

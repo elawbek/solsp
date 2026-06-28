@@ -1861,22 +1861,36 @@ fn typed_overload_target(
     if candidates.len() < 2 {
         return None; // not overloaded — nothing to disambiguate
     }
-    let args: Vec<_> = call
-        .children()
-        .find(|n| n.kind() == ARG_LIST)?
-        .children()
-        .collect();
+    use solsp_syntax::SyntaxKind::NAMED_ARG_LIST;
+    // arguments, positional (`key = None`) or named (`key = Some`).
+    let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
+        if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {
+            al.children().map(|v| (None, v)).collect()
+        } else if let Some(nal) = call.children().find(|n| n.kind() == NAMED_ARG_LIST) {
+            named_arg_pairs(&nal)
+        } else {
+            return None;
+        };
     let arg_tys: Vec<typecheck::Ty> = args
         .iter()
-        .map(|a| infer_arg_ty(state, uri, root, a))
+        .map(|(_, v)| infer_arg_ty(state, uri, root, v))
         .collect();
     let is_base = |a: &str, b: &str| is_subtype(state, uri, root, a, b);
     let accepts = |node: &solsp_syntax::SyntaxNode| {
         let params = named_arg_fields(DefKind::Function, node);
-        params.len() == args.len()
-            && params.iter().zip(&arg_tys).all(|((_, p), a)| {
-                typecheck::implicitly_convertible(a, &typecheck::parse_ty(p), &is_base)
+        if params.len() != args.len() {
+            return false;
+        }
+        (0..args.len()).all(|i| {
+            // a named arg matches its parameter by key; a positional one by position.
+            let ptype = match &args[i].0 {
+                Some(key) => params.iter().find(|(pn, _)| pn == key).map(|(_, t)| t),
+                None => params.get(i).map(|(_, t)| t),
+            };
+            ptype.is_some_and(|p| {
+                typecheck::implicitly_convertible(&arg_tys[i], &typecheck::parse_ty(p), &is_base)
             })
+        })
     };
     let mut matches = candidates.iter().filter(|(_, node)| accepts(node));
     let (_, node) = matches.next()?;
