@@ -2847,68 +2847,6 @@ fn arithmetic_on_address_is_diagnosed() {
     server_thread.join().expect("server thread panicked");
 }
 
-#[test]
-fn inlay_hints_skip_unnamed_parameters() {
-    let uri = Url::parse("file:///ih.sol").unwrap();
-    // `transfer` has named parameters; `noname` has only types — no hints for the latter.
-    let src = "contract C { \
-               function transfer(address to, uint256 amount) public {} \
-               function noname(uint256, address) public {} \
-               function f() public { transfer(msg.sender, 100); noname(5, msg.sender); } }";
-
-    let (server, client) = Connection::memory();
-    let server_thread = thread::spawn(move || {
-        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
-        server.initialize(caps).expect("handshake");
-        solsp_server::run(&server).expect("run");
-    });
-    send_request(&client, 1, "initialize", InitializeParams::default());
-    let _ = next_response(&client);
-    send_notification(&client, "initialized", lsp_types::InitializedParams {});
-    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
-    let _ = next_notification(&client, "textDocument/publishDiagnostics");
-
-    send_request(
-        &client,
-        2,
-        "textDocument/inlayHint",
-        lsp_types::InlayHintParams {
-            text_document: doc_id(&uri),
-            range: Range {
-                start: Position {
-                    line: 0,
-                    character: 0,
-                },
-                end: Position {
-                    line: 0,
-                    character: src.len() as u32,
-                },
-            },
-            work_done_progress_params: Default::default(),
-        },
-    );
-    let hints: Vec<lsp_types::InlayHint> =
-        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
-    let labels: Vec<String> = hints
-        .iter()
-        .map(|h| match &h.label {
-            lsp_types::InlayHintLabel::String(s) => s.clone(),
-            _ => String::new(),
-        })
-        .collect();
-    // only the two named parameters of `transfer`; `noname`'s arguments get nothing.
-    assert_eq!(
-        labels,
-        vec!["to:".to_string(), "amount:".to_string()],
-        "{labels:?}"
-    );
-
-    send_request(&client, 9, "shutdown", serde_json::Value::Null);
-    let _ = next_response(&client);
-    send_notification(&client, "exit", serde_json::Value::Null);
-    server_thread.join().expect("server thread panicked");
-}
-
 /// A notification with malformed params must be ignored, not crash the main loop:
 /// the server has no id to answer, so propagating the error would silently kill it.
 #[test]

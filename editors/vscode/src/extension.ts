@@ -23,13 +23,6 @@ export function activate(context: vscode.ExtensionContext): void {
   };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "solidity" }],
-    // Forwarded to the server at `initialize`; `solsp.inlayHints.parameterNames`
-    // (`all` / `skip-redundant` / `off`) sets the verbosity. Changing it needs a reload.
-    initializationOptions: {
-      inlayHints: vscode.workspace
-        .getConfiguration("solsp")
-        .get<string>("inlayHints.parameterNames", "all"),
-    },
   };
 
   // The client id `solsp` also keys the `solsp.trace.server` setting, so the
@@ -48,22 +41,6 @@ export function activate(context: vscode.ExtensionContext): void {
       void client?.stop();
     },
   });
-
-  // Push live settings changes to the server (no window reload). The server applies the
-  // new inlay-hint mode and asks the editor to re-query hints.
-  context.subscriptions.push(
-    vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("solsp.inlayHints")) {
-        void client?.sendNotification("workspace/didChangeConfiguration", {
-          settings: {
-            inlayHints: vscode.workspace
-              .getConfiguration("solsp")
-              .get<string>("inlayHints.parameterNames", "all"),
-          },
-        });
-      }
-    }),
-  );
 }
 
 export function deactivate(): Thenable<void> | undefined {

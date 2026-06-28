@@ -53,32 +53,6 @@ pub struct ServerState {
     /// Resolved type names. Cleared wholesale on any `set` (an entry may point into the
     /// edited file from any querying file), so it acts within an edit epoch.
     type_cache: RefCell<TypeCache>,
-    /// How much parameter-name inlay detail to produce.
-    inlay_hints: InlayHintMode,
-}
-
-/// Parameter-name inlay hint verbosity.
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-pub enum InlayHintMode {
-    /// No hints.
-    Off,
-    /// Hints, except where the argument already repeats the parameter name.
-    SkipRedundant,
-    /// A hint before every positional argument.
-    #[default]
-    All,
-}
-
-impl InlayHintMode {
-    /// Parse the `initializationOptions.inlayHints` setting (`"all"` / `"skip-redundant"` /
-    /// `"off"`); anything else is `All`.
-    pub fn parse(s: &str) -> Self {
-        match s {
-            "off" => Self::Off,
-            "skip-redundant" => Self::SkipRedundant,
-            _ => Self::All,
-        }
-    }
 }
 
 /// A contract's cached member list (own body + same-file C3 bases, in lookup order).
@@ -192,16 +166,6 @@ impl ServerState {
     /// The salsa database (read-only access for queries).
     pub fn db(&self) -> &RootDatabase {
         &self.db
-    }
-
-    /// Set the parameter-name inlay hint verbosity.
-    pub fn set_inlay_hints(&mut self, mode: InlayHintMode) {
-        self.inlay_hints = mode;
-    }
-
-    /// The parameter-name inlay hint verbosity.
-    pub fn inlay_hint_mode(&self) -> InlayHintMode {
-        self.inlay_hints
     }
 
     /// The `SourceFile` input handle for an open document.

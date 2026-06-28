@@ -10,28 +10,19 @@ fn main() -> Result<()> {
 
     let capabilities = serde_json::to_value(solsp_server::server_capabilities())?;
     let init_params = connection.initialize(capabilities)?;
-    let params = serde_json::from_value::<lsp_types::InitializeParams>(init_params).ok();
     // The editor's workspace root, so the whole project can be pre-parsed up front.
-    let workspace_root = params.as_ref().and_then(|p| {
-        p.workspace_folders
-            .as_ref()
-            .and_then(|folders| folders.first())
-            .and_then(|f| f.uri.to_file_path().ok())
-            .or_else(|| {
-                #[allow(deprecated)]
-                p.root_uri.as_ref().and_then(|u| u.to_file_path().ok())
-            })
-    });
-    // `initializationOptions: { inlayHints: "all" | "skip-redundant" | "off" }` sets the
-    // parameter-name hint verbosity (default "all").
-    let inlay_hints = params
-        .as_ref()
-        .and_then(|p| p.initialization_options.as_ref())
-        .and_then(|o| o.get("inlayHints"))
-        .and_then(|v| v.as_str())
-        .map(solsp_server::state::InlayHintMode::parse)
-        .unwrap_or(solsp_server::state::InlayHintMode::All);
-    solsp_server::run_with_root(&connection, workspace_root, inlay_hints)?;
+    let workspace_root = serde_json::from_value::<lsp_types::InitializeParams>(init_params)
+        .ok()
+        .and_then(|p| {
+            p.workspace_folders
+                .and_then(|folders| folders.into_iter().next())
+                .and_then(|f| f.uri.to_file_path().ok())
+                .or_else(|| {
+                    #[allow(deprecated)]
+                    p.root_uri.and_then(|u| u.to_file_path().ok())
+                })
+        });
+    solsp_server::run_with_root(&connection, workspace_root)?;
 
     // Drop the connection before joining: its `sender` feeds the stdio writer
     // thread, which only finishes once every sender clone is gone. Without this,
