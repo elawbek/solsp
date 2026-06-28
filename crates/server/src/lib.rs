@@ -2594,10 +2594,21 @@ fn handle_notification(
                 return Ok(());
             };
             let uri = params.text_document.uri;
-            // Keep the file loaded (it may be imported by open files) but refresh it
-            // from disk; just stop showing its diagnostics.
+            // Refresh the file from disk (it may still be imported by open files). Keep its
+            // project-wide diagnostics in the tree by re-diagnosing the on-disk version,
+            // rather than clearing — unless the file is gone.
             state.reload_or_drop(&uri);
-            send_diagnostics(connection, uri, Vec::new())?;
+            if state.file(&uri).is_some() {
+                publish_diagnostics(
+                    connection,
+                    state,
+                    &uri,
+                    true,
+                    Some(std::time::Duration::from_millis(150)),
+                )?;
+            } else {
+                send_diagnostics(connection, uri, Vec::new())?;
+            }
         }
         _ => {}
     }
