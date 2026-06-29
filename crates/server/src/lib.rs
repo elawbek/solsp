@@ -10,15 +10,16 @@ use lsp_types::notification::{
     Notification as _,
 };
 use lsp_types::request::{
-    CodeLensRequest, Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
-    Request as _, SemanticTokensFullRequest, SignatureHelpRequest,
+    CodeLensRequest, CodeLensResolve, Completion, DocumentSymbolRequest, GotoDefinition,
+    HoverRequest, References, Rename, Request as _, SemanticTokensFullRequest,
+    SignatureHelpRequest,
 };
 use lsp_types::{
     CodeLens, CodeLensParams, Command, CompletionItem, CompletionParams, CompletionResponse,
     DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
     Hover, HoverParams, Location, ParameterInformation, ParameterLabel, ReferenceParams,
-    SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    SignatureInformation, Url,
+    RenameParams, SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
+    SignatureInformation, TextEdit, Url, WorkspaceEdit,
 };
 
 mod builtins;
@@ -161,8 +162,16 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
             Ok((id, params)) => Response::new_ok(id, references(state, params)),
             Err(e) => extract_err_response(id, e),
         },
+        Rename::METHOD => match req.extract::<RenameParams>(Rename::METHOD) {
+            Ok((id, params)) => Response::new_ok(id, rename(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
         CodeLensRequest::METHOD => match req.extract::<CodeLensParams>(CodeLensRequest::METHOD) {
             Ok((id, params)) => Response::new_ok(id, code_lens(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
+        CodeLensResolve::METHOD => match req.extract::<CodeLens>(CodeLensResolve::METHOD) {
+            Ok((id, lens)) => Response::new_ok(id, code_lens_resolve(state, lens)),
             Err(e) => extract_err_response(id, e),
         },
         HoverRequest::METHOD => match req.extract::<HoverParams>(HoverRequest::METHOD) {
@@ -318,6 +327,49 @@ fn references(state: &ServerState, params: ReferenceParams) -> Option<Vec<Locati
     Some(locations)
 }
 
+/// `textDocument/rename` → workspace edit over every loaded reference to the symbol.
+fn rename(state: &ServerState, params: RenameParams) -> Option<WorkspaceEdit> {
+    if !is_valid_rename_identifier(&params.new_name) {
+        return None;
+    }
+    let pos = params.text_document_position;
+    let uri = pos.text_document.uri;
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let offset = to_proto::offset(li, pos.position)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+    let query_name = solsp_ide::navigation::name_at(&root, offset)?;
+    let target = reference_target_at(state, &uri, &root, offset)?;
+    let locations = reference_locations(state, &query_name, &target, true);
+    if locations.is_empty() {
+        return None;
+    }
+
+    let mut changes: std::collections::HashMap<Url, Vec<TextEdit>> =
+        std::collections::HashMap::new();
+    for loc in locations {
+        changes
+            .entry(loc.uri)
+            .or_default()
+            .push(TextEdit::new(loc.range, params.new_name.clone()));
+    }
+    Some(WorkspaceEdit::new(changes))
+}
+
+fn is_valid_rename_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first == '$' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    if !chars.all(|c| c == '_' || c == '$' || c.is_ascii_alphanumeric()) {
+        return false;
+    }
+    solsp_syntax::SyntaxKind::from_keyword(name).is_none()
+}
+
 fn reference_locations(
     state: &ServerState,
     query_name: &str,
@@ -327,6 +379,12 @@ fn reference_locations(
     let mut locations = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for candidate_uri in state.loaded_uris() {
+        if state
+            .text(&candidate_uri)
+            .is_some_and(|text| !text.contains(query_name))
+        {
+            continue;
+        }
         let Some(candidate_file) = state.file(&candidate_uri) else {
             continue;
         };
@@ -401,30 +459,74 @@ fn code_lens(state: &ServerState, params: CodeLensParams) -> Option<Vec<CodeLens
             uri: uri.clone(),
             range: token.text_range(),
         };
-        let locations = reference_locations(state, token.text(), &target, true);
-        let title = match locations.len() {
-            1 => "1 reference".to_string(),
-            n => format!("{n} references"),
-        };
         let position = to_proto::range(li, token.text_range()).start;
         out.push(CodeLens {
             range: lsp_types::Range {
                 start: position,
                 end: position,
             },
-            command: Some(Command {
-                title,
-                command: "solsp.showReferences".to_string(),
-                arguments: Some(vec![serde_json::json!({
-                    "uri": uri,
-                    "position": position,
-                    "locations": locations,
-                })]),
-            }),
-            data: None,
+            command: None,
+            data: Some(serde_json::json!({
+                "uri": target.uri,
+                "queryName": token.text(),
+                "targetStart": u32::from(target.range.start()),
+                "targetEnd": u32::from(target.range.end()),
+            })),
         });
     }
     Some(out)
+}
+
+fn code_lens_resolve(state: &ServerState, mut lens: CodeLens) -> CodeLens {
+    let Some(data) = lens.data.as_ref() else {
+        return lens;
+    };
+    let Some(uri) = data
+        .get("uri")
+        .and_then(|value| value.as_str())
+        .and_then(|uri| Url::parse(uri).ok())
+    else {
+        return lens;
+    };
+    let Some(query_name) = data.get("queryName").and_then(|value| value.as_str()) else {
+        return lens;
+    };
+    let Some(target_start) = data
+        .get("targetStart")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return lens;
+    };
+    let Some(target_end) = data
+        .get("targetEnd")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return lens;
+    };
+    let target = RefTarget {
+        uri: uri.clone(),
+        range: rowan::TextRange::new(
+            rowan::TextSize::from(target_start),
+            rowan::TextSize::from(target_end),
+        ),
+    };
+    let locations = reference_locations(state, query_name, &target, true);
+    let title = match locations.len() {
+        1 => "1 reference".to_string(),
+        n => format!("{n} references"),
+    };
+    lens.command = Some(Command {
+        title,
+        command: "solsp.showReferences".to_string(),
+        arguments: Some(vec![serde_json::json!({
+            "uri": uri,
+            "position": lens.range.start,
+            "locations": locations,
+        })]),
+    });
+    lens
 }
 
 fn is_code_lens_definition(kind: solsp_hir::resolve::DefKind) -> bool {

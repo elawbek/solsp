@@ -1,9 +1,9 @@
 //! LSP capabilities advertised during `initialize`.
 
 use lsp_types::{
-    CodeLensOptions, CompletionOptions, HoverProviderCapability, OneOf, SemanticTokensFullOptions,
-    SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities,
-    TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
+    CodeLensOptions, CompletionOptions, HoverProviderCapability, OneOf, RenameOptions,
+    SemanticTokensFullOptions, SemanticTokensOptions, SemanticTokensServerCapabilities,
+    ServerCapabilities, TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
 };
 
 use crate::to_proto;
@@ -24,8 +24,12 @@ pub fn server_capabilities() -> ServerCapabilities {
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
         references_provider: Some(OneOf::Left(true)),
+        rename_provider: Some(OneOf::Right(RenameOptions {
+            prepare_provider: Some(false),
+            work_done_progress_options: WorkDoneProgressOptions::default(),
+        })),
         code_lens_provider: Some(CodeLensOptions {
-            resolve_provider: Some(false),
+            resolve_provider: Some(true),
         }),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
