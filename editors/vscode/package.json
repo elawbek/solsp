@@ -4,8 +4,24 @@
   "description": "Thin VS Code client for the solsp Solidity language server (outline, diagnostics, semantic highlighting).",
   "version": "0.0.1",
   "publisher": "solsp",
-  "license": "MIT OR Apache-2.0",
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elawbek/solsp.git",
+    "directory": "editors/vscode"
+  },
+  "homepage": "https://github.com/elawbek/solsp#readme",
+  "bugs": {
+    "url": "https://github.com/elawbek/solsp/issues"
+  },
+  "qna": "https://github.com/elawbek/solsp/issues",
+  "keywords": [
+    "solidity",
+    "ethereum",
+    "smart-contracts",
+    "language-server",
+    "lsp"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
@@ -68,8 +84,11 @@
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "compile": "npm run typecheck && npm run bundle",
+    "typecheck": "tsc -p ./ --noEmit",
+    "bundle": "esbuild ./src/extension.ts --bundle --platform=node --format=cjs --target=node18 --external:vscode --outfile=out/extension.js",
+    "package:platform": "node ./scripts/package-platform.mjs",
+    "watch": "esbuild ./src/extension.ts --bundle --platform=node --format=cjs --target=node18 --external:vscode --outfile=out/extension.js --watch"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -77,6 +96,7 @@
   "devDependencies": {
     "@types/node": "^20.11.0",
     "@types/vscode": "^1.85.0",
+    "esbuild": "^0.28.1",
     "typescript": "^5.4.0"
   }
 }

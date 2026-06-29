@@ -1,7 +1,6 @@
 // Thin VS Code client for solsp. All language intelligence lives in the
 // `solsp-server` binary; this extension only launches it over stdio and wires the
-// `solidity` document selector to it (design §5). Run locally via the Extension
-// Development Host (F5) — no Marketplace publish in M1.
+// `solidity` document selector to it.
 
 import * as fs from "fs";
 import * as path from "path";

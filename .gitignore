@@ -1,6 +1,7 @@
 # Rust build artifacts
 /target
 **/target
+/dist
 
 # Local design docs / specs — kept out of VCS per project preference
 /docs/

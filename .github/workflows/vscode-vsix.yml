@@ -1,0 +1,77 @@
+name: Build VS Code VSIX
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths:
+      - ".github/workflows/vscode-vsix.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "editors/vscode/**"
+  pull_request:
+    paths:
+      - ".github/workflows/vscode-vsix.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "crates/**"
+      - "editors/vscode/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.vscode-target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode-target: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - vscode-target: linux-arm64
+            rust-target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - vscode-target: win32-x64
+            rust-target: x86_64-pc-windows-msvc
+            os: windows-latest
+          - vscode-target: win32-arm64
+            rust-target: aarch64-pc-windows-msvc
+            os: windows-11-arm
+          - vscode-target: darwin-x64
+            rust-target: x86_64-apple-darwin
+            os: macos-15-intel
+          - vscode-target: darwin-arm64
+            rust-target: aarch64-apple-darwin
+            os: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: editors/vscode/package-lock.json
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.rust-target }}
+
+      - name: Install extension dependencies
+        run: npm ci --prefix editors/vscode
+
+      - name: Build VSIX
+        run: npm run package:platform --prefix editors/vscode -- --target ${{ matrix.vscode-target }} --build
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: solsp-vscode-${{ matrix.vscode-target }}
+          path: dist/solsp-vscode-${{ matrix.vscode-target }}.vsix
+          if-no-files-found: error

@@ -1,10 +1,10 @@
-node_modules/**
-.vscode/**
-scripts/**
-src/**
+node_modules/
+scripts/
+src/
 tsconfig.json
 package-lock.json
+*.vsix
 **/*.map
 **/*.ts
 .gitignore
-.npmignore
+.vscode/
