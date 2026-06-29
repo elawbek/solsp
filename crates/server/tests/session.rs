@@ -899,6 +899,46 @@ fn unused_private_function_is_diagnosed() {
 }
 
 #[test]
+fn override_used_by_base_is_not_diagnosed_as_unused() {
+    let uri = Url::parse("file:///override-used.sol").unwrap();
+    let src = "contract Base {\n    function run() public { hook(); }\n    function hook() internal virtual {}\n    function idle() internal virtual {}\n}\ncontract Child is Base {\n    function hook() internal override {}\n    function idle() internal override {}\n}\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "function `hook()` is never used"
+                && diag.range.start.line == 6),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        diags.diagnostics.iter().any(|diag| {
+            diag.message == "function `idle()` is never used" && diag.range.start.line == 7
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn unused_private_state_variable_is_diagnosed() {
     let uri = Url::parse("file:///unused-state.sol").unwrap();
     let src = "contract C {\n    uint256 private used;\n    uint256 private unused;\n    uint256 public publicVar;\n    function run() public { used = 1; }\n}\n";

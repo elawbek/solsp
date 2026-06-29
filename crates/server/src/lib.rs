@@ -487,6 +487,9 @@ fn unused_function_diagnostics(
         let Some(name) = function_name(&function) else {
             continue;
         };
+        if overridden_base_function_is_referenced(state, uri, root, &function, &name) {
+            continue;
+        }
         let target = RefTarget {
             uri: uri.clone(),
             range: function_name_range(&function),
@@ -548,6 +551,77 @@ fn unused_state_variable_diagnostics(
         });
     }
     out
+}
+
+fn overridden_base_function_is_referenced(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    function: &solsp_syntax::SyntaxNode,
+    name: &str,
+) -> bool {
+    if !function_has_override(function) {
+        return false;
+    }
+    let Some(arity) = function_arity(function) else {
+        return false;
+    };
+    let Some(contract) = enclosing_contract(function) else {
+        return false;
+    };
+    let Some((base_uri, base_root, base_def)) =
+        overridden_base_function(state, uri, root, &contract, name, arity)
+    else {
+        return false;
+    };
+    let target = RefTarget {
+        uri: base_uri,
+        range: def_name_range(&base_root, &base_def),
+    };
+    !reference_locations(state, name, &target, false).is_empty()
+}
+
+fn overridden_base_function(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+    name: &str,
+    arity: usize,
+) -> Option<(
+    Url,
+    solsp_syntax::SyntaxNode,
+    solsp_hir::resolve::Definition,
+)> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut queue: VecDeque<(Url, solsp_syntax::SyntaxNode, solsp_syntax::SyntaxNode)> =
+        VecDeque::new();
+    let mut visited: HashSet<(Url, String)> = HashSet::new();
+    queue.push_back((uri.clone(), root.clone(), contract.clone()));
+
+    while let Some((current_uri, current_root, current_contract)) = queue.pop_front() {
+        let key = (
+            current_uri.clone(),
+            solsp_hir::resolve::contract_def_name(&current_contract).unwrap_or_default(),
+        );
+        if !visited.insert(key) {
+            continue;
+        }
+
+        for base in solsp_hir::resolve::base_names(&current_contract) {
+            let Some((base_uri, base_root, base_node)) =
+                resolve_base(state, &current_uri, &current_root, &base)
+            else {
+                continue;
+            };
+            if let Some(def) = solsp_hir::resolve::contract_member(&base_node, name, Some(arity)) {
+                return Some((base_uri, base_root, def));
+            }
+            queue.push_back((base_uri, base_root, base_node));
+        }
+    }
+    None
 }
 
 /// `textDocument/codeAction` → quick fixes for concrete contracts that still owe
@@ -713,6 +787,14 @@ fn function_has_visibility(function: &solsp_syntax::SyntaxNode) -> bool {
                 PUBLIC_KW | EXTERNAL_KW | INTERNAL_KW | PRIVATE_KW
             )
         })
+}
+
+fn function_has_override(function: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::OVERRIDE_KW;
+    function
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .any(|token| token.kind() == OVERRIDE_KW)
 }
 
 fn missing_inherited_functions(
