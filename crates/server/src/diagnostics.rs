@@ -60,6 +60,9 @@ pub(super) fn publish_diagnostics(
                 diags.extend(super::unused_function_diagnostics(
                     state, uri, &root, li, deadline,
                 ));
+                diags.extend(super::unused_state_variable_diagnostics(
+                    state, uri, &root, li, deadline,
+                ));
                 diags.extend(super::abstract_contract_diagnostics(
                     state, uri, &root, li, deadline,
                 ));

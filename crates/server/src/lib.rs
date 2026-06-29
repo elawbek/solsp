@@ -506,6 +506,50 @@ fn unused_function_diagnostics(
     out
 }
 
+fn unused_state_variable_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, STATE_VAR_DEF};
+
+    let mut out = Vec::new();
+    for var in root
+        .descendants()
+        .filter(|node| node.kind() == STATE_VAR_DEF)
+    {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if var.ancestors().all(|node| node.kind() != CONTRACT_DEF)
+            || matches!(member_visibility(&var), Some("public"))
+        {
+            continue;
+        }
+        let Some(name) = declaration_name(&var) else {
+            continue;
+        };
+        let target = RefTarget {
+            uri: uri.clone(),
+            range: declaration_name_range(&var),
+        };
+        if reference_locations(state, &name, &target, true).len() > 1 {
+            continue;
+        }
+        out.push(lsp_types::Diagnostic {
+            range: to_proto::range(li, target.range),
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            source: Some("solsp".to_string()),
+            message: format!("state variable `{name}` is never used"),
+            tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// `textDocument/codeAction` → quick fixes for concrete contracts that still owe
 /// abstract/interface functions.
 fn code_action(state: &ServerState, params: CodeActionParams) -> Option<CodeActionResponse> {
@@ -766,11 +810,7 @@ fn function_label(function: &solsp_syntax::SyntaxNode) -> String {
 }
 
 fn function_name(function: &solsp_syntax::SyntaxNode) -> Option<String> {
-    use solsp_syntax::SyntaxKind::NAME;
-    function
-        .children()
-        .find(|child| child.kind() == NAME)
-        .and_then(|name| node_ident(&name))
+    declaration_name(function)
 }
 
 fn function_name_range(function: &solsp_syntax::SyntaxNode) -> rowan::TextRange {
@@ -796,8 +836,32 @@ fn function_name_range(function: &solsp_syntax::SyntaxNode) -> rowan::TextRange 
 }
 
 fn function_visibility(function: &solsp_syntax::SyntaxNode) -> Option<&'static str> {
+    member_visibility(function)
+}
+
+fn declaration_name(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
+    use solsp_syntax::SyntaxKind::NAME;
+    decl.children()
+        .find(|child| child.kind() == NAME)
+        .and_then(|name| node_ident(&name))
+}
+
+fn declaration_name_range(decl: &solsp_syntax::SyntaxNode) -> rowan::TextRange {
+    use solsp_syntax::SyntaxKind::{IDENT, NAME};
+    decl.children()
+        .find(|child| child.kind() == NAME)
+        .and_then(|name| {
+            name.children_with_tokens()
+                .filter_map(|element| element.into_token())
+                .find(|token| token.kind() == IDENT)
+        })
+        .map(|token| token.text_range())
+        .unwrap_or_else(|| decl.text_range())
+}
+
+fn member_visibility(member: &solsp_syntax::SyntaxNode) -> Option<&'static str> {
     use solsp_syntax::SyntaxKind::{EXTERNAL_KW, INTERNAL_KW, PRIVATE_KW, PUBLIC_KW};
-    function
+    member
         .children_with_tokens()
         .filter_map(|element| element.into_token())
         .find_map(|token| match token.kind() {
