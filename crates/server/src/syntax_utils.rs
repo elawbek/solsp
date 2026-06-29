@@ -17,7 +17,14 @@ pub(super) fn param_name_types(decl: &solsp_syntax::SyntaxNode) -> Vec<(String, 
         .into_iter()
         .flat_map(|pl| pl.children())
         .filter(|n| n.kind() == PARAM)
-        .filter_map(|p| named_type(&p))
+        .filter_map(|p| {
+            let name = p
+                .children()
+                .find(|n| n.kind() == solsp_syntax::SyntaxKind::NAME)
+                .and_then(|n| node_ident(&n))
+                .unwrap_or_default();
+            Some((name, type_text(&p)?))
+        })
         .collect()
 }
 
