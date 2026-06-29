@@ -47,10 +47,10 @@ export function deactivate(): Thenable<void> | undefined {
   return client?.stop();
 }
 
-/// Locate the `solsp-server` binary: an explicit setting wins; otherwise probe each
-/// open workspace folder's Cargo output AND the repo's `target/` relative to this
-/// extension (`editors/vscode` → `../../target`), so F5 works no matter which folder
-/// the Extension Development Host opened. Finally fall back to the bare name on `PATH`.
+/// Locate the `solsp-server` binary: an explicit setting wins; otherwise use a bundled
+/// binary from the installed extension. Dev builds then probe Cargo outputs so F5 works
+/// no matter which folder the Extension Development Host opened. Finally fall back to
+/// the bare name on `PATH`.
 function resolveServerPath(extensionPath: string): string {
   const configured = vscode.workspace
     .getConfiguration("solsp")
@@ -60,6 +60,10 @@ function resolveServerPath(extensionPath: string): string {
   }
 
   const exe = process.platform === "win32" ? "solsp-server.exe" : "solsp-server";
+  const bundled = path.join(extensionPath, "server", exe);
+  if (fs.existsSync(bundled)) {
+    return bundled;
+  }
 
   // Roots to probe for `target/{debug,release}/<exe>`: open folders first, then the
   // repo root inferred from the extension's own location.

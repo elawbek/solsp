@@ -34,9 +34,12 @@ pub(super) fn named_arg_completion(
     if last_delim == Some(COLON) {
         return None; // value position — let scope/member completion handle it
     }
-    let (def_uri, def) = named_arg_target(state, uri, root, &nal)?;
-    let droot = super::parse_root(state, &def_uri)?;
-    let fields = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot));
+    let target = named_arg_target(state, uri, root, &nal)?;
+    let droot = super::parse_root(state, &target.uri)?;
+    let fields = named_arg_fields(target.def.kind, &target.def.full_ptr.to_node(&droot))
+        .into_iter()
+        .skip(target.skip_params)
+        .collect::<Vec<_>>();
     // drop keys already supplied in this argument list (the direct NAME children).
     let present: std::collections::HashSet<String> = nal
         .children()
@@ -77,10 +80,11 @@ pub(super) fn named_arg_hover(
         return None;
     }
     let key = super::node_ident(&name_node)?;
-    let (def_uri, def) = named_arg_target(state, uri, root, &nal)?;
-    let droot = super::parse_root(state, &def_uri)?;
-    let (_, ty) = named_arg_fields(def.kind, &def.full_ptr.to_node(&droot))
+    let target = named_arg_target(state, uri, root, &nal)?;
+    let droot = super::parse_root(state, &target.uri)?;
+    let (_, ty) = named_arg_fields(target.def.kind, &target.def.full_ptr.to_node(&droot))
         .into_iter()
+        .skip(target.skip_params)
         .find(|(n, _)| n == &key)?;
     Some(super::markup_hover(
         format!("```solidity\n{ty} {key}\n```"),
@@ -88,15 +92,43 @@ pub(super) fn named_arg_hover(
     ))
 }
 
+struct NamedArgTarget {
+    uri: Url,
+    def: solsp_hir::resolve::Definition,
+    skip_params: usize,
+}
+
 /// Resolve the callee of the call whose named-argument list is `nal` to its declaration.
+/// A `using L for T` extension call hides the receiver as the library function's first
+/// parameter, so named arguments in the explicit braces start after that parameter.
 fn named_arg_target(
     state: &ServerState,
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     nal: &solsp_syntax::SyntaxNode,
-) -> Option<(Url, solsp_hir::resolve::Definition)> {
+) -> Option<NamedArgTarget> {
+    use solsp_syntax::SyntaxKind::{MEMBER_EXPR, NAME};
     let callee = nal.parent()?.first_child()?;
-    super::resolve_named_callee(state, uri, root, &callee)
+    if callee.kind() == MEMBER_EXPR {
+        let receiver = callee.first_child()?;
+        let member = super::member_name(&callee)?;
+        let explicit_args = nal.children().filter(|n| n.kind() != NAME).count();
+        if let Some((target_uri, def)) =
+            super::using_member(state, uri, root, &receiver, &member, Some(explicit_args))
+        {
+            return Some(NamedArgTarget {
+                uri: target_uri,
+                def,
+                skip_params: 1,
+            });
+        }
+    }
+    let (target_uri, def) = super::resolve_named_callee(state, uri, root, &callee)?;
+    Some(NamedArgTarget {
+        uri: target_uri,
+        def,
+        skip_params: 0,
+    })
 }
 
 /// The `(name, type)` of each named argument a callee accepts: a function/constructor's

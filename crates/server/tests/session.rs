@@ -1702,6 +1702,88 @@ fn completion_builtin_type_members() {
 }
 
 #[test]
+fn using_for_named_arg_hover_skips_receiver_param() {
+    let uri = Url::parse("file:///uf_named.sol").unwrap();
+    let src = "struct Addresses { uint256 id; }\n\
+               library SeasonsLibrary { function syncSeasonRewards(Addresses memory r, uint256 seasonYear, uint256 seasonIndex) internal {} }\n\
+               contract C { using SeasonsLibrary for Addresses; function f() public { Addresses memory r; r.syncSeasonRewards({ seasonYear: 1, seasonIndex: 1 }); r.syncSeasonRewards({ }); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line2 = src.lines().nth(2).unwrap();
+    let hover_ch = line2.find("seasonYear: 1").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 2,
+                    character: hover_ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(m) = hov.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        m.value.contains("uint256 seasonYear"),
+        "hover was {:?}",
+        m.value
+    );
+
+    let completion_ch = line2.rfind("({ })").unwrap() as u32 + 2;
+    send_request(
+        &client,
+        3,
+        "textDocument/completion",
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 2,
+                    character: completion_ch,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: None,
+        },
+    );
+    let resp = next_response(&client);
+    let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let items = match r {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let labels: Vec<_> = items.iter().map(|i| i.label.as_str()).collect();
+    assert!(labels.contains(&"seasonYear"), "{labels:?}");
+    assert!(labels.contains(&"seasonIndex"), "{labels:?}");
+    assert!(!labels.contains(&"r"), "{labels:?}");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn completion_builtin_global_members() {
     let uri = Url::parse("file:///b.sol").unwrap();
     let src = "contract C { function f() public { uint256 x = block.; address a = tx.; } }";
