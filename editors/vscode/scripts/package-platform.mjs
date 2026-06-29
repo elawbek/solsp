@@ -83,7 +83,16 @@ try {
   const out = join(distDir, `solsp-vscode-${target}.vsix`);
   run(
     "npx",
-    ["@vscode/vsce", "package", "--target", target, "--no-rewrite-relative-links", "--out", out],
+    [
+      "@vscode/vsce",
+      "package",
+      "--target",
+      target,
+      "--allow-missing-repository",
+      "--no-rewrite-relative-links",
+      "--out",
+      out,
+    ],
     extensionDir,
   );
   console.log(`Packaged ${out}`);

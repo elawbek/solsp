@@ -1,20 +1,10 @@
 {
-  "name": "solsp-vscode",
-  "displayName": "solsp — Solidity Language Server",
-  "description": "Thin VS Code client for the solsp Solidity language server (outline, diagnostics, semantic highlighting).",
+  "name": "solsp",
+  "displayName": "SolSP",
+  "description": "Solidity language support powered by the bundled solsp language server.",
   "version": "0.0.1",
   "publisher": "solsp",
   "license": "MIT",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/elawbek/solsp.git",
-    "directory": "editors/vscode"
-  },
-  "homepage": "https://github.com/elawbek/solsp#readme",
-  "bugs": {
-    "url": "https://github.com/elawbek/solsp/issues"
-  },
-  "qna": "https://github.com/elawbek/solsp/issues",
   "keywords": [
     "solidity",
     "ethereum",
