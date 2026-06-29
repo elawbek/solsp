@@ -49,6 +49,9 @@ pub(super) fn publish_diagnostics(
                 diags.extend(super::comparison_diagnostics(
                     state, uri, &root, li, deadline,
                 ));
+                diags.extend(super::condition_diagnostics(
+                    state, uri, &root, li, deadline,
+                ));
                 diags.extend(super::unreachable_diagnostics(&root, li, deadline));
                 diags.extend(super::mutability_diagnostics(
                     state, uri, &root, li, deadline,

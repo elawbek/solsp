@@ -57,7 +57,14 @@
           "decorator:solidity": "#cd5c5c"
         }
       }
-    }
+    },
+    "grammars": [
+      {
+        "language": "solidity",
+        "scopeName": "source.solidity",
+        "path": "./syntaxes/solidity.tmLanguage.json"
+      }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",

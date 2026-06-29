@@ -1,0 +1,118 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Solidity",
+  "scopeName": "source.solidity",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#types"
+    },
+    {
+      "include": "#builtins"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.line.double-slash.solidity",
+          "match": "//.*$"
+        },
+        {
+          "name": "comment.block.solidity",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.solidity",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.solidity",
+              "match": "\\\\."
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.solidity",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.solidity",
+              "match": "\\\\."
+            }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.hex.solidity",
+          "match": "\\b0[xX][0-9a-fA-F_]+\\b"
+        },
+        {
+          "name": "constant.numeric.decimal.solidity",
+          "match": "\\b[0-9][0-9_]*(?:\\.[0-9_]+)?(?:[eE][+-]?[0-9_]+)?\\b"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.solidity",
+          "match": "\\b(?:if|else|for|while|do|break|continue|return|revert|try|catch|throw|emit|assembly)\\b"
+        },
+        {
+          "name": "keyword.declaration.solidity",
+          "match": "\\b(?:pragma|import|from|as|contract|interface|library|function|modifier|constructor|struct|enum|event|error|type|using|is)\\b"
+        },
+        {
+          "name": "keyword.other.solidity",
+          "match": "\\b(?:public|private|internal|external|pure|view|payable|virtual|override|abstract|immutable|constant|indexed|anonymous|returns|storage|memory|calldata|unchecked|new|delete)\\b"
+        },
+        {
+          "name": "constant.language.boolean.solidity",
+          "match": "\\b(?:true|false)\\b"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "name": "support.type.solidity",
+          "match": "\\b(?:address|bool|string|bytes(?:[1-9]|[12][0-9]|3[0-2])?|u?int(?:8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256)?)\\b"
+        }
+      ]
+    },
+    "builtins": {
+      "patterns": [
+        {
+          "name": "support.variable.solidity",
+          "match": "\\b(?:msg|block|tx|abi|this|super)\\b"
+        },
+        {
+          "name": "support.function.solidity",
+          "match": "\\b(?:require|assert|revert|keccak256|sha256|ripemd160|ecrecover|addmod|mulmod|selfdestruct|gasleft)\\b"
+        }
+      ]
+    }
+  }
+}

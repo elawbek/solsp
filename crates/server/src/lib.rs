@@ -623,7 +623,12 @@ fn receiver_value_info(
         match callee_display_name(&callee)?.as_str() {
             "address" => return Some(("address".to_string(), false)),
             "payable" => return Some(("address payable".to_string(), false)),
-            _ => {}
+            name => {
+                let parsed = typecheck::parse_ty(name);
+                if !matches!(parsed, typecheck::Ty::User(_)) {
+                    return Some((ty_label(&parsed), false));
+                }
+            }
         }
         // a function call → its return type (a memory/value result).
         let (duri, def) = resolve_named_callee(state, uri, root, &callee)?;
@@ -658,6 +663,21 @@ fn receiver_value_info(
                 .filter(|d| !d.is_empty())
             {
                 // drop a data location so the type model sees `bytes`, not `bytes calldata`.
+                let ty = d
+                    .trim_end_matches(" calldata")
+                    .trim_end_matches(" memory")
+                    .trim_end_matches(" storage")
+                    .to_string();
+                return Some((ty, false));
+            }
+        }
+        if let Some(items) = value_type_builtin_members(state, uri, root, &recv) {
+            if let Some(d) = items
+                .iter()
+                .find(|i| i.label == member)
+                .and_then(|i| i.detail.as_deref())
+                .filter(|d| !d.is_empty())
+            {
                 let ty = d
                     .trim_end_matches(" calldata")
                     .trim_end_matches(" memory")
@@ -1738,6 +1758,67 @@ fn comparison_diagnostics(
         }
     }
     out
+}
+
+/// Flag control-flow conditions whose concrete type is not `bool`. Unknown expressions
+/// are skipped so incomplete type inference does not create false positives.
+fn condition_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{DO_WHILE_STMT, FOR_STMT, IF_STMT, WHILE_STMT};
+    let mut out = Vec::new();
+    for stmt in root
+        .descendants()
+        .filter(|n| matches!(n.kind(), IF_STMT | WHILE_STMT | DO_WHILE_STMT | FOR_STMT))
+    {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let Some(condition) = condition_expr(&stmt) else {
+            continue;
+        };
+        let ty = infer_arg_ty(state, uri, root, &condition);
+        if matches!(
+            ty,
+            typecheck::Ty::Unknown | typecheck::Ty::Bool | typecheck::Ty::BoolLiteral
+        ) {
+            continue;
+        }
+        out.push(type_mismatch(
+            li,
+            &condition,
+            &format!("condition must be `bool`, got `{}`", ty_label(&ty)),
+        ));
+    }
+    out
+}
+
+/// The condition expression of an `if`/`while`/`do while`/`for` statement.
+fn condition_expr(stmt: &solsp_syntax::SyntaxNode) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::{DO_WHILE_STMT, FOR_STMT, IF_STMT, SEMICOLON, WHILE_STMT};
+    match stmt.kind() {
+        IF_STMT | WHILE_STMT => stmt.children().next(),
+        DO_WHILE_STMT => stmt.children().last(),
+        FOR_STMT => {
+            let semis: Vec<_> = stmt
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .filter(|t| t.kind() == SEMICOLON)
+                .collect();
+            let [first, second, ..] = semis.as_slice() else {
+                return None;
+            };
+            stmt.children().find(|n| {
+                first.text_range().end() <= n.text_range().start()
+                    && n.text_range().end() <= second.text_range().start()
+            })
+        }
+        _ => None,
+    }
 }
 
 /// Whether a type supports the ordered comparison operators `< > <= >=` (integers,

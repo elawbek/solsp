@@ -354,6 +354,103 @@ fn goto_definition_and_hover() {
 }
 
 #[test]
+fn hover_bytes_length_builtin_member() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+
+    let uri = Url::parse("file:///C.sol").unwrap();
+    let src =
+        "contract C { function f(string memory s, bytes memory b) public { uint256 n = b.length + bytes(s).length + msg.sender.code.length; } }";
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let cursor = TextDocumentPositionParams {
+        text_document: doc_id(&uri),
+        position: Position {
+            line: 0,
+            character: src.find("length").unwrap() as u32,
+        },
+    };
+    send_request(
+        &client,
+        2,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: cursor,
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hover: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(markup.value.contains("length: uint256"), "{markup:?}");
+    assert!(markup.value.contains("*(builtin)*"), "{markup:?}");
+
+    let cast_cursor = TextDocumentPositionParams {
+        text_document: doc_id(&uri),
+        position: Position {
+            line: 0,
+            character: (src.find("bytes(s).length").unwrap() + "bytes(s).".len()) as u32,
+        },
+    };
+    send_request(
+        &client,
+        3,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: cast_cursor,
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hover: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(markup.value.contains("length: uint256"), "{markup:?}");
+    assert!(markup.value.contains("*(builtin)*"), "{markup:?}");
+
+    let code_cursor = TextDocumentPositionParams {
+        text_document: doc_id(&uri),
+        position: Position {
+            line: 0,
+            character: src.rfind("length").unwrap() as u32,
+        },
+    };
+    send_request(
+        &client,
+        4,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: code_cursor,
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hover: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(markup.value.contains("length: uint256"), "{markup:?}");
+    assert!(markup.value.contains("*(builtin)*"), "{markup:?}");
+
+    send_request(&client, 5, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn cross_file_goto_definition() {
     use std::fs;
 
@@ -2396,6 +2493,39 @@ fn named_argument_type_mismatch_is_diagnosed() {
         .collect();
     assert_eq!(errs.len(), 1, "{:?}", diags.diagnostics);
     assert!(errs[0].message.contains("uint256"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn non_bool_conditions_are_diagnosed() {
+    let uri = Url::parse("file:///cond.sol").unwrap();
+    let src = "contract C { function f() public { uint256 n; bool ok; \
+               if (n) {} while (1) {} for (; n; ) {} if (ok) {} } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let errs: Vec<_> = diags
+        .diagnostics
+        .iter()
+        .filter(|d| d.message.starts_with("condition must be"))
+        .collect();
+    assert_eq!(errs.len(), 3, "{:?}", diags.diagnostics);
+    assert!(errs.iter().any(|d| d.message.contains("uint256")));
+    assert!(errs.iter().any(|d| d.message.contains("literal")));
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
