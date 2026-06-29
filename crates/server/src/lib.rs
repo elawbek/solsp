@@ -462,6 +462,50 @@ fn missing_visibility_diagnostics(
     out
 }
 
+fn unused_function_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, FUNCTION_DEF};
+
+    let mut out = Vec::new();
+    for function in root
+        .descendants()
+        .filter(|node| node.kind() == FUNCTION_DEF)
+    {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if function.ancestors().all(|node| node.kind() != CONTRACT_DEF)
+            || !matches!(function_visibility(&function), Some("private" | "internal"))
+        {
+            continue;
+        }
+        let Some(name) = function_name(&function) else {
+            continue;
+        };
+        let target = RefTarget {
+            uri: uri.clone(),
+            range: function_name_range(&function),
+        };
+        if reference_locations(state, &name, &target, true).len() > 1 {
+            continue;
+        }
+        out.push(lsp_types::Diagnostic {
+            range: to_proto::range(li, target.range),
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            source: Some("solsp".to_string()),
+            message: format!("function `{}` is never used", function_label(&function)),
+            tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// `textDocument/codeAction` → quick fixes for concrete contracts that still owe
 /// abstract/interface functions.
 fn code_action(state: &ServerState, params: CodeActionParams) -> Option<CodeActionResponse> {
@@ -712,18 +756,21 @@ fn direct_abstract_function_labels(contract: &solsp_syntax::SyntaxNode) -> Vec<S
 }
 
 fn function_label(function: &solsp_syntax::SyntaxNode) -> String {
-    use solsp_syntax::SyntaxKind::NAME;
-    let name = function
-        .children()
-        .find(|child| child.kind() == NAME)
-        .and_then(|name| node_ident(&name))
-        .unwrap_or_else(|| "function".to_string());
+    let name = function_name(function).unwrap_or_else(|| "function".to_string());
     let params = param_name_types(function)
         .into_iter()
         .map(|(_, ty)| ty)
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}({params})")
+}
+
+fn function_name(function: &solsp_syntax::SyntaxNode) -> Option<String> {
+    use solsp_syntax::SyntaxKind::NAME;
+    function
+        .children()
+        .find(|child| child.kind() == NAME)
+        .and_then(|name| node_ident(&name))
 }
 
 fn function_name_range(function: &solsp_syntax::SyntaxNode) -> rowan::TextRange {
@@ -746,6 +793,20 @@ fn function_name_range(function: &solsp_syntax::SyntaxNode) -> rowan::TextRange 
         .find(|token| matches!(token.kind(), FUNCTION_KW | FALLBACK_KW | RECEIVE_KW))
         .map(|token| token.text_range())
         .unwrap_or_else(|| function.text_range())
+}
+
+fn function_visibility(function: &solsp_syntax::SyntaxNode) -> Option<&'static str> {
+    use solsp_syntax::SyntaxKind::{EXTERNAL_KW, INTERNAL_KW, PRIVATE_KW, PUBLIC_KW};
+    function
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find_map(|token| match token.kind() {
+            PUBLIC_KW => Some("public"),
+            EXTERNAL_KW => Some("external"),
+            INTERNAL_KW => Some("internal"),
+            PRIVATE_KW => Some("private"),
+            _ => None,
+        })
 }
 
 fn contract_name_range(contract: &solsp_syntax::SyntaxNode) -> rowan::TextRange {

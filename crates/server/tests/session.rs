@@ -858,6 +858,47 @@ fn code_action_adds_missing_function_visibility() {
 }
 
 #[test]
+fn unused_private_function_is_diagnosed() {
+    let uri = Url::parse("file:///unused-function.sol").unwrap();
+    let src = "contract C {\n    function used() private {}\n    function unused() private {}\n    function run() public { used(); }\n}\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|diag| {
+            diag.severity == Some(lsp_types::DiagnosticSeverity::WARNING)
+                && diag.tags == Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])
+                && diag.message == "function `unused()` is never used"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "function `used()` is never used"),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn code_action_implements_missing_cross_file_interface_function() {
     use std::fs;
 
