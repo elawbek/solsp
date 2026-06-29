@@ -56,6 +56,7 @@ pub(super) fn publish_diagnostics(
                 diags.extend(super::mutability_diagnostics(
                     state, uri, &root, li, deadline,
                 ));
+                diags.extend(super::missing_visibility_diagnostics(&root, li, deadline));
                 diags.extend(super::abstract_contract_diagnostics(
                     state, uri, &root, li, deadline,
                 ));

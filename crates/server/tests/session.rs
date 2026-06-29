@@ -773,6 +773,91 @@ fn code_action_implements_missing_interface_function_or_marks_abstract() {
 }
 
 #[test]
+fn code_action_adds_missing_function_visibility() {
+    let uri = Url::parse("file:///visibility.sol").unwrap();
+    let src = "contract C {\n    function f() returns (uint256) { return 1; }\n}\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|diag| {
+            diag.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                && (diag.message == "Function `f(uint256)` has no explicit visibility"
+                    || diag.message == "Function `f()` has no explicit visibility")
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    let position = Position {
+        line: 1,
+        character: 15,
+    };
+    send_request(
+        &client,
+        2,
+        "textDocument/codeAction",
+        CodeActionParams {
+            text_document: doc_id(&uri),
+            range: Range {
+                start: position,
+                end: position,
+            },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let actions: Vec<CodeActionOrCommand> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let public = actions
+        .iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) if action.title == "Add public visibility" => {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("public visibility action");
+    let edit = public.edit.as_ref().expect("visibility edit");
+    assert_eq!(
+        edit.changes.as_ref().unwrap().get(&uri).unwrap()[0].new_text,
+        " public"
+    );
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        CodeActionOrCommand::CodeAction(action) if action.title == "Add external visibility"
+    )));
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        CodeActionOrCommand::CodeAction(action) if action.title == "Add internal visibility"
+    )));
+    assert!(actions.iter().any(|action| matches!(
+        action,
+        CodeActionOrCommand::CodeAction(action) if action.title == "Add private visibility"
+    )));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn code_action_implements_missing_cross_file_interface_function() {
     use std::fs;
 

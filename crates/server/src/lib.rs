@@ -429,6 +429,39 @@ fn abstract_contract_diagnostics(
     out
 }
 
+fn missing_visibility_diagnostics(
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, FUNCTION_DEF};
+    let mut out = Vec::new();
+    for function in root
+        .descendants()
+        .filter(|node| node.kind() == FUNCTION_DEF)
+    {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if function.ancestors().all(|node| node.kind() != CONTRACT_DEF)
+            || function_has_visibility(&function)
+        {
+            continue;
+        }
+        out.push(lsp_types::Diagnostic {
+            range: to_proto::range(li, function_name_range(&function)),
+            severity: Some(lsp_types::DiagnosticSeverity::ERROR),
+            source: Some("solsp".to_string()),
+            message: format!(
+                "Function `{}` has no explicit visibility",
+                function_label(&function)
+            ),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 /// `textDocument/codeAction` → quick fixes for concrete contracts that still owe
 /// abstract/interface functions.
 fn code_action(state: &ServerState, params: CodeActionParams) -> Option<CodeActionResponse> {
@@ -442,9 +475,15 @@ fn code_action(state: &ServerState, params: CodeActionParams) -> Option<CodeActi
         return Some(Vec::new());
     }
 
+    let mut actions = Vec::new();
+    if let Some(function) = function_at_offset(&root, offset) {
+        if !function_has_visibility(&function) {
+            actions_extend_visibility(&mut actions, &uri, li, &function);
+        }
+    }
+
     let missing = missing_inherited_functions(state, &uri, &root, &contract);
     let needs_abstract = !missing.is_empty() || has_direct_abstract_function(&contract);
-    let mut actions = Vec::new();
 
     if !missing.is_empty() {
         if let Some(edit) = implement_missing_edit(&uri, li, &contract, &missing) {
@@ -500,6 +539,91 @@ fn contract_at_offset(
         .find(|node| {
             let range = node.text_range();
             range.start() <= offset && offset <= range.end()
+        })
+}
+
+fn function_at_offset(
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::FUNCTION_DEF;
+    if let Some(token) = root.token_at_offset(offset).find(|token| {
+        let range = token.text_range();
+        range.start() <= offset && offset <= range.end()
+    }) {
+        if let Some(function) = token.parent().and_then(|node| {
+            node.ancestors()
+                .find(|ancestor| ancestor.kind() == FUNCTION_DEF)
+        }) {
+            return Some(function);
+        }
+    }
+    root.descendants()
+        .filter(|node| node.kind() == FUNCTION_DEF)
+        .find(|node| {
+            let range = node.text_range();
+            range.start() <= offset && offset <= range.end()
+        })
+}
+
+fn actions_extend_visibility(
+    actions: &mut CodeActionResponse,
+    uri: &Url,
+    li: &solsp_ide::LineIndex,
+    function: &solsp_syntax::SyntaxNode,
+) {
+    for visibility in ["public", "external", "internal", "private"] {
+        if let Some(edit) = add_visibility_edit(uri, li, function, visibility) {
+            actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+                title: format!("Add {visibility} visibility"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                edit: Some(edit),
+                ..Default::default()
+            }));
+        }
+    }
+}
+
+fn add_visibility_edit(
+    uri: &Url,
+    li: &solsp_ide::LineIndex,
+    function: &solsp_syntax::SyntaxNode,
+    visibility: &str,
+) -> Option<WorkspaceEdit> {
+    let offset = visibility_insert_offset(function)?;
+    let position = to_proto::range(li, rowan::TextRange::new(offset, offset)).start;
+    let mut changes = std::collections::HashMap::new();
+    changes.insert(
+        uri.clone(),
+        vec![TextEdit::new(
+            lsp_types::Range {
+                start: position,
+                end: position,
+            },
+            format!(" {visibility}"),
+        )],
+    );
+    Some(WorkspaceEdit::new(changes))
+}
+
+fn visibility_insert_offset(function: &solsp_syntax::SyntaxNode) -> Option<rowan::TextSize> {
+    use solsp_syntax::SyntaxKind::PARAM_LIST;
+    function
+        .children()
+        .find(|child| child.kind() == PARAM_LIST)
+        .map(|params| params.text_range().end())
+}
+
+fn function_has_visibility(function: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::{EXTERNAL_KW, INTERNAL_KW, PRIVATE_KW, PUBLIC_KW};
+    function
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .any(|token| {
+            matches!(
+                token.kind(),
+                PUBLIC_KW | EXTERNAL_KW | INTERNAL_KW | PRIVATE_KW
+            )
         })
 }
 
@@ -600,6 +724,28 @@ fn function_label(function: &solsp_syntax::SyntaxNode) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!("{name}({params})")
+}
+
+fn function_name_range(function: &solsp_syntax::SyntaxNode) -> rowan::TextRange {
+    use solsp_syntax::SyntaxKind::{FALLBACK_KW, FUNCTION_KW, IDENT, NAME, RECEIVE_KW};
+    if let Some(range) = function
+        .children()
+        .find(|child| child.kind() == NAME)
+        .and_then(|name| {
+            name.children_with_tokens()
+                .filter_map(|element| element.into_token())
+                .find(|token| token.kind() == IDENT)
+        })
+        .map(|token| token.text_range())
+    {
+        return range;
+    }
+    function
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| matches!(token.kind(), FUNCTION_KW | FALLBACK_KW | RECEIVE_KW))
+        .map(|token| token.text_range())
+        .unwrap_or_else(|| function.text_range())
 }
 
 fn contract_name_range(contract: &solsp_syntax::SyntaxNode) -> rowan::TextRange {
