@@ -10,14 +10,15 @@ use lsp_types::notification::{
     Notification as _,
 };
 use lsp_types::request::{
-    Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, Request as _,
-    SemanticTokensFullRequest, SignatureHelpRequest,
+    CodeLensRequest, Completion, DocumentSymbolRequest, GotoDefinition, HoverRequest, References,
+    Request as _, SemanticTokensFullRequest, SignatureHelpRequest,
 };
 use lsp_types::{
-    CompletionItem, CompletionParams, CompletionResponse, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    Location, ParameterInformation, ParameterLabel, SemanticTokensParams, SemanticTokensResult,
-    SignatureHelp, SignatureHelpParams, SignatureInformation, Url,
+    CodeLens, CodeLensParams, Command, CompletionItem, CompletionParams, CompletionResponse,
+    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
+    Hover, HoverParams, Location, ParameterInformation, ParameterLabel, ReferenceParams,
+    SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
+    SignatureInformation, Url,
 };
 
 mod builtins;
@@ -156,6 +157,14 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
             Ok((id, params)) => Response::new_ok(id, goto_definition(state, params)),
             Err(e) => extract_err_response(id, e),
         },
+        References::METHOD => match req.extract::<ReferenceParams>(References::METHOD) {
+            Ok((id, params)) => Response::new_ok(id, references(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
+        CodeLensRequest::METHOD => match req.extract::<CodeLensParams>(CodeLensRequest::METHOD) {
+            Ok((id, params)) => Response::new_ok(id, code_lens(state, params)),
+            Err(e) => extract_err_response(id, e),
+        },
         HoverRequest::METHOD => match req.extract::<HoverParams>(HoverRequest::METHOD) {
             Ok((id, params)) => Response::new_ok(id, hover(state, params)),
             Err(e) => extract_err_response(id, e),
@@ -276,6 +285,151 @@ fn goto_definition(
         uri: target_uri,
         range: lsp_types::Range::default(),
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefTarget {
+    uri: Url,
+    range: rowan::TextRange,
+}
+
+/// `textDocument/references` → every loaded reference resolving to the same declaration.
+fn references(state: &ServerState, params: ReferenceParams) -> Option<Vec<Location>> {
+    let started = std::time::Instant::now();
+    let pos = params.text_document_position;
+    let uri = pos.text_document.uri;
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let offset = to_proto::offset(li, pos.position)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+    let query_name = solsp_ide::navigation::name_at(&root, offset)?;
+    let target = reference_target_at(state, &uri, &root, offset)?;
+    let locations = reference_locations(
+        state,
+        &query_name,
+        &target,
+        params.context.include_declaration,
+    );
+    eprintln!(
+        "solsp: references `{query_name}` -> {} locations in {:?}",
+        locations.len(),
+        started.elapsed()
+    );
+    Some(locations)
+}
+
+fn reference_locations(
+    state: &ServerState,
+    query_name: &str,
+    target: &RefTarget,
+    include_declaration: bool,
+) -> Vec<Location> {
+    let mut locations = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for candidate_uri in state.loaded_uris() {
+        let Some(candidate_file) = state.file(&candidate_uri) else {
+            continue;
+        };
+        let Some(candidate_li) = state.line_index(&candidate_uri) else {
+            continue;
+        };
+        let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
+        for token in candidate_root
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
+            .filter(|t| t.text() == query_name)
+        {
+            let Some(found) = reference_target_at(
+                state,
+                &candidate_uri,
+                &candidate_root,
+                token.text_range().start(),
+            ) else {
+                continue;
+            };
+            if found != *target {
+                continue;
+            }
+            if !include_declaration
+                && candidate_uri == target.uri
+                && token.text_range() == target.range
+            {
+                continue;
+            }
+            let key = format!(
+                "{}:{}..{}",
+                candidate_uri,
+                u32::from(token.text_range().start()),
+                u32::from(token.text_range().end())
+            );
+            if seen.insert(key) {
+                locations.push(Location {
+                    uri: candidate_uri.clone(),
+                    range: to_proto::range(candidate_li, token.text_range()),
+                });
+            }
+        }
+    }
+    locations
+}
+
+/// `textDocument/codeLens` → inline reference counts above declarations.
+fn code_lens(state: &ServerState, params: CodeLensParams) -> Option<Vec<CodeLens>> {
+    let uri = params.text_document.uri;
+    let file = state.file(&uri)?;
+    let li = state.line_index(&uri)?;
+    let root = solsp_base_db::parse(state.db(), file).syntax();
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for token in root
+        .descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
+    {
+        let Some(def) = solsp_hir::resolve::definition_at(&root, token.text_range().start()) else {
+            continue;
+        };
+        if !is_code_lens_definition(def.kind) || def_name_range(&root, &def) != token.text_range() {
+            continue;
+        }
+        if !seen.insert(token.text_range()) {
+            continue;
+        }
+        let target = RefTarget {
+            uri: uri.clone(),
+            range: token.text_range(),
+        };
+        let locations = reference_locations(state, token.text(), &target, true);
+        let title = match locations.len() {
+            1 => "1 reference".to_string(),
+            n => format!("{n} references"),
+        };
+        let position = to_proto::range(li, token.text_range()).start;
+        out.push(CodeLens {
+            range: lsp_types::Range {
+                start: position,
+                end: position,
+            },
+            command: Some(Command {
+                title,
+                command: "solsp.showReferences".to_string(),
+                arguments: Some(vec![serde_json::json!({
+                    "uri": uri,
+                    "position": position,
+                    "locations": locations,
+                })]),
+            }),
+            data: None,
+        });
+    }
+    Some(out)
+}
+
+fn is_code_lens_definition(kind: solsp_hir::resolve::DefKind) -> bool {
+    use solsp_hir::resolve::DefKind::*;
+    !matches!(kind, Local | Parameter | Field | Variant)
 }
 
 /// `textDocument/hover` → the definition's signature + kind as markdown (or `None`).
@@ -1562,23 +1716,15 @@ fn unused_import_diagnostics(
     if directives.is_empty() {
         return Vec::new();
     }
-    // every identifier used OUTSIDE the import directives.
-    let used: std::collections::HashSet<String> = root
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| t.kind() == IDENT)
-        .filter(|t| {
-            !directives
-                .iter()
-                .any(|d| d.text_range().contains_range(t.text_range()))
-        })
-        .map(|t| t.text().to_string())
-        .collect();
+    let used = identifiers_outside_imports(root);
 
     let mut out = Vec::new();
     for (dir, imp) in directives.iter().zip(solsp_hir::imports::imports(root)) {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
+        }
+        if has_unused_import_suppression(root, dir) {
+            continue;
         }
         let locals: Vec<String> = match imp.kind {
             ImportKind::Named(names) => names.iter().map(|n| n.local().to_string()).collect(),
@@ -1605,6 +1751,44 @@ fn unused_import_diagnostics(
         }
     }
     out
+}
+
+fn has_unused_import_suppression(
+    root: &solsp_syntax::SyntaxNode,
+    import_directive: &solsp_syntax::SyntaxNode,
+) -> bool {
+    const MARKER: &str = "forge-lint: disable-next-line(unused-import)";
+    if import_directive.text().to_string().contains(MARKER) {
+        return true;
+    }
+    let text = root.text().to_string();
+    let start: usize = import_directive.text_range().start().into();
+    let before = &text[..start];
+    let previous_line = before
+        .trim_end_matches([' ', '\t', '\r', '\n'])
+        .rsplit_once('\n')
+        .map_or(before.trim_end(), |(_, line)| line.trim());
+    previous_line.contains(MARKER)
+}
+
+fn identifiers_outside_imports(
+    root: &solsp_syntax::SyntaxNode,
+) -> std::collections::HashSet<String> {
+    use solsp_syntax::SyntaxKind::{IDENT, IMPORT_DIRECTIVE};
+    let directives: Vec<_> = root
+        .descendants()
+        .filter(|n| n.kind() == IMPORT_DIRECTIVE)
+        .collect();
+    root.descendants_with_tokens()
+        .filter_map(|e| e.into_token())
+        .filter(|t| t.kind() == IDENT)
+        .filter(|t| {
+            !directives
+                .iter()
+                .any(|d| d.text_range().contains_range(t.text_range()))
+        })
+        .map(|t| t.text().to_string())
+        .collect()
 }
 
 /// Flag a state-variable write inside a `view` or `pure` function (which may not modify
@@ -2874,6 +3058,45 @@ fn parse_root(state: &ServerState, uri: &Url) -> Option<solsp_syntax::SyntaxNode
     Some(solsp_base_db::parse(state.db(), file).syntax())
 }
 
+fn reference_target_at(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<RefTarget> {
+    if let Some((turi, def)) = typed_overload_target(state, uri, root, offset) {
+        return definition_target(state, turi, &def);
+    }
+    if let Some(def) = solsp_hir::resolve::definition_at(root, offset) {
+        return Some(RefTarget {
+            uri: uri.clone(),
+            range: def_name_range(root, &def),
+        });
+    }
+    if let Some((turi, def)) = member_resolve(state, uri, root, offset) {
+        return definition_target(state, turi, &def);
+    }
+    if let Some((turi, def)) = inherited_name_at(state, uri, root, offset) {
+        return definition_target(state, turi, &def);
+    }
+    let name = solsp_ide::navigation::name_at(root, offset)?;
+    let arity = arity_at(root, offset);
+    let (turi, def) = cross_file_definition(state, uri, root, &name, arity)?;
+    definition_target(state, turi, &def)
+}
+
+fn definition_target(
+    state: &ServerState,
+    uri: Url,
+    def: &solsp_hir::resolve::Definition,
+) -> Option<RefTarget> {
+    let root = parse_root(state, &uri)?;
+    Some(RefTarget {
+        range: def_name_range(&root, def),
+        uri,
+    })
+}
+
 /// The byte range of a definition's name identifier within `root`.
 fn def_name_range(
     root: &solsp_syntax::SyntaxNode,
@@ -2955,4 +3178,36 @@ fn handle_notification(
         _ => {}
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unused_import_respects_forge_lint_disable_next_line() {
+        let uri = Url::parse("file:///Base.sol").unwrap();
+        let src = "/// forge-lint: disable-next-line(unused-import)\n\
+                   import { TransferHelper } from \"./Helper.sol\";\n\
+                   import { Other } from \"./Helper.sol\";\n\
+                   contract Base {}\n";
+        let mut state = ServerState::default();
+        state.set(&uri, src.to_string());
+        let file = state.file(&uri).unwrap();
+        let root = solsp_base_db::parse(state.db(), file).syntax();
+        let li = state.line_index(&uri).unwrap();
+
+        let diags = unused_import_diagnostics(&root, li, None);
+        let messages: Vec<_> = diags.iter().map(|diag| diag.message.as_str()).collect();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("TransferHelper")),
+            "{messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("Other")),
+            "{messages:?}"
+        );
+    }
 }

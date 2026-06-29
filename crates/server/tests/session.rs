@@ -5,13 +5,13 @@
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    CompletionItem, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
-    Position, PublishDiagnosticsParams, Range, SemanticTokensParams, SemanticTokensResult,
-    SignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier,
+    CodeLens, CodeLensParams, CompletionItem, CompletionParams, CompletionResponse,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, InitializeParams, InitializeResult, Position, PublishDiagnosticsParams, Range,
+    ReferenceContext, ReferenceParams, SemanticTokensParams, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
 };
 use std::thread;
 
@@ -569,6 +569,166 @@ fn cross_file_goto_definition() {
     let _ = next_notification(&client, "textDocument/publishDiagnostics");
     let loc = definition(5, 1, use_ch + 1);
     assert_eq!(loc.uri, token_uri, "still resolves after target closed");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn same_file_references() {
+    let uri = Url::parse("file:///refs.sol").unwrap();
+    let src = "contract C { uint256 stored; function f() public { stored = 1; uint256 storedLocal = stored; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let ch = src.find("stored = 1").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/references",
+        ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: ch + 1,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        },
+    );
+    let resp = next_response(&client);
+    let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(refs.len(), 3, "{refs:?}");
+    assert!(refs.iter().all(|loc| loc.uri == uri));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn code_lens_shows_reference_counts() {
+    let uri = Url::parse("file:///lens.sol").unwrap();
+    let src = "contract C { uint256 stored; function f() public { stored = 1; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    send_request(
+        &client,
+        2,
+        "textDocument/codeLens",
+        CodeLensParams {
+            text_document: doc_id(&uri),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let lenses: Vec<CodeLens> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(
+        lenses.iter().any(|lens| lens
+            .command
+            .as_ref()
+            .is_some_and(|cmd| cmd.title == "2 references")),
+        "{lenses:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn cross_file_references_for_imported_symbol() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_xfile_refs");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("Token.sol");
+    let main = dir.join("Main.sol");
+    fs::write(&token, "contract Token { }\n").unwrap();
+    fs::write(
+        &main,
+        "import {Token} from \"Token.sol\";\ncontract Main { Token t; function f() public { Token u; } }\n",
+    )
+    .unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let token_uri = Url::from_file_path(fs::canonicalize(&token).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let ch = main_src.lines().nth(1).unwrap().find("Token t").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/references",
+        ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&main_uri),
+                position: Position {
+                    line: 1,
+                    character: ch + 1,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        },
+    );
+    let resp = next_response(&client);
+    let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(refs.len(), 4, "{refs:?}");
+    assert!(refs.iter().any(|loc| loc.uri == token_uri));
+    assert_eq!(refs.iter().filter(|loc| loc.uri == main_uri).count(), 3);
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);

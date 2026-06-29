@@ -1,7 +1,7 @@
 //! LSP capabilities advertised during `initialize`.
 
 use lsp_types::{
-    CompletionOptions, HoverProviderCapability, OneOf, SemanticTokensFullOptions,
+    CodeLensOptions, CompletionOptions, HoverProviderCapability, OneOf, SemanticTokensFullOptions,
     SemanticTokensOptions, SemanticTokensServerCapabilities, ServerCapabilities,
     TextDocumentSyncCapability, TextDocumentSyncKind, WorkDoneProgressOptions,
 };
@@ -23,6 +23,10 @@ pub fn server_capabilities() -> ServerCapabilities {
         )),
         document_symbol_provider: Some(OneOf::Left(true)),
         definition_provider: Some(OneOf::Left(true)),
+        references_provider: Some(OneOf::Left(true)),
+        code_lens_provider: Some(CodeLensOptions {
+            resolve_provider: Some(false),
+        }),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
             // `.` triggers member completion; bare-identifier completion is implicit.

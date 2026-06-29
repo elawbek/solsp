@@ -15,6 +15,10 @@
 # Local Codex project skills — installed for this checkout, not versioned
 /.codex-local/
 
+# Local VS Code launch/debug helpers and scratch TODOs
+/.vscode/
+/TODO.txt
+
 # Agent-memory plugin store (SQLite db + embeddings/graph/index/markdown mirrors)
 # — canonical durable store, kept local, not versioned
 /.memory/

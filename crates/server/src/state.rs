@@ -173,6 +173,15 @@ impl ServerState {
         self.files.get(uri.as_str()).map(|e| e.file)
     }
 
+    /// All files currently tracked by the server, opened by the editor or loaded from
+    /// disk during workspace/import-graph warming.
+    pub fn loaded_uris(&self) -> Vec<Url> {
+        self.files
+            .keys()
+            .filter_map(|key| Url::parse(key).ok())
+            .collect()
+    }
+
     /// The cached line index for an open document.
     pub fn line_index(&self, uri: &Url) -> Option<&LineIndex> {
         self.files.get(uri.as_str()).map(|e| &e.line_index)

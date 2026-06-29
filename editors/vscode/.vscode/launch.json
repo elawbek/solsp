@@ -9,6 +9,9 @@
         "--extensionDevelopmentPath=${workspaceFolder}",
         "--disable-extensions"
       ],
+      "env": {
+        "SOLSP_SERVER_PATH": "${workspaceFolder}/../../target/debug/solsp-server"
+      },
       "outFiles": ["${workspaceFolder}/out/**/*.js"],
       "preLaunchTask": "compile"
     }
