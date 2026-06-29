@@ -5,14 +5,14 @@
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
-    CodeLens, CodeLensParams, CompletionItem, CompletionParams, CompletionResponse,
-    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
-    HoverParams, InitializeParams, InitializeResult, Position, PublishDiagnosticsParams, Range,
-    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult,
-    SignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier, WorkspaceEdit,
+    CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeLens, CodeLensParams,
+    CompletionItem, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
+    Position, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
+    SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams, SymbolKind,
+    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceEdit,
 };
 use std::thread;
 
@@ -679,6 +679,256 @@ fn code_lens_shows_reference_counts() {
     let _ = next_response(&client);
     send_notification(&client, "exit", serde_json::Value::Null);
     server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn code_action_implements_missing_interface_function_or_marks_abstract() {
+    let uri = Url::parse("file:///actions.sol").unwrap();
+    let src = "interface I {\n    function ping(uint256 amount) external returns (uint256);\n}\ncontract C is I {\n}\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|diag| {
+            diag.message
+                .contains("Contract `C` must be marked abstract")
+                && diag.message.contains("ping(uint256)")
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    let position = Position {
+        line: 3,
+        character: 10,
+    };
+    send_request(
+        &client,
+        2,
+        "textDocument/codeAction",
+        CodeActionParams {
+            text_document: doc_id(&uri),
+            range: Range {
+                start: position,
+                end: position,
+            },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let actions: Vec<CodeActionOrCommand> = serde_json::from_value(resp.result.unwrap()).unwrap();
+
+    let implement = actions
+        .iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action)
+                if action.title == "Implement missing inherited functions" =>
+            {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("implement action");
+    let edit = implement.edit.as_ref().expect("implement edit");
+    let text = &edit.changes.as_ref().unwrap().get(&uri).unwrap()[0].new_text;
+    assert!(text.starts_with("\n    function ping"), "{text:?}");
+    assert!(text.contains("function ping(uint256 amount) external override returns (uint256)"));
+    assert!(text.contains("revert(\"Not implemented\");"));
+
+    let mark_abstract = actions
+        .iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action) if action.title == "Mark contract abstract" => {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("mark abstract action");
+    let edit = mark_abstract.edit.as_ref().expect("abstract edit");
+    assert_eq!(
+        edit.changes.as_ref().unwrap().get(&uri).unwrap()[0].new_text,
+        "abstract "
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn code_action_implements_missing_cross_file_interface_function() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_code_action_xfile");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let iface = dir.join("I.sol");
+    let main = dir.join("Main.sol");
+    fs::write(
+        &iface,
+        "interface I { function ping(address who) external view returns (uint256); }\n",
+    )
+    .unwrap();
+    fs::write(&main, "import {I} from \"I.sol\";\ncontract C is I {\n}\n").unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|diag| {
+            diag.message
+                .contains("Contract `C` must be marked abstract")
+                && diag.message.contains("ping(address)")
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    let position = Position {
+        line: 1,
+        character: 10,
+    };
+    send_request(
+        &client,
+        2,
+        "textDocument/codeAction",
+        CodeActionParams {
+            text_document: doc_id(&main_uri),
+            range: Range {
+                start: position,
+                end: position,
+            },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: None,
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let actions: Vec<CodeActionOrCommand> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let implement = actions
+        .iter()
+        .find_map(|action| match action {
+            CodeActionOrCommand::CodeAction(action)
+                if action.title == "Implement missing inherited functions" =>
+            {
+                Some(action)
+            }
+            _ => None,
+        })
+        .expect("cross-file implement action");
+    let text = &implement
+        .edit
+        .as_ref()
+        .unwrap()
+        .changes
+        .as_ref()
+        .unwrap()
+        .get(&main_uri)
+        .unwrap()[0]
+        .new_text;
+    assert!(text.contains("function ping(address who) external view override returns (uint256)"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn invalid_named_import_reports_missing_export() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_invalid_named_import");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("Token.sol");
+    let main = dir.join("Main.sol");
+    fs::write(&token, "contract Token { }\n").unwrap();
+    fs::write(
+        &main,
+        "import {Missing} from \"Token.sol\";\ncontract Main { }\n",
+    )
+    .unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|diag| {
+            diag.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                && diag.message == "Import target `Token.sol` does not export `Missing`"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message.contains("imported but never used")),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

@@ -56,7 +56,15 @@ pub(super) fn publish_diagnostics(
                 diags.extend(super::mutability_diagnostics(
                     state, uri, &root, li, deadline,
                 ));
-                diags.extend(super::unused_import_diagnostics(&root, li, deadline));
+                diags.extend(super::abstract_contract_diagnostics(
+                    state, uri, &root, li, deadline,
+                ));
+                diags.extend(super::invalid_import_diagnostics(
+                    state, uri, &root, li, deadline,
+                ));
+                diags.extend(super::unused_import_diagnostics(
+                    state, uri, &root, li, deadline,
+                ));
                 diags.extend(super::unused_local_diagnostics(&root, li, deadline));
             }
             diags
