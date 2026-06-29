@@ -553,6 +553,84 @@ fn unused_state_variable_diagnostics(
     out
 }
 
+fn unused_event_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, EVENT_DEF};
+
+    let mut out = Vec::new();
+    for event in root.descendants().filter(|node| node.kind() == EVENT_DEF) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if event.ancestors().all(|node| node.kind() != CONTRACT_DEF) {
+            continue;
+        }
+        let Some(name) = declaration_name(&event) else {
+            continue;
+        };
+        let target = RefTarget {
+            uri: uri.clone(),
+            range: declaration_name_range(&event),
+        };
+        if reference_locations(state, &name, &target, true).len() > 1 {
+            continue;
+        }
+        out.push(lsp_types::Diagnostic {
+            range: to_proto::range(li, target.range),
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            source: Some("solsp".to_string()),
+            message: format!("event `{name}` is never emitted"),
+            tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
+    out
+}
+
+fn unused_error_diagnostics(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, ERROR_DEF};
+
+    let mut out = Vec::new();
+    for error in root.descendants().filter(|node| node.kind() == ERROR_DEF) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        if error.ancestors().all(|node| node.kind() != CONTRACT_DEF) {
+            continue;
+        }
+        let Some(name) = declaration_name(&error) else {
+            continue;
+        };
+        let target = RefTarget {
+            uri: uri.clone(),
+            range: declaration_name_range(&error),
+        };
+        if reference_locations(state, &name, &target, true).len() > 1 {
+            continue;
+        }
+        out.push(lsp_types::Diagnostic {
+            range: to_proto::range(li, target.range),
+            severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+            source: Some("solsp".to_string()),
+            message: format!("error `{name}` is never used"),
+            tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+            ..Default::default()
+        });
+    }
+    out
+}
+
 fn overridden_base_function_is_referenced(
     state: &ServerState,
     uri: &Url,
