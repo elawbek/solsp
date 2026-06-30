@@ -1339,7 +1339,49 @@ fn reference_locations(
             }
         }
     }
+    if let Some(hex) = reference_abi_hex(state, target) {
+        for candidate_uri in state.loaded_uris() {
+            let Some(candidate_file) = state.file(&candidate_uri) else {
+                continue;
+            };
+            let Some(candidate_li) = state.line_index(&candidate_uri) else {
+                continue;
+            };
+            let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
+            for range in abi::yul_hex_ranges(&candidate_root, &hex) {
+                let key = format!(
+                    "{}:{}..{}",
+                    candidate_uri,
+                    u32::from(range.start()),
+                    u32::from(range.end())
+                );
+                if seen.insert(key) {
+                    locations.push(Location {
+                        uri: candidate_uri.clone(),
+                        range: to_proto::range(candidate_li, range),
+                    });
+                }
+            }
+        }
+    }
     locations
+}
+
+fn reference_abi_hex(state: &ServerState, target: &RefTarget) -> Option<String> {
+    use solsp_syntax::SyntaxKind::{ERROR_DEF, EVENT_DEF, IDENT};
+
+    let root = parse_root(state, &target.uri)?;
+    let token = root
+        .token_at_offset(target.range.start())
+        .find(|token| token.kind() == IDENT && token.text_range() == target.range)?;
+    let decl = token
+        .parent_ancestors()
+        .find(|node| matches!(node.kind(), ERROR_DEF | EVENT_DEF))?;
+    match decl.kind() {
+        ERROR_DEF => abi::error_selector_hex(&decl),
+        EVENT_DEF => abi::event_topic_hex(&decl),
+        _ => None,
+    }
 }
 
 /// `textDocument/codeLens` → inline reference counts above declarations.

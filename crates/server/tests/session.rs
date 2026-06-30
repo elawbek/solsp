@@ -630,6 +630,89 @@ fn same_file_references() {
 }
 
 #[test]
+fn abi_selector_references_include_assembly_hex() {
+    let uri = Url::parse("file:///abi-refs.sol").unwrap();
+    let src = "contract C { event Transfer(address indexed from, address indexed to, uint256 value); error UnsafeDotPosition(uint256 dot); function run(uint256 dot) public { assembly { log3(0, 0, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, caller(), address()) mstore(0x00, 0xbfb6d3c2) } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let transfer_decl = src.find("Transfer").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/references",
+        ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: transfer_decl,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        },
+    );
+    let resp = next_response(&client);
+    let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    assert!(refs
+        .iter()
+        .any(|loc| loc.range.start.character == transfer_decl));
+    assert!(refs
+        .iter()
+        .any(|loc| { loc.range.start.character == src.find("0xddf252ad").unwrap() as u32 }));
+
+    let error_decl = src.find("UnsafeDotPosition").unwrap() as u32;
+    send_request(
+        &client,
+        3,
+        "textDocument/references",
+        ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: error_decl,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: ReferenceContext {
+                include_declaration: true,
+            },
+        },
+    );
+    let resp = next_response(&client);
+    let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert_eq!(refs.len(), 2, "{refs:?}");
+    assert!(refs
+        .iter()
+        .any(|loc| loc.range.start.character == error_decl));
+    assert!(refs
+        .iter()
+        .any(|loc| { loc.range.start.character == src.find("0xbfb6d3c2").unwrap() as u32 }));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn code_lens_shows_reference_counts() {
     let uri = Url::parse("file:///lens.sol").unwrap();
     let src = "contract C { uint256 stored; function f() public { stored = 1; } }";

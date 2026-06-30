@@ -69,6 +69,22 @@ pub(crate) fn yul_contains_hex(root: &solsp_syntax::SyntaxNode, hex: &str) -> bo
         })
 }
 
+pub(crate) fn yul_hex_ranges(root: &solsp_syntax::SyntaxNode, hex: &str) -> Vec<rowan::TextRange> {
+    let needle = hex.to_ascii_lowercase();
+    root.descendants()
+        .filter(|node| node.kind() == SyntaxKind::YUL_BLOCK)
+        .flat_map(|block| {
+            block
+                .descendants_with_tokens()
+                .filter_map(|element| element.into_token())
+                .filter(|token| token.kind() != SyntaxKind::COMMENT)
+                .filter(|token| token.text().to_ascii_lowercase().contains(&needle))
+                .map(|token| token.text_range())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
