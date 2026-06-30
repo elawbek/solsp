@@ -3,18 +3,35 @@ use solsp_syntax::SyntaxKind;
 use crate::syntax_utils::type_text;
 
 pub(crate) fn error_selector_hex(error: &solsp_syntax::SyntaxNode) -> Option<String> {
-    let signature = abi_signature(error)?;
+    error_selector_hex_for_name(error, None)
+}
+
+pub(crate) fn error_selector_hex_for_name(
+    error: &solsp_syntax::SyntaxNode,
+    name: Option<&str>,
+) -> Option<String> {
+    let signature = abi_signature(error, name)?;
     let hash = keccak256(signature.as_bytes());
     Some(to_hex(&hash[..4]))
 }
 
 pub(crate) fn event_topic_hex(event: &solsp_syntax::SyntaxNode) -> Option<String> {
-    let signature = abi_signature(event)?;
+    event_topic_hex_for_name(event, None)
+}
+
+pub(crate) fn event_topic_hex_for_name(
+    event: &solsp_syntax::SyntaxNode,
+    name: Option<&str>,
+) -> Option<String> {
+    let signature = abi_signature(event, name)?;
     Some(to_hex(&keccak256(signature.as_bytes())))
 }
 
-fn abi_signature(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
-    let name = super::declaration_name(decl)?;
+fn abi_signature(decl: &solsp_syntax::SyntaxNode, name_override: Option<&str>) -> Option<String> {
+    let name = match name_override {
+        Some(name) => name.to_string(),
+        None => super::declaration_name(decl)?,
+    };
     let params = decl
         .children()
         .find(|node| node.kind() == SyntaxKind::PARAM_LIST)
@@ -71,18 +88,25 @@ pub(crate) fn yul_contains_hex(root: &solsp_syntax::SyntaxNode, hex: &str) -> bo
 
 pub(crate) fn yul_hex_ranges(root: &solsp_syntax::SyntaxNode, hex: &str) -> Vec<rowan::TextRange> {
     let needle = hex.to_ascii_lowercase();
-    root.descendants()
+    let mut seen = std::collections::HashSet::new();
+    let mut ranges = Vec::new();
+    for block in root
+        .descendants()
         .filter(|node| node.kind() == SyntaxKind::YUL_BLOCK)
-        .flat_map(|block| {
-            block
-                .descendants_with_tokens()
-                .filter_map(|element| element.into_token())
-                .filter(|token| token.kind() != SyntaxKind::COMMENT)
-                .filter(|token| token.text().to_ascii_lowercase().contains(&needle))
-                .map(|token| token.text_range())
-                .collect::<Vec<_>>()
-        })
-        .collect()
+    {
+        for range in block
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() != SyntaxKind::COMMENT)
+            .filter(|token| token.text().to_ascii_lowercase().contains(&needle))
+            .map(|token| token.text_range())
+        {
+            if seen.insert(range) {
+                ranges.push(range);
+            }
+        }
+    }
+    ranges
 }
 
 fn to_hex(bytes: &[u8]) -> String {

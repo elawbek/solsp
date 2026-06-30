@@ -326,6 +326,7 @@ fn references(state: &ServerState, params: ReferenceParams) -> Option<Vec<Locati
         &query_name,
         &target,
         params.context.include_declaration,
+        true,
     );
     eprintln!(
         "solsp: references `{query_name}` -> {} locations in {:?}",
@@ -348,7 +349,7 @@ fn rename(state: &ServerState, params: RenameParams) -> Option<WorkspaceEdit> {
     let root = solsp_base_db::parse(state.db(), file).syntax();
     let query_name = solsp_ide::navigation::name_at(&root, offset)?;
     let target = reference_target_at(state, &uri, &root, offset)?;
-    let locations = reference_locations(state, &query_name, &target, true);
+    let locations = reference_locations(state, &query_name, &target, true, false);
     if locations.is_empty() {
         return None;
     }
@@ -360,6 +361,27 @@ fn rename(state: &ServerState, params: RenameParams) -> Option<WorkspaceEdit> {
             .entry(loc.uri)
             .or_default()
             .push(TextEdit::new(loc.range, params.new_name.clone()));
+    }
+    if let Some((old_hex, new_hex)) = reference_abi_rename_hex(state, &target, &params.new_name) {
+        let new_text = format!("0x{new_hex}");
+        for candidate_uri in state.loaded_uris() {
+            let Some(candidate_file) = state.file(&candidate_uri) else {
+                continue;
+            };
+            let Some(candidate_li) = state.line_index(&candidate_uri) else {
+                continue;
+            };
+            let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
+            for range in abi::yul_hex_ranges(&candidate_root, &old_hex) {
+                changes
+                    .entry(candidate_uri.clone())
+                    .or_default()
+                    .push(TextEdit::new(
+                        to_proto::range(candidate_li, range),
+                        new_text.clone(),
+                    ));
+            }
+        }
     }
     Some(WorkspaceEdit::new(changes))
 }
@@ -495,7 +517,7 @@ fn unused_function_diagnostics(
             uri: uri.clone(),
             range: function_name_range(&function),
         };
-        if reference_locations(state, &name, &target, true).len() > 1 {
+        if reference_locations(state, &name, &target, true, false).len() > 1 {
             continue;
         }
         out.push(lsp_types::Diagnostic {
@@ -542,7 +564,7 @@ fn unused_state_variable_diagnostics(
             uri: uri.clone(),
             range: declaration_name_range(&var),
         };
-        if reference_locations(state, &name, &target, true).len() > 1 {
+        if reference_locations(state, &name, &target, true, false).len() > 1 {
             continue;
         }
         out.push(lsp_types::Diagnostic {
@@ -581,7 +603,7 @@ fn unused_event_diagnostics(
             uri: uri.clone(),
             range: declaration_name_range(&event),
         };
-        if reference_locations(state, &name, &target, true).len() > 1 {
+        if reference_locations(state, &name, &target, true, true).len() > 1 {
             continue;
         }
         if abi::event_topic_hex(&event).is_some_and(|topic| abi::yul_contains_hex(root, &topic)) {
@@ -623,7 +645,7 @@ fn unused_error_diagnostics(
             uri: uri.clone(),
             range: declaration_name_range(&error),
         };
-        if reference_locations(state, &name, &target, true).len() > 1 {
+        if reference_locations(state, &name, &target, true, true).len() > 1 {
             continue;
         }
         if abi::error_selector_hex(&error)
@@ -668,7 +690,7 @@ fn overridden_base_function_is_referenced(
         uri: base_uri,
         range: def_name_range(&base_root, &base_def),
     };
-    !reference_locations(state, name, &target, false).is_empty()
+    !reference_locations(state, name, &target, false, false).is_empty()
 }
 
 fn overridden_base_function(
@@ -1285,6 +1307,7 @@ fn reference_locations(
     query_name: &str,
     target: &RefTarget,
     include_declaration: bool,
+    include_abi_hex: bool,
 ) -> Vec<Location> {
     let mut locations = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1339,27 +1362,29 @@ fn reference_locations(
             }
         }
     }
-    if let Some(hex) = reference_abi_hex(state, target) {
-        for candidate_uri in state.loaded_uris() {
-            let Some(candidate_file) = state.file(&candidate_uri) else {
-                continue;
-            };
-            let Some(candidate_li) = state.line_index(&candidate_uri) else {
-                continue;
-            };
-            let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
-            for range in abi::yul_hex_ranges(&candidate_root, &hex) {
-                let key = format!(
-                    "{}:{}..{}",
-                    candidate_uri,
-                    u32::from(range.start()),
-                    u32::from(range.end())
-                );
-                if seen.insert(key) {
-                    locations.push(Location {
-                        uri: candidate_uri.clone(),
-                        range: to_proto::range(candidate_li, range),
-                    });
+    if include_abi_hex {
+        if let Some(hex) = reference_abi_hex(state, target) {
+            for candidate_uri in state.loaded_uris() {
+                let Some(candidate_file) = state.file(&candidate_uri) else {
+                    continue;
+                };
+                let Some(candidate_li) = state.line_index(&candidate_uri) else {
+                    continue;
+                };
+                let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
+                for range in abi::yul_hex_ranges(&candidate_root, &hex) {
+                    let key = format!(
+                        "{}:{}..{}",
+                        candidate_uri,
+                        u32::from(range.start()),
+                        u32::from(range.end())
+                    );
+                    if seen.insert(key) {
+                        locations.push(Location {
+                            uri: candidate_uri.clone(),
+                            range: to_proto::range(candidate_li, range),
+                        });
+                    }
                 }
             }
         }
@@ -1380,6 +1405,33 @@ fn reference_abi_hex(state: &ServerState, target: &RefTarget) -> Option<String> 
     match decl.kind() {
         ERROR_DEF => abi::error_selector_hex(&decl),
         EVENT_DEF => abi::event_topic_hex(&decl),
+        _ => None,
+    }
+}
+
+fn reference_abi_rename_hex(
+    state: &ServerState,
+    target: &RefTarget,
+    new_name: &str,
+) -> Option<(String, String)> {
+    use solsp_syntax::SyntaxKind::{ERROR_DEF, EVENT_DEF, IDENT};
+
+    let root = parse_root(state, &target.uri)?;
+    let token = root
+        .token_at_offset(target.range.start())
+        .find(|token| token.kind() == IDENT && token.text_range() == target.range)?;
+    let decl = token
+        .parent_ancestors()
+        .find(|node| matches!(node.kind(), ERROR_DEF | EVENT_DEF))?;
+    match decl.kind() {
+        ERROR_DEF => Some((
+            abi::error_selector_hex(&decl)?,
+            abi::error_selector_hex_for_name(&decl, Some(new_name))?,
+        )),
+        EVENT_DEF => Some((
+            abi::event_topic_hex(&decl)?,
+            abi::event_topic_hex_for_name(&decl, Some(new_name))?,
+        )),
         _ => None,
     }
 }
@@ -1464,7 +1516,7 @@ fn code_lens_resolve(state: &ServerState, mut lens: CodeLens) -> CodeLens {
             rowan::TextSize::from(target_end),
         ),
     };
-    let locations = reference_locations(state, query_name, &target, true);
+    let locations = reference_locations(state, query_name, &target, true, true);
     let title = match locations.len() {
         1 => "1 reference".to_string(),
         n => format!("{n} references"),

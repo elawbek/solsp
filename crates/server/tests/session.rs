@@ -1506,6 +1506,109 @@ fn same_file_rename_uses_resolved_references() {
 }
 
 #[test]
+fn rename_error_updates_assembly_selector() {
+    let uri = Url::parse("file:///rename-abi.sol").unwrap();
+    let src = "contract C { error UnsafeDotPosition(uint256 dot); function run(uint256 dot) public { assembly { if gt(dot, 0x4d) { mstore(0x00, 0xbfb6d3c2) } } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let ch = src.find("UnsafeDotPosition").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/rename",
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: ch,
+                },
+            },
+            new_name: "RenamedError".to_string(),
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&uri).expect("same-file edits");
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    assert!(edits
+        .iter()
+        .any(|edit| edit.new_text == "RenamedError" && edit.range.start.character == ch));
+    assert!(edits.iter().any(|edit| edit.new_text == "0x52e4d7bd"
+        && edit.range.start.character == src.find("0xbfb6d3c2").unwrap() as u32));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn rename_event_updates_assembly_topic() {
+    let uri = Url::parse("file:///rename-event-abi.sol").unwrap();
+    let src = "contract C { event Transfer(address indexed from, address indexed to, uint256 value); function run() public { assembly { log3(0, 0, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, caller(), address()) } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let ch = src.find("Transfer").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/rename",
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: ch,
+                },
+            },
+            new_name: "RenamedTransfer".to_string(),
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let changes = edit.changes.unwrap();
+    let edits = changes.get(&uri).expect("same-file edits");
+    assert_eq!(edits.len(), 2, "{edits:?}");
+    assert!(edits
+        .iter()
+        .any(|edit| edit.new_text == "RenamedTransfer" && edit.range.start.character == ch));
+    assert!(edits.iter().any(|edit| edit.new_text
+        == "0xa8a56067abce16eb9a74e2bd77d7df7f7174c3e430f7cca86061b2fd8cb73040"
+        && edit.range.start.character == src.find("0xddf252ad").unwrap() as u32));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn cross_file_rename_imported_symbol() {
     use std::fs;
 
