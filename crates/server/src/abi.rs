@@ -27,6 +27,16 @@ pub(crate) fn event_topic_hex_for_name(
     Some(to_hex(&keccak256(signature.as_bytes())))
 }
 
+pub(crate) fn function_selector_hex(function: &solsp_syntax::SyntaxNode) -> Option<String> {
+    let signature = abi_signature(function, None)?;
+    let hash = keccak256(signature.as_bytes());
+    Some(to_hex(&hash[..4]))
+}
+
+pub(crate) fn signature(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
+    abi_signature(decl, None)
+}
+
 fn abi_signature(decl: &solsp_syntax::SyntaxNode, name_override: Option<&str>) -> Option<String> {
     let name = match name_override {
         Some(name) => name.to_string(),

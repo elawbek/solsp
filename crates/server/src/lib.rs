@@ -16,11 +16,11 @@ use lsp_types::request::{
 };
 use lsp_types::{
     CodeAction, CodeActionKind, CodeActionOrCommand, CodeActionParams, CodeActionResponse,
-    CodeLens, CodeLensParams, Command, CompletionItem, CompletionParams, CompletionResponse,
-    DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse,
-    Hover, HoverParams, Location, ParameterInformation, ParameterLabel, ReferenceParams,
-    RenameParams, SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams,
-    SignatureInformation, TextEdit, Url, WorkspaceEdit,
+    CodeLens, CodeLensParams, Command, CompletionItem, CompletionItemKind, CompletionParams,
+    CompletionResponse, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, Location, ParameterInformation, ParameterLabel,
+    ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult, SignatureHelp,
+    SignatureHelpParams, SignatureInformation, TextEdit, Url, WorkspaceEdit,
 };
 
 mod abi;
@@ -1713,7 +1713,7 @@ fn completion_items(state: &ServerState, params: &CompletionParams) -> Option<Ve
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
     if is_inside_yul_block(&root, offset) {
-        return Some(yul_builtin_items());
+        return Some(yul_completion_items(state, &uri, &root, offset));
     }
     // named-argument keys (`f({ <here>: … })`) are the most specific context.
     if let Some(items) = named_arg_completion(state, &uri, &root, offset) {
@@ -1724,6 +1724,113 @@ fn completion_items(state: &ServerState, params: &CompletionParams) -> Option<Ve
         return Some(items);
     }
     Some(scope_completion(state, &uri, &root, offset))
+}
+
+fn yul_completion_items(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Vec<CompletionItem> {
+    let mut items = yul_builtin_items();
+    items.extend(abi_selector_completion_items(state, uri, root, offset));
+    let mut seen = std::collections::HashSet::new();
+    items.retain(|item| seen.insert(item.label.clone()));
+    items
+}
+
+fn abi_selector_completion_items(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Vec<CompletionItem> {
+    let node = root
+        .token_at_offset(offset)
+        .left_biased()
+        .or_else(|| root.token_at_offset(offset).right_biased())
+        .and_then(|token| token.parent())
+        .unwrap_or_else(|| root.clone());
+    let Some(contract) = enclosing_contract(&node) else {
+        return Vec::new();
+    };
+
+    let mut items = Vec::new();
+    for (_, decl) in abi_selector_decls(state, uri, root, &contract) {
+        if let Some(item) = abi_selector_completion_item(&decl) {
+            items.push(item);
+        }
+    }
+    items
+}
+
+fn abi_selector_decls(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+) -> Vec<(Url, solsp_syntax::SyntaxNode)> {
+    use std::collections::{HashSet, VecDeque};
+
+    let mut out = Vec::new();
+    let mut visited: HashSet<(Url, String)> = HashSet::new();
+    let mut queue = VecDeque::from([(uri.clone(), root.clone(), contract.clone())]);
+    while let Some((current_uri, current_root, current_contract)) = queue.pop_front() {
+        let key = (
+            current_uri.clone(),
+            solsp_hir::resolve::contract_def_name(&current_contract).unwrap_or_default(),
+        );
+        if !visited.insert(key) {
+            continue;
+        }
+
+        for def in solsp_hir::resolve::contract_members(&current_contract) {
+            let decl = def.full_ptr.to_node(&current_root);
+            if matches!(
+                def.kind,
+                solsp_hir::resolve::DefKind::Function
+                    | solsp_hir::resolve::DefKind::Event
+                    | solsp_hir::resolve::DefKind::Error
+            ) {
+                out.push((current_uri.clone(), decl));
+            }
+        }
+
+        for base in solsp_hir::resolve::base_names(&current_contract) {
+            let Some((base_uri, base_root, base_node)) =
+                resolve_base(state, &current_uri, &current_root, &base)
+            else {
+                continue;
+            };
+            queue.push_back((base_uri, base_root, base_node));
+        }
+    }
+    out
+}
+
+fn abi_selector_completion_item(decl: &solsp_syntax::SyntaxNode) -> Option<CompletionItem> {
+    use solsp_syntax::SyntaxKind::{ERROR_DEF, EVENT_DEF, FUNCTION_DEF};
+
+    let signature = abi::signature(decl)?;
+    let (suffix, hex, detail) = match decl.kind() {
+        FUNCTION_DEF if solsp_hir::resolve::is_externally_visible(decl) => (
+            "selector",
+            abi::function_selector_hex(decl)?,
+            "function selector",
+        ),
+        FUNCTION_DEF => return None,
+        ERROR_DEF => ("selector", abi::error_selector_hex(decl)?, "error selector"),
+        EVENT_DEF => ("topic0", abi::event_topic_hex(decl)?, "event topic0"),
+        _ => return None,
+    };
+    let insert_text = format!("0x{hex}");
+    Some(CompletionItem {
+        label: format!("{signature}.{suffix}"),
+        kind: Some(CompletionItemKind::CONSTANT),
+        detail: Some(format!("{detail}: {insert_text}")),
+        insert_text: Some(insert_text),
+        ..Default::default()
+    })
 }
 
 /// Completion for `receiver.<here>`: the members of the receiver's type (incl. cross-file
