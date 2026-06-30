@@ -768,6 +768,65 @@ fn code_lens_shows_reference_counts() {
 }
 
 #[test]
+fn code_lens_counts_assembly_abi_hex_references() {
+    let uri = Url::parse("file:///abi-lens.sol").unwrap();
+    let src = "contract C { error UnsafeDotPosition(uint256 dot); event Transfer(address indexed from, address indexed to, uint256 value); function run(uint256 dot) public { assembly { mstore(0x00, 0xbfb6d3c2) log3(0, 0, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, caller(), address()) } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    send_request(
+        &client,
+        2,
+        "textDocument/codeLens",
+        CodeLensParams {
+            text_document: doc_id(&uri),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let lenses: Vec<CodeLens> = serde_json::from_value(resp.result.unwrap()).unwrap();
+
+    for (id, name) in [(3, "UnsafeDotPosition"), (4, "Transfer")] {
+        let lens = lenses
+            .iter()
+            .find(|lens| {
+                lens.data
+                    .as_ref()
+                    .and_then(|data| data.get("queryName"))
+                    .and_then(|name| name.as_str())
+                    == Some(name)
+            })
+            .cloned()
+            .expect("unresolved code lens for ABI item");
+        send_request(&client, id, "codeLens/resolve", lens);
+        let resp = next_response(&client);
+        let lens: CodeLens = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert!(
+            lens.command
+                .as_ref()
+                .is_some_and(|cmd| cmd.title == "2 references"),
+            "{name}: {lens:?}"
+        );
+    }
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn code_action_implements_missing_interface_function_or_marks_abstract() {
     let uri = Url::parse("file:///actions.sol").unwrap();
     let src = "interface I {\n    function ping(uint256 amount) external returns (uint256);\n}\ncontract C is I {\n}\n";
@@ -1459,6 +1518,175 @@ fn cross_file_references_for_imported_symbol() {
 }
 
 #[test]
+fn cross_file_references_ignore_foreign_assembly_abi_hex() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_xfile_abi_refs");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let defs = dir.join("Defs.sol");
+    let main = dir.join("Main.sol");
+    fs::write(
+        &defs,
+        "contract Defs { error UnsafeDotPosition(uint256 dot); event Transfer(address indexed from, address indexed to, uint256 value); }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        "import \"Defs.sol\";\ncontract Main { function run(uint256 dot) public { assembly { mstore(0x00, 0xbfb6d3c2) log3(0, 0, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, caller(), address()) } } }\n",
+    )
+    .unwrap();
+
+    let defs_uri = Url::from_file_path(fs::canonicalize(&defs).unwrap()).unwrap();
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let defs_src = fs::read_to_string(&defs).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&defs_uri, &defs_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    for (id, name) in [(2, "UnsafeDotPosition"), (3, "Transfer")] {
+        let ch = defs_src.find(name).unwrap() as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/references",
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&defs_uri),
+                    position: Position {
+                        line: 0,
+                        character: ch,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            },
+        );
+        let resp = next_response(&client);
+        let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(refs.len(), 1, "{name}: {refs:?}");
+        assert!(refs.iter().all(|loc| loc.uri == defs_uri), "{refs:?}");
+    }
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn cross_file_references_include_inherited_assembly_abi_hex() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_xfile_inherited_abi_refs");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let defs = dir.join("Defs.sol");
+    let main = dir.join("Main.sol");
+    fs::write(
+        &defs,
+        "interface Defs { error UnsafeDotPosition(uint256 dot); event Transfer(address indexed from, address indexed to, uint256 value); }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        "import \"Defs.sol\";\ncontract Main is Defs { function run(uint256 dot) public { assembly { mstore(0x00, 0xbfb6d3c2) log3(0, 0, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, caller(), address()) } } }\n",
+    )
+    .unwrap();
+
+    let defs_uri = Url::from_file_path(fs::canonicalize(&defs).unwrap()).unwrap();
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let defs_src = fs::read_to_string(&defs).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&defs_uri, &defs_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    for (id, name, hex) in [
+        (2, "UnsafeDotPosition", "0xbfb6d3c2"),
+        (3, "Transfer", "0xddf252ad"),
+    ] {
+        let ch = defs_src.find(name).unwrap() as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/references",
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&defs_uri),
+                    position: Position {
+                        line: 0,
+                        character: ch,
+                    },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+            },
+        );
+        let resp = next_response(&client);
+        let refs: Vec<lsp_types::Location> = serde_json::from_value(resp.result.unwrap()).unwrap();
+        assert_eq!(refs.len(), 2, "{name}: {refs:?}");
+        assert!(refs.iter().any(|loc| loc.uri == defs_uri));
+        let hex_character = main_src.lines().nth(1).unwrap().find(hex).unwrap() as u32;
+        assert!(refs
+            .iter()
+            .any(|loc| loc.uri == main_uri && loc.range.start.character == hex_character));
+    }
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn same_file_rename_uses_resolved_references() {
     let uri = Url::parse("file:///rename.sol").unwrap();
     let src = "contract C { uint256 stored; function f() public { stored = 1; uint256 storedLocal = stored; } }";
@@ -1606,6 +1834,97 @@ fn rename_event_updates_assembly_topic() {
     let _ = next_response(&client);
     send_notification(&client, "exit", serde_json::Value::Null);
     server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn rename_error_updates_inherited_assembly_selector() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_xfile_abi_rename");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let defs = dir.join("Defs.sol");
+    let main = dir.join("Main.sol");
+    let other = dir.join("Other.sol");
+    fs::write(
+        &defs,
+        "interface Defs { error UnsafeDotPosition(uint256 dot); }\n",
+    )
+    .unwrap();
+    fs::write(
+        &main,
+        "import \"Defs.sol\";\ncontract Main is Defs { function run(uint256 dot) public { assembly { mstore(0x00, 0xbfb6d3c2) } } }\n",
+    )
+    .unwrap();
+    fs::write(
+        &other,
+        "contract Other { function run(uint256 dot) public { assembly { mstore(0x00, 0xbfb6d3c2) } } }\n",
+    )
+    .unwrap();
+
+    let defs_uri = Url::from_file_path(fs::canonicalize(&defs).unwrap()).unwrap();
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let other_uri = Url::from_file_path(fs::canonicalize(&other).unwrap()).unwrap();
+    let defs_src = fs::read_to_string(&defs).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+    let other_src = fs::read_to_string(&other).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    for (uri, src) in [
+        (&defs_uri, defs_src.as_str()),
+        (&main_uri, main_src.as_str()),
+        (&other_uri, other_src.as_str()),
+    ] {
+        send_notification(&client, "textDocument/didOpen", open_params(uri, src));
+        let _ = next_notification(&client, "textDocument/publishDiagnostics");
+    }
+
+    let ch = defs_src.find("UnsafeDotPosition").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/rename",
+        RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&defs_uri),
+                position: Position {
+                    line: 0,
+                    character: ch,
+                },
+            },
+            new_name: "RenamedError".to_string(),
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let edit: WorkspaceEdit = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let changes = edit.changes.unwrap();
+    let defs_edits = changes.get(&defs_uri).expect("definition edits");
+    assert!(defs_edits
+        .iter()
+        .any(|edit| edit.new_text == "RenamedError"));
+    let main_edits = changes.get(&main_uri).expect("inherited selector edit");
+    assert!(main_edits.iter().any(|edit| edit.new_text == "0x52e4d7bd"
+        && edit.range.start.character
+            == main_src.lines().nth(1).unwrap().find("0xbfb6d3c2").unwrap() as u32));
+    assert!(
+        !changes.contains_key(&other_uri),
+        "unrelated file must not be edited: {changes:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

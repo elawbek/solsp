@@ -364,23 +364,11 @@ fn rename(state: &ServerState, params: RenameParams) -> Option<WorkspaceEdit> {
     }
     if let Some((old_hex, new_hex)) = reference_abi_rename_hex(state, &target, &params.new_name) {
         let new_text = format!("0x{new_hex}");
-        for candidate_uri in state.loaded_uris() {
-            let Some(candidate_file) = state.file(&candidate_uri) else {
-                continue;
-            };
-            let Some(candidate_li) = state.line_index(&candidate_uri) else {
-                continue;
-            };
-            let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
-            for range in abi::yul_hex_ranges(&candidate_root, &old_hex) {
-                changes
-                    .entry(candidate_uri.clone())
-                    .or_default()
-                    .push(TextEdit::new(
-                        to_proto::range(candidate_li, range),
-                        new_text.clone(),
-                    ));
-            }
+        for loc in reference_abi_hex_locations(state, &target, &old_hex) {
+            changes
+                .entry(loc.uri.clone())
+                .or_default()
+                .push(TextEdit::new(loc.range, new_text.clone()));
         }
     }
     Some(WorkspaceEdit::new(changes))
@@ -1364,27 +1352,17 @@ fn reference_locations(
     }
     if include_abi_hex {
         if let Some(hex) = reference_abi_hex(state, target) {
-            for candidate_uri in state.loaded_uris() {
-                let Some(candidate_file) = state.file(&candidate_uri) else {
-                    continue;
-                };
-                let Some(candidate_li) = state.line_index(&candidate_uri) else {
-                    continue;
-                };
-                let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
-                for range in abi::yul_hex_ranges(&candidate_root, &hex) {
-                    let key = format!(
-                        "{}:{}..{}",
-                        candidate_uri,
-                        u32::from(range.start()),
-                        u32::from(range.end())
-                    );
-                    if seen.insert(key) {
-                        locations.push(Location {
-                            uri: candidate_uri.clone(),
-                            range: to_proto::range(candidate_li, range),
-                        });
-                    }
+            for loc in reference_abi_hex_locations(state, target, &hex) {
+                let key = format!(
+                    "{}:{}:{}..{}:{}",
+                    loc.uri,
+                    loc.range.start.line,
+                    loc.range.start.character,
+                    loc.range.end.line,
+                    loc.range.end.character
+                );
+                if seen.insert(key) {
+                    locations.push(loc);
                 }
             }
         }
@@ -1407,6 +1385,122 @@ fn reference_abi_hex(state: &ServerState, target: &RefTarget) -> Option<String> 
         EVENT_DEF => abi::event_topic_hex(&decl),
         _ => None,
     }
+}
+
+fn reference_abi_hex_locations(
+    state: &ServerState,
+    target: &RefTarget,
+    hex: &str,
+) -> Vec<Location> {
+    let Some((target_owner_uri, target_owner_name)) = reference_abi_owner(state, target) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for candidate_uri in state.loaded_uris() {
+        let Some(candidate_file) = state.file(&candidate_uri) else {
+            continue;
+        };
+        let Some(candidate_li) = state.line_index(&candidate_uri) else {
+            continue;
+        };
+        let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
+        for range in abi::yul_hex_ranges(&candidate_root, hex) {
+            let Some(contract) = node_at_range(&candidate_root, range).and_then(|node| {
+                node.ancestors()
+                    .find(|ancestor| ancestor.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF)
+            }) else {
+                continue;
+            };
+            if !contract_inherits_target(
+                state,
+                &candidate_uri,
+                &candidate_root,
+                &contract,
+                &target_owner_uri,
+                &target_owner_name,
+            ) {
+                continue;
+            }
+            let key = format!(
+                "{}:{}..{}",
+                candidate_uri,
+                u32::from(range.start()),
+                u32::from(range.end())
+            );
+            if seen.insert(key) {
+                out.push(Location {
+                    uri: candidate_uri.clone(),
+                    range: to_proto::range(candidate_li, range),
+                });
+            }
+        }
+    }
+    out
+}
+
+fn reference_abi_owner(state: &ServerState, target: &RefTarget) -> Option<(Url, String)> {
+    let root = parse_root(state, &target.uri)?;
+    let token = root
+        .token_at_offset(target.range.start())
+        .find(|token| token.text_range() == target.range)?;
+    let owner = token
+        .parent_ancestors()
+        .find(|node| node.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF)?;
+    let name = solsp_hir::resolve::contract_def_name(&owner)?;
+    Some((target.uri.clone(), name))
+}
+
+fn node_at_range(
+    root: &solsp_syntax::SyntaxNode,
+    range: rowan::TextRange,
+) -> Option<solsp_syntax::SyntaxNode> {
+    root.token_at_offset(range.start())
+        .find(|token| token.text_range() == range)
+        .and_then(|token| token.parent())
+}
+
+fn contract_inherits_target(
+    state: &ServerState,
+    candidate_uri: &Url,
+    candidate_root: &solsp_syntax::SyntaxNode,
+    candidate_contract: &solsp_syntax::SyntaxNode,
+    target_owner_uri: &Url,
+    target_owner_name: &str,
+) -> bool {
+    use std::collections::{HashSet, VecDeque};
+
+    let Some(candidate_name) = solsp_hir::resolve::contract_def_name(candidate_contract) else {
+        return false;
+    };
+    if candidate_uri == target_owner_uri && candidate_name == target_owner_name {
+        return true;
+    }
+
+    let mut visited = HashSet::new();
+    let mut queue = VecDeque::from([(
+        candidate_uri.clone(),
+        candidate_root.clone(),
+        candidate_contract.clone(),
+    )]);
+    while let Some((uri, root, contract)) = queue.pop_front() {
+        for base in solsp_hir::resolve::base_names(&contract) {
+            let Some((base_uri, base_root, base_node)) = resolve_base(state, &uri, &root, &base)
+            else {
+                continue;
+            };
+            let Some(base_name) = solsp_hir::resolve::contract_def_name(&base_node) else {
+                continue;
+            };
+            if base_uri == *target_owner_uri && base_name == target_owner_name {
+                return true;
+            }
+            if visited.insert((base_uri.clone(), base_name)) {
+                queue.push_back((base_uri, base_root, base_node));
+            }
+        }
+    }
+    false
 }
 
 fn reference_abi_rename_hex(
