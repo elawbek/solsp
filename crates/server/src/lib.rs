@@ -1865,7 +1865,7 @@ fn member_completion(
         let library = contract_like && is_library_node(&tdef);
         // a contract/interface *instance* (`x.`, `this.`) → only public/external members;
         // a library (`Lib.`) or `super.` → everything except `private`; a struct → fields.
-        let is_super = solsp_hir::resolve::receiver_name(&receiver).as_deref() == Some("super");
+        let is_super = is_super_receiver(&receiver);
         let external = contract_like
             && !library
             && !is_super
@@ -1880,18 +1880,27 @@ fn member_completion(
             }
         };
         // members carry their declared type (`Definition::ty`) in the completion detail.
-        let same_file = solsp_hir::resolve::type_members(&tdef)
-            .into_iter()
-            .filter(|d| keep(&d.full_ptr.to_node(&troot)))
-            .collect();
+        let same_file = if is_super {
+            Vec::new()
+        } else {
+            solsp_hir::resolve::type_members(&tdef)
+                .into_iter()
+                .filter(|d| keep(&d.full_ptr.to_node(&troot)))
+                .collect()
+        };
         let mut items = completion_items_from(same_file);
         // contracts inherit across files (libraries do not); add those members.
         if contract_like && !library {
-            items.extend(completion_items_from(collect_inherited_members(
-                state, &turi, &troot, &tdef, external,
-            )));
+            let inherited = if is_super {
+                collect_base_members(state, &turi, &troot, &tdef, false)
+            } else {
+                collect_inherited_members(state, &turi, &troot, &tdef, external)
+            };
+            items.extend(completion_items_from(inherited));
         }
-        items.extend(using_items);
+        if !is_super {
+            items.extend(using_items);
+        }
         let mut seen = std::collections::HashSet::new();
         items.retain(|i| seen.insert(i.label.clone()));
         return Some(items);
@@ -2057,15 +2066,15 @@ fn resolve_receiver_def_target(
     }
 }
 
-/// Members of `type(X)`: integer `min`/`max`, enum `min`/`max`, or a contract/interface's
-/// `name`/`creationCode`/`runtimeCode`/`interfaceId`. `None` if the receiver isn't `type(X)`.
+/// Members of `type(X)`: integer/enum `min`/`max`, contract bytecode metadata, or an
+/// interface `interfaceId`. `None` if the receiver isn't `type(X)`.
 fn type_expr_members(
     state: &ServerState,
     uri: &Url,
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
 ) -> Option<Vec<CompletionItem>> {
-    use solsp_syntax::SyntaxKind::{ENUM_DEF, PATH_TYPE, TYPE_EXPR};
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, ENUM_DEF, PATH_TYPE, TYPE_EXPR};
     if receiver.kind() != TYPE_EXPR {
         return None;
     }
@@ -2078,12 +2087,15 @@ fn type_expr_members(
     if let Some((_, tdef)) = resolve_path_type(state, uri, root, &pt) {
         return Some(match tdef.kind() {
             ENUM_DEF => synthetic_members(&[("min", "", false), ("max", "", false)]),
-            _ => synthetic_members(&[
+            CONTRACT_DEF if is_interface_node(&tdef) => {
+                synthetic_members(&[("name", "string", false), ("interfaceId", "bytes4", false)])
+            }
+            CONTRACT_DEF => synthetic_members(&[
                 ("name", "string", false),
                 ("creationCode", "bytes", false),
                 ("runtimeCode", "bytes", false),
-                ("interfaceId", "bytes4", false),
             ]),
+            _ => Vec::new(),
         });
     }
     Some(Vec::new())
@@ -2099,7 +2111,17 @@ fn value_type_builtin_members(
 ) -> Option<Vec<CompletionItem>> {
     let (ty, is_storage) = receiver_value_info(state, uri, root, receiver)?;
     let ty = ty.trim();
-    if ty == "address" || ty == "address payable" {
+    if ty == "address" {
+        return Some(synthetic_members(&[
+            ("balance", "uint256", false),
+            ("code", "bytes", false),
+            ("codehash", "bytes32", false),
+            ("call", "", true),
+            ("delegatecall", "", true),
+            ("staticcall", "", true),
+        ]));
+    }
+    if ty == "address payable" {
         return Some(synthetic_members(&[
             ("balance", "uint256", false),
             ("code", "bytes", false),
@@ -2248,8 +2270,16 @@ fn receiver_decl(
             let member = member_name(receiver)?;
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
             let troot = parse_root(state, &turi)?;
-            let mdef = member_lookup(state, &turi, &tdef, &member, None)?;
-            Some(mdef.full_ptr.to_node(&troot))
+            let (muri, mdef) = if is_super_receiver(&recv) {
+                inherited_base_member(state, &turi, &troot, &tdef, &member, None)?
+            } else {
+                (
+                    turi.clone(),
+                    member_lookup(state, &turi, &tdef, &member, None)?,
+                )
+            };
+            let mroot = parse_root(state, &muri)?;
+            Some(mdef.full_ptr.to_node(&mroot))
         }
         _ => None,
     }
@@ -2260,6 +2290,17 @@ fn is_library_node(c: &solsp_syntax::SyntaxNode) -> bool {
     c.children_with_tokens()
         .filter_map(|e| e.into_token())
         .any(|t| t.kind() == solsp_syntax::SyntaxKind::LIBRARY_KW)
+}
+
+/// Whether a `CONTRACT_DEF` node is an `interface`.
+fn is_interface_node(c: &solsp_syntax::SyntaxNode) -> bool {
+    c.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .any(|t| t.kind() == solsp_syntax::SyntaxKind::INTERFACE_KW)
+}
+
+fn is_super_receiver(receiver: &solsp_syntax::SyntaxNode) -> bool {
+    solsp_hir::resolve::receiver_name(receiver).as_deref() == Some("super")
 }
 
 /// Whether a receiver is a *value* (a contract instance) rather than a bare type name —
@@ -2490,6 +2531,28 @@ fn collect_inherited_members(
     // external access (`instance.member`) → only `public`/`external` members.
     external_only: bool,
 ) -> Vec<solsp_hir::resolve::Definition> {
+    collect_inherited_members_impl(state, uri, root, contract, external_only, true)
+}
+
+/// All members reachable through `super`: direct and transitive base contracts only.
+fn collect_base_members(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+    external_only: bool,
+) -> Vec<solsp_hir::resolve::Definition> {
+    collect_inherited_members_impl(state, uri, root, contract, external_only, false)
+}
+
+fn collect_inherited_members_impl(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+    external_only: bool,
+    include_self: bool,
+) -> Vec<solsp_hir::resolve::Definition> {
     use std::collections::{HashSet, VecDeque};
     let mut visited: HashSet<(Url, String)> = HashSet::new();
     // (uri, root, contract, is_base) — a base's `private` members are not inherited.
@@ -2500,7 +2563,15 @@ fn collect_inherited_members(
         bool,
     )> = VecDeque::new();
     let mut out = Vec::new();
-    queue.push_back((uri.clone(), root.clone(), contract.clone(), false));
+    if include_self {
+        queue.push_back((uri.clone(), root.clone(), contract.clone(), false));
+    } else {
+        for base in solsp_hir::resolve::base_names(contract) {
+            if let Some((bu, br, bn)) = resolve_base(state, uri, root, &base) {
+                queue.push_back((bu, br, bn, true));
+            }
+        }
+    }
     while let Some((u, r, c, is_base)) = queue.pop_front() {
         let key = (
             u.clone(),
@@ -2571,9 +2642,6 @@ fn undefined_name_diagnostics(
         else {
             continue;
         };
-        // names declared via `let` anywhere in the enclosing assembly — Yul scoping
-        // (for-init, nested blocks) isn't fully modeled by `resolve`, so trust a `let`.
-        let yul_lets = enclosing_yul_lets(&asn);
         // each target path before `:=`; its first segment is the variable.
         for path in asn
             .children()
@@ -2585,7 +2653,7 @@ fn undefined_name_diagnostics(
             let Some(name) = nameref_text(&seg) else {
                 continue;
             };
-            if !yul_lets.contains(&name) && !name_defined(state, uri, root, &seg, &name) {
+            if !yul_assignment_target_defined(state, uri, root, &seg, &name) {
                 out.push(type_mismatch(li, &seg, &format!("`{name}` is not defined")));
             }
         }
@@ -2593,18 +2661,42 @@ fn undefined_name_diagnostics(
     out
 }
 
-/// Names declared with `let` anywhere in the assembly block enclosing `node` — used to
-/// avoid false "undefined" on Yul locals whose scoping `resolve` doesn't fully model.
-fn enclosing_yul_lets(node: &solsp_syntax::SyntaxNode) -> std::collections::HashSet<String> {
-    use solsp_syntax::SyntaxKind::{NAME, YUL_BLOCK, YUL_VAR_DECL};
-    let Some(top) = node.ancestors().filter(|n| n.kind() == YUL_BLOCK).last() else {
-        return std::collections::HashSet::new();
-    };
-    top.descendants()
-        .filter(|n| n.kind() == YUL_VAR_DECL)
-        .flat_map(|d| d.children().filter(|c| c.kind() == NAME))
-        .filter_map(|nm| nameref_text(&nm))
-        .collect()
+fn yul_assignment_target_defined(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    target: &solsp_syntax::SyntaxNode,
+    name: &str,
+) -> bool {
+    if let Some(def) = solsp_hir::resolve::resolve(target) {
+        let name_node = def.name_ptr.to_node(root);
+        if is_yul_binding_name(&name_node)
+            && name_node.text_range().start() > target.text_range().start()
+        {
+            return false;
+        }
+        return true;
+    }
+    if solsp_hir::resolve::top_level_definition(root, name, None).is_some() {
+        return true;
+    }
+    if let Some(c) = enclosing_contract(target) {
+        if inherited_member(state, uri, root, &c, name, None).is_some() {
+            return true;
+        }
+    }
+    cross_file_definition(state, uri, root, name, None).is_some()
+}
+
+fn is_yul_binding_name(node: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::{NAME, YUL_FUNCTION_DEF, YUL_PARAM_LIST, YUL_VAR_DECL};
+    node.kind() == NAME
+        && node.parent().is_some_and(|parent| {
+            matches!(
+                parent.kind(),
+                YUL_VAR_DECL | YUL_PARAM_LIST | YUL_FUNCTION_DEF
+            )
+        })
 }
 
 /// Type-check assignments: a simple assignment `lhs = rhs` and a local declaration with an
@@ -4218,6 +4310,10 @@ fn member_resolve(
     }
 
     if let Some((type_uri, type_def)) = resolve_receiver_type(state, uri, root, &receiver) {
+        if is_super_receiver(&receiver) {
+            let troot = parse_root(state, &type_uri)?;
+            return inherited_base_member(state, &type_uri, &troot, &type_def, &member, arity);
+        }
         if let Some(def) = member_lookup(state, &type_uri, &type_def, &member, arity) {
             return Some((type_uri, def));
         }
@@ -4313,8 +4409,16 @@ fn receiver_type(
             }
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
             let troot = parse_root(state, &turi)?;
-            let mdef = member_lookup(state, &turi, &tdef, &member, None)?;
-            member_value_type(state, &turi, &troot, &mdef, element)
+            let (muri, mdef) = if is_super_receiver(&recv) {
+                inherited_base_member(state, &turi, &troot, &tdef, &member, None)?
+            } else {
+                (
+                    turi.clone(),
+                    member_lookup(state, &turi, &tdef, &member, None)?,
+                )
+            };
+            let mroot = parse_root(state, &muri)?;
+            member_value_type(state, &muri, &mroot, &mdef, element)
         }
         PATH_EXPR | NAME_REF => {
             // `this` / `super` → the enclosing contract's type.
@@ -4385,6 +4489,10 @@ fn resolve_callee(
             let recv = callee.first_child()?;
             let member = member_name(callee)?;
             let (turi, tdef) = receiver_type(state, uri, root, &recv, false)?;
+            if is_super_receiver(&recv) {
+                let troot = parse_root(state, &turi)?;
+                return inherited_base_member(state, &turi, &troot, &tdef, &member, arity);
+            }
             // same-file C3 first, then cross-file inheritance.
             if let Some(mdef) = member_lookup(state, &turi, &tdef, &member, arity) {
                 return Some((turi, mdef));
@@ -4535,6 +4643,31 @@ fn inherited_member(
     name: &str,
     arity: Option<usize>,
 ) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    inherited_member_impl(state, uri, root, contract, name, arity, true)
+}
+
+/// Resolve a `super.name` target: direct and transitive bases only, never the current
+/// contract's override.
+fn inherited_base_member(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+    name: &str,
+    arity: Option<usize>,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    inherited_member_impl(state, uri, root, contract, name, arity, false)
+}
+
+fn inherited_member_impl(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    contract: &solsp_syntax::SyntaxNode,
+    name: &str,
+    arity: Option<usize>,
+    include_self: bool,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
     use std::collections::{HashSet, VecDeque};
     let mut visited: HashSet<(Url, String)> = HashSet::new();
     // (uri, root, contract, is_base) — a base's `private` member is not accessible here.
@@ -4544,7 +4677,15 @@ fn inherited_member(
         solsp_syntax::SyntaxNode,
         bool,
     )> = VecDeque::new();
-    queue.push_back((uri.clone(), root.clone(), contract.clone(), false));
+    if include_self {
+        queue.push_back((uri.clone(), root.clone(), contract.clone(), false));
+    } else {
+        for base in solsp_hir::resolve::base_names(contract) {
+            if let Some((bu, br, bn)) = resolve_base(state, uri, root, &base) {
+                queue.push_back((bu, br, bn, true));
+            }
+        }
+    }
     while let Some((u, r, c, is_base)) = queue.pop_front() {
         let key = (
             u.clone(),

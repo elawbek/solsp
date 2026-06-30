@@ -1003,6 +1003,57 @@ fn code_action_adds_missing_function_visibility() {
 }
 
 #[test]
+fn yul_assignment_uses_lexical_scope_for_undefined_names() {
+    let uri = Url::parse("file:///yul-scope.sol").unwrap();
+    let src = "contract C { function f() public { assembly { \
+               x := 1 let x := 2 { let z := 1 } z := 2 let y := 1 y := add(y, 1) \
+               } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+
+    assert!(
+        diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "`x` is not defined"),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "`z` is not defined"),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "`y` is not defined"),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn unused_private_function_is_diagnosed() {
     let uri = Url::parse("file:///unused-function.sol").unwrap();
     let src = "contract C {\n    function used() private {}\n    function unused() private {}\n    function run() public { used(); }\n}\n";
@@ -2970,8 +3021,8 @@ fn using_for_library_method() {
 #[test]
 fn this_and_super_member_completion() {
     let uri = Url::parse("file:///ts.sol").unwrap();
-    let src = "contract Base { function pub_() public {} function int_() internal {} }\n\
-               contract C is Base { function f() public { this.X1; super.X2; } }";
+    let src = "contract Base { function pub_() public {} function int_() internal {} function foo(uint256 x) public virtual returns (uint256) { return x; } }\n\
+               contract C is Base { function currentOnly() public {} function foo(uint256 x) public override returns (uint256) { return super.foo(x); } function f() public { this.X1; super.X2; } }";
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
@@ -3027,6 +3078,41 @@ fn this_and_super_member_completion() {
     assert!(
         super_m.contains(&"int_".to_string()),
         "super. should see internal: {super_m:?}"
+    );
+    assert!(
+        super_m.contains(&"foo".to_string()) && !super_m.contains(&"currentOnly".to_string()),
+        "super. should see base members only: {super_m:?}"
+    );
+
+    let super_foo = line1.find("super.foo").unwrap() + "super.".len();
+    send_request(
+        &client,
+        4,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 1,
+                    character: super_foo as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let def: GotoDefinitionResponse =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = def else {
+        panic!("expected super.foo definition");
+    };
+    assert_eq!(loc.uri, uri);
+    assert_eq!(
+        loc.range.start,
+        Position {
+            line: 0,
+            character: src.lines().next().unwrap().find("foo(uint256").unwrap() as u32
+        }
     );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
@@ -3105,7 +3191,7 @@ fn address_and_array_builtins_by_location_and_form() {
     let uri = Url::parse("file:///av.sol").unwrap();
     let src = "contract C { uint256[] sarr; struct S { address who; } S s; \
                function f(uint256[] memory marr) public { \
-               sarr.A1; marr.A2; msg.sender.A3; address(this).A4; s.who.A5; } }";
+               address payable p; sarr.A1; marr.A2; msg.sender.A3; address(this).A4; s.who.A5; p.A6; } }";
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
@@ -3153,11 +3239,21 @@ fn address_and_array_builtins_by_location_and_form() {
     assert!(!labels(3, "A2").contains(&"push".to_string()));
     // address from a builtin member, a cast, and a struct field.
     for (id, m) in [(4, "A3"), (5, "A4"), (6, "A5")] {
+        let labels = labels(id, m);
         assert!(
-            labels(id, m).contains(&"call".to_string()),
+            labels.contains(&"call".to_string()),
             "{m} missing address members"
         );
+        assert!(
+            !labels.contains(&"transfer".to_string()) && !labels.contains(&"send".to_string()),
+            "{m} plain address must not have payable members: {labels:?}"
+        );
     }
+    let payable = labels(7, "A6");
+    assert!(
+        payable.contains(&"transfer".to_string()) && payable.contains(&"send".to_string()),
+        "{payable:?}"
+    );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
@@ -3168,10 +3264,10 @@ fn address_and_array_builtins_by_location_and_form() {
 #[test]
 fn completion_builtin_type_members() {
     let uri = Url::parse("file:///bt.sol").unwrap();
-    let src = "interface IFoo { function x() external; }\n\
+    let src = "interface IFoo { function x() external; } struct S { uint256 x; } contract D {}\n\
                contract C { function f() public { \
                address a; a.X1; uint256[] memory arr; arr.X2; uint256 m = type(uint256).X3; \
-               bytes4 id = type(IFoo).X4; } }";
+               bytes4 id = type(IFoo).X4; bytes memory b = type(D).X5; type(S).X6; } }";
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
@@ -3231,8 +3327,27 @@ fn completion_builtin_type_members() {
     assert_eq!(int_ty, ["min", "max"]);
     let iface = labels(5, "X4");
     assert!(
-        iface.contains(&"interfaceId".to_string()) && iface.contains(&"creationCode".to_string()),
+        iface.contains(&"interfaceId".to_string())
+            && iface.contains(&"name".to_string())
+            && !iface.contains(&"creationCode".to_string())
+            && !iface.contains(&"runtimeCode".to_string()),
         "{iface:?}"
+    );
+    let contract_ty = labels(6, "X5");
+    assert!(
+        contract_ty.contains(&"name".to_string())
+            && contract_ty.contains(&"creationCode".to_string())
+            && contract_ty.contains(&"runtimeCode".to_string())
+            && !contract_ty.contains(&"interfaceId".to_string()),
+        "{contract_ty:?}"
+    );
+    let struct_ty = labels(7, "X6");
+    assert!(
+        !struct_ty.contains(&"name".to_string())
+            && !struct_ty.contains(&"creationCode".to_string())
+            && !struct_ty.contains(&"interfaceId".to_string())
+            && !struct_ty.contains(&"min".to_string()),
+        "{struct_ty:?}"
     );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
