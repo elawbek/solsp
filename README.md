@@ -107,6 +107,8 @@ generally skipped rather than reported, to avoid noisy false positives.
   members.
 - Hover supports `.selector`, `type(X)` members, address members, array/bytes
   members, and builtin global members.
+- Hover inside inline assembly shows Yul/EVM builtin signatures and short
+  descriptions.
 
 ### Completion
 
@@ -146,6 +148,8 @@ generally skipped rather than reported, to avoid noisy false positives.
 - `type(X)` member completion for integer/enum `min` and `max`, and
   contract/interface `name`, `creationCode`, `runtimeCode`, and `interfaceId`.
 - `.selector` completion for functions, errors, and events.
+- Inline assembly completion for Yul/EVM builtins and opcodes, with snippet
+  call insertion and signature/detail metadata.
 - Callable completions insert snippet parentheses and trigger signature help.
 - Completion items include kind and type/detail metadata where available.
 

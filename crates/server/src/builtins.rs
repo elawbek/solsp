@@ -1,6 +1,7 @@
 //! Solidity builtin names and completion items.
 
 use lsp_types::{CompletionItem, CompletionItemKind, InsertTextFormat};
+use std::sync::OnceLock;
 
 use crate::protocol::trigger_signature_help;
 
@@ -235,4 +236,445 @@ pub(super) fn is_builtin_name(name: &str) -> bool {
         || is_fixed_bytes(name)
         || name.starts_with("ufixed")
         || name.starts_with("fixed")
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct YulBuiltin {
+    pub name: &'static str,
+    pub signature: &'static str,
+    pub detail: &'static str,
+}
+
+pub(super) const YUL_BUILTINS: &[YulBuiltin] = &[
+    YulBuiltin {
+        name: "stop",
+        signature: "stop()",
+        detail: "stop execution",
+    },
+    YulBuiltin {
+        name: "add",
+        signature: "add(x, y)",
+        detail: "wrapping addition",
+    },
+    YulBuiltin {
+        name: "sub",
+        signature: "sub(x, y)",
+        detail: "wrapping subtraction",
+    },
+    YulBuiltin {
+        name: "mul",
+        signature: "mul(x, y)",
+        detail: "wrapping multiplication",
+    },
+    YulBuiltin {
+        name: "div",
+        signature: "div(x, y)",
+        detail: "unsigned division",
+    },
+    YulBuiltin {
+        name: "sdiv",
+        signature: "sdiv(x, y)",
+        detail: "signed division",
+    },
+    YulBuiltin {
+        name: "mod",
+        signature: "mod(x, y)",
+        detail: "unsigned modulo",
+    },
+    YulBuiltin {
+        name: "smod",
+        signature: "smod(x, y)",
+        detail: "signed modulo",
+    },
+    YulBuiltin {
+        name: "exp",
+        signature: "exp(x, y)",
+        detail: "exponentiation",
+    },
+    YulBuiltin {
+        name: "not",
+        signature: "not(x)",
+        detail: "bitwise not",
+    },
+    YulBuiltin {
+        name: "lt",
+        signature: "lt(x, y)",
+        detail: "unsigned less-than",
+    },
+    YulBuiltin {
+        name: "gt",
+        signature: "gt(x, y)",
+        detail: "unsigned greater-than",
+    },
+    YulBuiltin {
+        name: "slt",
+        signature: "slt(x, y)",
+        detail: "signed less-than",
+    },
+    YulBuiltin {
+        name: "sgt",
+        signature: "sgt(x, y)",
+        detail: "signed greater-than",
+    },
+    YulBuiltin {
+        name: "eq",
+        signature: "eq(x, y)",
+        detail: "equality comparison",
+    },
+    YulBuiltin {
+        name: "iszero",
+        signature: "iszero(x)",
+        detail: "1 if x is zero, otherwise 0",
+    },
+    YulBuiltin {
+        name: "and",
+        signature: "and(x, y)",
+        detail: "bitwise and",
+    },
+    YulBuiltin {
+        name: "or",
+        signature: "or(x, y)",
+        detail: "bitwise or",
+    },
+    YulBuiltin {
+        name: "xor",
+        signature: "xor(x, y)",
+        detail: "bitwise xor",
+    },
+    YulBuiltin {
+        name: "byte",
+        signature: "byte(n, x)",
+        detail: "nth byte of x",
+    },
+    YulBuiltin {
+        name: "shl",
+        signature: "shl(x, y)",
+        detail: "logical left shift",
+    },
+    YulBuiltin {
+        name: "shr",
+        signature: "shr(x, y)",
+        detail: "logical right shift",
+    },
+    YulBuiltin {
+        name: "sar",
+        signature: "sar(x, y)",
+        detail: "arithmetic right shift",
+    },
+    YulBuiltin {
+        name: "addmod",
+        signature: "addmod(x, y, m)",
+        detail: "modular addition",
+    },
+    YulBuiltin {
+        name: "mulmod",
+        signature: "mulmod(x, y, m)",
+        detail: "modular multiplication",
+    },
+    YulBuiltin {
+        name: "signextend",
+        signature: "signextend(i, x)",
+        detail: "sign extend from byte i",
+    },
+    YulBuiltin {
+        name: "keccak256",
+        signature: "keccak256(p, n)",
+        detail: "hash memory region",
+    },
+    YulBuiltin {
+        name: "pc",
+        signature: "pc()",
+        detail: "program counter",
+    },
+    YulBuiltin {
+        name: "pop",
+        signature: "pop(x)",
+        detail: "discard value",
+    },
+    YulBuiltin {
+        name: "mload",
+        signature: "mload(p)",
+        detail: "load word from memory",
+    },
+    YulBuiltin {
+        name: "mstore",
+        signature: "mstore(p, v)",
+        detail: "store word to memory",
+    },
+    YulBuiltin {
+        name: "mstore8",
+        signature: "mstore8(p, v)",
+        detail: "store byte to memory",
+    },
+    YulBuiltin {
+        name: "msize",
+        signature: "msize()",
+        detail: "current memory size",
+    },
+    YulBuiltin {
+        name: "mcopy",
+        signature: "mcopy(t, f, s)",
+        detail: "copy memory",
+    },
+    YulBuiltin {
+        name: "sload",
+        signature: "sload(p)",
+        detail: "load word from storage",
+    },
+    YulBuiltin {
+        name: "sstore",
+        signature: "sstore(p, v)",
+        detail: "store word to storage",
+    },
+    YulBuiltin {
+        name: "tload",
+        signature: "tload(p)",
+        detail: "load word from transient storage",
+    },
+    YulBuiltin {
+        name: "tstore",
+        signature: "tstore(p, v)",
+        detail: "store word to transient storage",
+    },
+    YulBuiltin {
+        name: "calldataload",
+        signature: "calldataload(p)",
+        detail: "load word from calldata",
+    },
+    YulBuiltin {
+        name: "calldatasize",
+        signature: "calldatasize()",
+        detail: "calldata size",
+    },
+    YulBuiltin {
+        name: "calldatacopy",
+        signature: "calldatacopy(t, f, s)",
+        detail: "copy calldata to memory",
+    },
+    YulBuiltin {
+        name: "codesize",
+        signature: "codesize()",
+        detail: "current code size",
+    },
+    YulBuiltin {
+        name: "codecopy",
+        signature: "codecopy(t, f, s)",
+        detail: "copy current code to memory",
+    },
+    YulBuiltin {
+        name: "extcodesize",
+        signature: "extcodesize(a)",
+        detail: "external account code size",
+    },
+    YulBuiltin {
+        name: "extcodecopy",
+        signature: "extcodecopy(a, t, f, s)",
+        detail: "copy external account code",
+    },
+    YulBuiltin {
+        name: "extcodehash",
+        signature: "extcodehash(a)",
+        detail: "external account code hash",
+    },
+    YulBuiltin {
+        name: "returndatasize",
+        signature: "returndatasize()",
+        detail: "last return data size",
+    },
+    YulBuiltin {
+        name: "returndatacopy",
+        signature: "returndatacopy(t, f, s)",
+        detail: "copy return data to memory",
+    },
+    YulBuiltin {
+        name: "create",
+        signature: "create(v, p, n)",
+        detail: "create contract",
+    },
+    YulBuiltin {
+        name: "create2",
+        signature: "create2(v, p, n, s)",
+        detail: "create contract with salt",
+    },
+    YulBuiltin {
+        name: "call",
+        signature: "call(g, a, v, in, insize, out, outsize)",
+        detail: "message call",
+    },
+    YulBuiltin {
+        name: "callcode",
+        signature: "callcode(g, a, v, in, insize, out, outsize)",
+        detail: "message call with current storage",
+    },
+    YulBuiltin {
+        name: "delegatecall",
+        signature: "delegatecall(g, a, in, insize, out, outsize)",
+        detail: "delegate call",
+    },
+    YulBuiltin {
+        name: "staticcall",
+        signature: "staticcall(g, a, in, insize, out, outsize)",
+        detail: "static call",
+    },
+    YulBuiltin {
+        name: "return",
+        signature: "return(p, s)",
+        detail: "return memory region",
+    },
+    YulBuiltin {
+        name: "revert",
+        signature: "revert(p, s)",
+        detail: "revert with memory region",
+    },
+    YulBuiltin {
+        name: "selfdestruct",
+        signature: "selfdestruct(a)",
+        detail: "destroy current contract",
+    },
+    YulBuiltin {
+        name: "invalid",
+        signature: "invalid()",
+        detail: "end execution with invalid instruction",
+    },
+    YulBuiltin {
+        name: "log0",
+        signature: "log0(p, s)",
+        detail: "emit log with no topics",
+    },
+    YulBuiltin {
+        name: "log1",
+        signature: "log1(p, s, t1)",
+        detail: "emit log with one topic",
+    },
+    YulBuiltin {
+        name: "log2",
+        signature: "log2(p, s, t1, t2)",
+        detail: "emit log with two topics",
+    },
+    YulBuiltin {
+        name: "log3",
+        signature: "log3(p, s, t1, t2, t3)",
+        detail: "emit log with three topics",
+    },
+    YulBuiltin {
+        name: "log4",
+        signature: "log4(p, s, t1, t2, t3, t4)",
+        detail: "emit log with four topics",
+    },
+    YulBuiltin {
+        name: "chainid",
+        signature: "chainid()",
+        detail: "current chain id",
+    },
+    YulBuiltin {
+        name: "basefee",
+        signature: "basefee()",
+        detail: "current block base fee",
+    },
+    YulBuiltin {
+        name: "blobbasefee",
+        signature: "blobbasefee()",
+        detail: "current blob base fee",
+    },
+    YulBuiltin {
+        name: "origin",
+        signature: "origin()",
+        detail: "transaction origin",
+    },
+    YulBuiltin {
+        name: "gasprice",
+        signature: "gasprice()",
+        detail: "transaction gas price",
+    },
+    YulBuiltin {
+        name: "blockhash",
+        signature: "blockhash(b)",
+        detail: "hash of block b",
+    },
+    YulBuiltin {
+        name: "coinbase",
+        signature: "coinbase()",
+        detail: "current block beneficiary",
+    },
+    YulBuiltin {
+        name: "timestamp",
+        signature: "timestamp()",
+        detail: "current block timestamp",
+    },
+    YulBuiltin {
+        name: "number",
+        signature: "number()",
+        detail: "current block number",
+    },
+    YulBuiltin {
+        name: "difficulty",
+        signature: "difficulty()",
+        detail: "current block difficulty",
+    },
+    YulBuiltin {
+        name: "prevrandao",
+        signature: "prevrandao()",
+        detail: "current block randomness",
+    },
+    YulBuiltin {
+        name: "gaslimit",
+        signature: "gaslimit()",
+        detail: "current block gas limit",
+    },
+    YulBuiltin {
+        name: "caller",
+        signature: "caller()",
+        detail: "message caller",
+    },
+    YulBuiltin {
+        name: "callvalue",
+        signature: "callvalue()",
+        detail: "call value",
+    },
+    YulBuiltin {
+        name: "gas",
+        signature: "gas()",
+        detail: "remaining gas",
+    },
+    YulBuiltin {
+        name: "balance",
+        signature: "balance(a)",
+        detail: "account balance",
+    },
+    YulBuiltin {
+        name: "selfbalance",
+        signature: "selfbalance()",
+        detail: "current contract balance",
+    },
+    YulBuiltin {
+        name: "blobhash",
+        signature: "blobhash(i)",
+        detail: "versioned hash of blob i",
+    },
+];
+
+pub(super) fn yul_builtin_items() -> Vec<CompletionItem> {
+    static ITEMS: OnceLock<Vec<CompletionItem>> = OnceLock::new();
+    ITEMS
+        .get_or_init(|| {
+            YUL_BUILTINS
+                .iter()
+                .map(|builtin| CompletionItem {
+                    kind: Some(CompletionItemKind::FUNCTION),
+                    detail: Some(format!("Yul builtin: {}", builtin.detail)),
+                    insert_text: Some(format!("{}($0)", builtin.name)),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    label: builtin.name.to_string(),
+                    ..Default::default()
+                })
+                .collect()
+        })
+        .clone()
+}
+
+pub(super) fn yul_builtin(name: &str) -> Option<YulBuiltin> {
+    YUL_BUILTINS
+        .iter()
+        .copied()
+        .find(|builtin| builtin.name == name)
 }

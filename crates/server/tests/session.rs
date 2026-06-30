@@ -2677,6 +2677,121 @@ fn completion_builtin_global_members() {
 }
 
 #[test]
+fn completion_inside_inline_assembly_offers_yul_builtins() {
+    let uri = Url::parse("file:///yul-completion.sol").unwrap();
+    let src = "contract C { function f() public { assembly {  } uint256 x; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let labels = |id: i32, character: u32| -> Vec<String> {
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position { line: 0, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: None,
+            },
+        );
+        let resp = next_response(&client);
+        let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        match r {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+        .into_iter()
+        .map(|item| item.label)
+        .collect()
+    };
+
+    let yul = labels(
+        2,
+        src.find("assembly {  }").unwrap() as u32 + "assembly { ".len() as u32,
+    );
+    for want in ["sstore", "mload", "calldataload", "return"] {
+        assert!(yul.contains(&want.to_string()), "missing {want}: {yul:?}");
+    }
+    assert!(
+        !yul.contains(&"uint256".to_string()),
+        "Yul completion should not show Solidity scope items: {yul:?}"
+    );
+
+    let solidity = labels(3, src.find("uint256 x").unwrap() as u32);
+    assert!(solidity.contains(&"uint256".to_string()), "{solidity:?}");
+    assert!(
+        !solidity.contains(&"sstore".to_string()),
+        "Solidity completion should not show Yul builtins: {solidity:?}"
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn hover_on_inline_assembly_builtin_shows_signature() {
+    let uri = Url::parse("file:///yul-hover.sol").unwrap();
+    let src = "contract C { function f() public { assembly { sstore(0, 1) } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    send_request(
+        &client,
+        2,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: src.find("sstore").unwrap() as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hover: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(markup) = hover.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(markup.value.contains("sstore(p, v)"), "{markup:?}");
+    assert!(markup.value.contains("store word to storage"), "{markup:?}");
+    assert!(markup.value.contains("*(Yul builtin)*"), "{markup:?}");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn named_arg_type_in_completion_and_hover() {
     let uri = Url::parse("file:///t.sol").unwrap();
     let src = "struct Point { uint256 x; address owner; }\n\

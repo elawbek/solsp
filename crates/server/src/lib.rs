@@ -40,7 +40,7 @@ pub use capabilities::server_capabilities;
 
 use builtins::{
     builtin_items, builtin_member_items, is_builtin_name, is_fixed_bytes, is_integer_type_name,
-    synthetic_members,
+    synthetic_members, yul_builtin, yul_builtin_items,
 };
 use completion_items::completion_items_from;
 use diagnostics::{publish_diagnostics, send_diagnostics};
@@ -1440,6 +1440,10 @@ fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
+    // Inline assembly uses Yul/EVM builtins rather than Solidity scope names.
+    if let Some(h) = yul_builtin_hover(&root, offset) {
+        return Some(h);
+    }
     // 0. a named-argument key (`f({ owner_: … })`) → its parameter/field type.
     if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
         return Some(h);
@@ -1508,6 +1512,9 @@ fn completion_items(state: &ServerState, params: &CompletionParams) -> Option<Ve
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
+    if is_inside_yul_block(&root, offset) {
+        return Some(yul_builtin_items());
+    }
     // named-argument keys (`f({ <here>: … })`) are the most specific context.
     if let Some(items) = named_arg_completion(state, &uri, &root, offset) {
         return Some(items);
@@ -1604,6 +1611,39 @@ fn member_completion(
         return Some(using_items);
     }
     Some(Vec::new())
+}
+
+fn yul_builtin_hover(root: &solsp_syntax::SyntaxNode, offset: rowan::TextSize) -> Option<Hover> {
+    use solsp_syntax::SyntaxKind::{NAME_REF, YUL_BLOCK};
+    let nr = root.token_at_offset(offset).find_map(|token| {
+        token
+            .parent_ancestors()
+            .find(|node| node.kind() == NAME_REF)
+    })?;
+    if nr.ancestors().all(|node| node.kind() != YUL_BLOCK) {
+        return None;
+    }
+    let text = nr.text().to_string();
+    let builtin = yul_builtin(text.trim())?;
+    Some(markup_hover(
+        format!(
+            "```yul\n{}\n```\n\n{}\n\n*(Yul builtin)*",
+            builtin.signature, builtin.detail
+        ),
+        None,
+    ))
+}
+
+fn is_inside_yul_block(root: &solsp_syntax::SyntaxNode, offset: rowan::TextSize) -> bool {
+    use solsp_syntax::SyntaxKind::YUL_BLOCK;
+    root.token_at_offset(offset)
+        .left_biased()
+        .or_else(|| root.token_at_offset(offset).right_biased())
+        .and_then(|token| token.parent())
+        .is_some_and(|node| {
+            node.ancestors()
+                .any(|ancestor| ancestor.kind() == YUL_BLOCK)
+        })
 }
 
 /// Hover for a builtin / synthetic member (`msg.sender`, `address(x).balance`,
@@ -3048,11 +3088,11 @@ fn yul_mutability_effects(function: &solsp_syntax::SyntaxNode) -> YulMutabilityE
         };
         let text = callee.text().to_string();
         let name = text.trim();
-        if yul_builtin_writes_state(&name) {
+        if yul_builtin_writes_state(name) {
             effects.state_writes.push(callee);
-        } else if yul_builtin_reads_state(&name) {
+        } else if yul_builtin_reads_state(name) {
             effects.state_reads.push(callee);
-        } else if !yul_builtin_is_pure(&name) {
+        } else if !yul_builtin_is_pure(name) {
             effects.has_unknown_call = true;
         }
     }
