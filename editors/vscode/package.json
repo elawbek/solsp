@@ -19,7 +19,9 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:solidity"
+    "onLanguage:solidity",
+    "onCommand:solsp.showInheritanceGraph",
+    "onCommand:solsp.showFunctionCallGraph"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -64,6 +66,16 @@
         }
       }
     },
+    "commands": [
+      {
+        "command": "solsp.showInheritanceGraph",
+        "title": "SolSP: Show Inheritance Graph"
+      },
+      {
+        "command": "solsp.showFunctionCallGraph",
+        "title": "SolSP: Show Function Call Graph"
+      }
+    ],
     "grammars": [
       {
         "language": "solidity",

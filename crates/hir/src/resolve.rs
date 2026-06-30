@@ -419,6 +419,9 @@ fn lookup_in_scope(scope: &SyntaxNode, name: &str, arity: Option<usize>) -> Opti
         // inline assembly (Yul): `let` declarations + nested `function` defs, and a
         // Yul function's params / `-> r` returns.
         YUL_BLOCK | YUL_FUNCTION_DEF => find_yul_binding(scope, name),
+        // Yul `for { init } cond { post } { body }`: bindings introduced in the init
+        // block are visible to the condition, post block, and body block.
+        YUL_FOR => find_yul_for_init_binding(scope, name),
         _ => None,
     }
 }
@@ -427,6 +430,16 @@ fn lookup_in_scope(scope: &SyntaxNode, name: &str, arity: Option<usize>) -> Opti
 /// nested `function`) or a `YUL_FUNCTION_DEF` (its params / return names).
 fn find_yul_binding(scope: &SyntaxNode, name: &str) -> Option<Definition> {
     yul_candidates(scope)
+        .into_iter()
+        .filter_map(|(nm, full, kind)| make_yul_def(&nm, &full, kind))
+        .find(|d| d.name == name)
+}
+
+fn find_yul_for_init_binding(scope: &SyntaxNode, name: &str) -> Option<Definition> {
+    let init = scope
+        .children()
+        .find(|node| node.kind() == SyntaxKind::YUL_BLOCK)?;
+    yul_candidates(&init)
         .into_iter()
         .filter_map(|(nm, full, kind)| make_yul_def(&nm, &full, kind))
         .find(|d| d.name == name)
@@ -958,6 +971,22 @@ mod tests {
         // `x` in `mul(a, x)` (inside the Yul function) → the OUTER `let x` (closure)
         let d = resolve_at(src, "x) }").unwrap();
         assert_eq!(d.name, "x");
+    }
+
+    #[test]
+    fn resolves_yul_for_init_bindings_across_for_parts() {
+        let src = "contract C { function f(uint256 n) public { assembly {\n\
+            for { let i := 0 } lt(i, n) { i := add(i, 1) } { mstore(i, 0) }\n\
+        } } }";
+        let d = resolve_at(src, "i, n").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "i");
+        let d = resolve_at(src, "i := add").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "i");
+        let d = resolve_at(src, "i, 0").unwrap();
+        assert_eq!(d.kind, DefKind::Local);
+        assert_eq!(d.name, "i");
     }
 
     #[test]

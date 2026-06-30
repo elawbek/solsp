@@ -5,6 +5,8 @@
 
 use lsp_server::{Connection, Message, Notification, Request, RequestId, Response};
 use lsp_types::{
+    CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
+    CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeLens, CodeLensParams,
     CompletionItem, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
     DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
@@ -352,6 +354,223 @@ fn goto_definition_and_hover() {
     assert!(markup.value.contains("`s`"));
 
     send_request(&client, 4, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn call_hierarchy_reports_incoming_and_outgoing_calls() {
+    let uri = Url::parse("file:///call-hierarchy.sol").unwrap();
+    let src = "contract C { function leaf() public {} function helper() internal { leaf(); } function run() public { leaf(); this.leaf(); helper(); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let resp = next_response(&client);
+    let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(init.capabilities.call_hierarchy_provider.is_some());
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let prepare = |id: i32, marker: &str| -> CallHierarchyItem {
+        let character = (src.find(marker).unwrap() + "function ".len()) as u32;
+        send_request(
+            &client,
+            id,
+            "textDocument/prepareCallHierarchy",
+            CallHierarchyPrepareParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position { line: 0, character },
+                },
+                work_done_progress_params: Default::default(),
+            },
+        );
+        let items: Option<Vec<CallHierarchyItem>> =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        items.expect("prepare result").pop().expect("call item")
+    };
+
+    let mut run_item = prepare(2, "function run");
+    assert_eq!(run_item.name, "run");
+    send_request(
+        &client,
+        3,
+        "callHierarchy/outgoingCalls",
+        CallHierarchyOutgoingCallsParams {
+            item: run_item.clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let outgoing: Option<Vec<CallHierarchyOutgoingCall>> =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let outgoing = outgoing.unwrap();
+    let leaf = outgoing
+        .iter()
+        .find(|call| call.to.name == "leaf")
+        .expect("run -> leaf");
+    assert_eq!(leaf.from_ranges.len(), 2, "{outgoing:?}");
+    assert!(
+        outgoing.iter().any(|call| call.to.name == "helper"),
+        "{outgoing:?}"
+    );
+
+    let leaf_item = prepare(4, "function leaf");
+    send_request(
+        &client,
+        5,
+        "callHierarchy/incomingCalls",
+        CallHierarchyIncomingCallsParams {
+            item: leaf_item,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let incoming: Option<Vec<CallHierarchyIncomingCall>> =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let incoming = incoming.unwrap();
+    assert!(
+        incoming
+            .iter()
+            .any(|call| call.from.name == "run" && call.from_ranges.len() == 2),
+        "{incoming:?}"
+    );
+    assert!(
+        incoming.iter().any(|call| call.from.name == "helper"),
+        "{incoming:?}"
+    );
+
+    run_item.data = None;
+    send_request(
+        &client,
+        6,
+        "callHierarchy/outgoingCalls",
+        CallHierarchyOutgoingCallsParams {
+            item: run_item,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let fallback: Option<Vec<CallHierarchyOutgoingCall>> =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    assert!(fallback.unwrap().iter().any(|call| call.to.name == "leaf"));
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn inheritance_graph_custom_request_returns_mermaid_edges() {
+    let uri = Url::parse("file:///inheritance-graph.sol").unwrap();
+    let src = "interface I {} contract Base {} contract Child is Base, I {} contract Unrelated {}";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    send_request(
+        &client,
+        2,
+        "solsp/inheritanceGraph",
+        serde_json::json!({
+            "textDocument": { "uri": uri }
+        }),
+    );
+    let graph = next_response(&client).result.unwrap();
+    let mermaid = graph
+        .get("mermaid")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert!(mermaid.contains("classDiagram"), "{mermaid}");
+    assert!(mermaid.contains("<|--"), "{mermaid}");
+    assert!(mermaid.contains("Base"), "{mermaid}");
+    assert!(mermaid.contains("Child"), "{mermaid}");
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 4, "{graph:?}");
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 2, "{graph:?}");
+
+    send_request(
+        &client,
+        3,
+        "solsp/inheritanceGraph",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": src.find("Child").unwrap() }
+        }),
+    );
+    let graph = next_response(&client).result.unwrap();
+    let mermaid = graph
+        .get("mermaid")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert!(mermaid.contains("Child"), "{mermaid}");
+    assert!(mermaid.contains("Base"), "{mermaid}");
+    assert!(mermaid.contains("I"), "{mermaid}");
+    assert!(!mermaid.contains("Unrelated"), "{mermaid}");
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 3, "{graph:?}");
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 2, "{graph:?}");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn function_call_graph_custom_request_returns_outgoing_edges() {
+    let uri = Url::parse("file:///function-call-graph.sol").unwrap();
+    let src = "contract C { function leaf() public {} function helper() internal { leaf(); } function run() public { leaf(); helper(); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    send_request(
+        &client,
+        2,
+        "solsp/functionCallGraph",
+        serde_json::json!({
+            "textDocument": { "uri": uri },
+            "position": { "line": 0, "character": src.find("run").unwrap() }
+        }),
+    );
+    let graph = next_response(&client).result.unwrap();
+    let mermaid = graph
+        .get("mermaid")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default();
+    assert!(mermaid.contains("flowchart TD"), "{mermaid}");
+    assert!(mermaid.contains("C.run"), "{mermaid}");
+    assert!(mermaid.contains("C.helper"), "{mermaid}");
+    assert!(mermaid.contains("C.leaf"), "{mermaid}");
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 3, "{graph:?}");
+    assert_eq!(graph["edges"].as_array().unwrap().len(), 3, "{graph:?}");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
     send_notification(&client, "exit", serde_json::Value::Null);
     server_thread.join().expect("server thread panicked");
@@ -741,6 +960,22 @@ fn code_lens_shows_reference_counts() {
     );
     let resp = next_response(&client);
     let lenses: Vec<CodeLens> = serde_json::from_value(resp.result.unwrap()).unwrap();
+    assert!(
+        lenses
+            .iter()
+            .any(|lens| lens.command.as_ref().is_some_and(|cmd| {
+                cmd.title == "inheritance graph" && cmd.command == "solsp.showInheritanceGraph"
+            })),
+        "{lenses:?}"
+    );
+    assert!(
+        lenses
+            .iter()
+            .any(|lens| lens.command.as_ref().is_some_and(|cmd| {
+                cmd.title == "call graph" && cmd.command == "solsp.showFunctionCallGraph"
+            })),
+        "{lenses:?}"
+    );
     let lens = lenses
         .into_iter()
         .find(|lens| {
@@ -1007,6 +1242,7 @@ fn yul_assignment_uses_lexical_scope_for_undefined_names() {
     let uri = Url::parse("file:///yul-scope.sol").unwrap();
     let src = "contract C { function f() public { assembly { \
                x := 1 let x := 2 { let z := 1 } z := 2 let y := 1 y := add(y, 1) \
+               for { let i := 0 } lt(i, 3) { i := add(i, 1) } { mstore(i, 0) } \
                } } }";
 
     let (server, client) = Connection::memory();
@@ -1043,6 +1279,14 @@ fn yul_assignment_uses_lexical_scope_for_undefined_names() {
             .diagnostics
             .iter()
             .any(|diag| diag.message == "`y` is not defined"),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "`i` is not defined"),
         "{:?}",
         diags.diagnostics
     );

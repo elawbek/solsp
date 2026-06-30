@@ -83,27 +83,22 @@ fn split_array_suffix(ty: &str) -> Option<(&str, &str)> {
 
 pub(crate) fn yul_contains_hex(root: &solsp_syntax::SyntaxNode, hex: &str) -> bool {
     let needle = hex.to_ascii_lowercase();
-    root.descendants()
-        .filter(|node| node.kind() == SyntaxKind::YUL_BLOCK)
-        .any(|block| {
-            let text: String = block
-                .descendants_with_tokens()
-                .filter_map(|element| element.into_token())
-                .filter(|token| token.kind() != SyntaxKind::COMMENT)
-                .map(|token| token.text().to_ascii_lowercase())
-                .collect();
-            text.contains(&needle)
-        })
+    assembly_yul_blocks(root).into_iter().any(|block| {
+        let text: String = block
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() != SyntaxKind::COMMENT)
+            .map(|token| token.text().to_ascii_lowercase())
+            .collect();
+        text.contains(&needle)
+    })
 }
 
 pub(crate) fn yul_hex_ranges(root: &solsp_syntax::SyntaxNode, hex: &str) -> Vec<rowan::TextRange> {
     let needle = hex.to_ascii_lowercase();
     let mut seen = std::collections::HashSet::new();
     let mut ranges = Vec::new();
-    for block in root
-        .descendants()
-        .filter(|node| node.kind() == SyntaxKind::YUL_BLOCK)
-    {
+    for block in assembly_yul_blocks(root) {
         for range in block
             .descendants_with_tokens()
             .filter_map(|element| element.into_token())
@@ -117,6 +112,16 @@ pub(crate) fn yul_hex_ranges(root: &solsp_syntax::SyntaxNode, hex: &str) -> Vec<
         }
     }
     ranges
+}
+
+fn assembly_yul_blocks(root: &solsp_syntax::SyntaxNode) -> Vec<solsp_syntax::SyntaxNode> {
+    root.descendants()
+        .filter(|node| node.kind() == SyntaxKind::ASSEMBLY_STMT)
+        .filter_map(|node| {
+            node.children()
+                .find(|child| child.kind() == SyntaxKind::YUL_BLOCK)
+        })
+        .collect()
 }
 
 fn to_hex(bytes: &[u8]) -> String {
@@ -239,6 +244,20 @@ mod tests {
             to_hex(&keccak256(b"Transfer(address,address,uint256)")),
             "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
         );
+    }
+
+    #[test]
+    fn counts_only_top_level_assembly_yul_blocks() {
+        let db = solsp_base_db::RootDatabase::default();
+        let file = solsp_base_db::SourceFile::new(
+            &db,
+            "file:///fixpoint-repro.sol".to_string(),
+            "contract C { error UnsafeDotPosition(uint256 dot); function f(uint256 dot) public { assembly { if gt(dot, 0x4d) { mstore(0x00, 0xbfb6d3c2) } } } }".to_string(),
+        );
+        let root = solsp_base_db::parse(&db, file).syntax();
+        assert_eq!(assembly_yul_blocks(&root).len(), 1);
+        assert_eq!(yul_hex_ranges(&root, "bfb6d3c2").len(), 1);
+        assert!(yul_contains_hex(&root, "bfb6d3c2"));
     }
 
     #[test]
