@@ -23,6 +23,7 @@ use lsp_types::{
     SignatureInformation, TextEdit, Url, WorkspaceEdit,
 };
 
+mod abi;
 mod builtins;
 mod capabilities;
 mod completion_items;
@@ -583,6 +584,9 @@ fn unused_event_diagnostics(
         if reference_locations(state, &name, &target, true).len() > 1 {
             continue;
         }
+        if abi::event_topic_hex(&event).is_some_and(|topic| abi::yul_contains_hex(root, &topic)) {
+            continue;
+        }
         out.push(lsp_types::Diagnostic {
             range: to_proto::range(li, target.range),
             severity: Some(lsp_types::DiagnosticSeverity::WARNING),
@@ -620,6 +624,11 @@ fn unused_error_diagnostics(
             range: declaration_name_range(&error),
         };
         if reference_locations(state, &name, &target, true).len() > 1 {
+            continue;
+        }
+        if abi::error_selector_hex(&error)
+            .is_some_and(|selector| abi::yul_contains_hex(root, &selector))
+        {
             continue;
         }
         out.push(lsp_types::Diagnostic {

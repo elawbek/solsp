@@ -1027,6 +1027,46 @@ fn unused_event_is_diagnosed() {
 }
 
 #[test]
+fn event_used_by_assembly_topic_is_not_diagnosed() {
+    let uri = Url::parse("file:///assembly-event.sol").unwrap();
+    let src = "contract C {\n    event Transfer(address indexed from, address indexed to, uint256 value);\n    event Unused(address who);\n    function run() public { assembly { log3(0, 0, 0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef, caller(), address()) } }\n}\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "event `Transfer` is never emitted"),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "event `Unused` is never emitted"),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn unused_custom_error_is_diagnosed() {
     let uri = Url::parse("file:///unused-error.sol").unwrap();
     let src = "contract C {\n    error Used(uint256 value);\n    error Unused(address who);\n    function run() public { revert Used(1); }\n}\n";
@@ -1057,6 +1097,46 @@ fn unused_custom_error_is_diagnosed() {
             .diagnostics
             .iter()
             .any(|diag| diag.message == "error `Used` is never used"),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn error_used_by_assembly_selector_is_not_diagnosed() {
+    let uri = Url::parse("file:///assembly-error.sol").unwrap();
+    let src = "contract C {\n    error UnsafeDotPosition(uint256 dot);\n    error Unused(address who);\n    function run(uint256 dot) public pure { assembly { if gt(dot, 0x4d) { mstore(0x00, 0xbfb6d3c2) mstore(0x20, dot) revert(0x1c, 0x24) } } }\n}\n";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "error `UnsafeDotPosition` is never used"),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.message == "error `Unused` is never used"),
         "{:?}",
         diags.diagnostics
     );
