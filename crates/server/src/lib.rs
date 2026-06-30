@@ -1664,20 +1664,36 @@ fn resolve_receiver_def(
     root: &solsp_syntax::SyntaxNode,
     receiver: &solsp_syntax::SyntaxNode,
 ) -> Option<solsp_hir::resolve::Definition> {
+    resolve_receiver_def_target(state, uri, root, receiver).map(|(_, _, def)| def)
+}
+
+fn resolve_receiver_def_target(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    receiver: &solsp_syntax::SyntaxNode,
+) -> Option<(
+    Url,
+    solsp_syntax::SyntaxNode,
+    solsp_hir::resolve::Definition,
+)> {
     use solsp_syntax::SyntaxKind::{MEMBER_EXPR, NAME_REF, PATH_EXPR};
     match receiver.kind() {
         PATH_EXPR | NAME_REF => {
             let nr = receiver_name_ref(receiver)?;
             if let Some(d) = solsp_hir::resolve::resolve(&nr) {
-                return Some(d);
+                return Some((uri.clone(), root.clone(), d));
             }
             let name = nameref_text(&nr)?;
             if let Some(c) = enclosing_contract(receiver) {
-                if let Some((_, d)) = inherited_member(state, uri, root, &c, &name, None) {
-                    return Some(d);
+                if let Some((target_uri, d)) = inherited_member(state, uri, root, &c, &name, None) {
+                    let target_root = parse_root(state, &target_uri)?;
+                    return Some((target_uri, target_root, d));
                 }
             }
-            cross_file_definition(state, uri, root, &name, None).map(|(_, d)| d)
+            let (target_uri, d) = cross_file_definition(state, uri, root, &name, None)?;
+            let target_root = parse_root(state, &target_uri)?;
+            Some((target_uri, target_root, d))
         }
         // `A.B` → resolve the member `B` at its own offset.
         MEMBER_EXPR => {
@@ -1686,7 +1702,9 @@ fn resolve_receiver_def(
                 .filter(|n| n.kind() == NAME_REF)
                 .last()?;
             let off = member_nr.text_range().start();
-            member_resolve(state, uri, root, off).map(|(_, d)| d)
+            let (target_uri, d) = member_resolve(state, uri, root, off)?;
+            let target_root = parse_root(state, &target_uri)?;
+            Some((target_uri, target_root, d))
         }
         _ => None,
     }
@@ -2880,8 +2898,8 @@ fn identifiers_outside_imports(
         .collect()
 }
 
-/// Flag a state-variable write inside a `view` or `pure` function (which may not modify
-/// state). The write target's base must name a state variable.
+/// Flag direct state access that conflicts with function mutability, and suggest stricter
+/// mutability for functions that only read state or do not touch state.
 fn mutability_diagnostics(
     state: &ServerState,
     uri: &Url,
@@ -2890,38 +2908,59 @@ fn mutability_diagnostics(
     deadline: Option<std::time::Instant>,
 ) -> Vec<lsp_types::Diagnostic> {
     use solsp_hir::resolve::DefKind;
-    use solsp_syntax::SyntaxKind::{ASSIGN_EXPR, FUNCTION_DEF, NAME_REF, PURE_KW, VIEW_KW};
+    use solsp_syntax::SyntaxKind::{
+        BLOCK, FUNCTION_DEF, MODIFIER_INVOCATION, NAME_REF, PAYABLE_KW, PURE_KW, VIEW_KW,
+    };
     let mut out = Vec::new();
-    for asn in root.descendants().filter(|n| n.kind() == ASSIGN_EXPR) {
+    for func in root.descendants().filter(|n| n.kind() == FUNCTION_DEF) {
         if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
             break;
         }
-        // inside a view/pure function?
-        let Some(func) = asn.ancestors().find(|n| n.kind() == FUNCTION_DEF) else {
-            continue;
-        };
-        let read_only = func
+        let is_view = func
             .children_with_tokens()
             .filter_map(|e| e.into_token())
-            .any(|t| matches!(t.kind(), VIEW_KW | PURE_KW));
-        if !read_only {
-            continue;
-        }
-        // the write target's base identifier.
-        let Some(lhs) = asn.first_child() else {
-            continue;
-        };
-        let base = if lhs.kind() == NAME_REF {
-            lhs.clone()
-        } else {
-            let Some(b) = lhs.descendants().find(|n| n.kind() == NAME_REF) else {
+            .any(|t| t.kind() == VIEW_KW);
+        let is_pure = func
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == PURE_KW);
+        let yul_effects = yul_mutability_effects(&func);
+
+        let mut reads_state = false;
+        let mut writes_state = false;
+        for nr in func.descendants().filter(|n| n.kind() == NAME_REF) {
+            let Some((_, def_root, def)) = resolve_receiver_def_target(state, uri, root, &nr)
+            else {
                 continue;
             };
-            b
-        };
-        // a write whose base is a state variable mutates storage.
-        if let Some(def) = resolve_receiver_def(state, uri, root, &base) {
-            if def.kind == DefKind::StateVariable {
+            if def.kind != DefKind::StateVariable {
+                continue;
+            }
+            if state_variable_is_constant_or_immutable(&def.full_ptr.to_node(&def_root)) {
+                continue;
+            }
+            if state_write_lhs(&nr).is_some() {
+                writes_state = true;
+            } else {
+                reads_state = true;
+                if is_pure {
+                    out.push(type_mismatch(
+                        li,
+                        &nr,
+                        "cannot read state in a `pure` function",
+                    ));
+                }
+            }
+        }
+
+        if (is_view || is_pure) && writes_state {
+            for lhs in func.descendants().filter_map(|n| {
+                (n.kind() == NAME_REF
+                    && resolve_receiver_def(state, uri, root, &n)
+                        .is_some_and(|def| def.kind == DefKind::StateVariable))
+                .then(|| state_write_lhs(&n))
+                .flatten()
+            }) {
                 out.push(type_mismatch(
                     li,
                     &lhs,
@@ -2929,8 +2968,258 @@ fn mutability_diagnostics(
                 ));
             }
         }
+        if is_pure {
+            for read in &yul_effects.state_reads {
+                out.push(type_mismatch(
+                    li,
+                    read,
+                    "cannot read state in a `pure` function",
+                ));
+            }
+        }
+        if is_view || is_pure {
+            for write in &yul_effects.state_writes {
+                out.push(type_mismatch(
+                    li,
+                    write,
+                    "cannot write to state in a `view`/`pure` function",
+                ));
+            }
+        }
+
+        if is_view
+            || is_pure
+            || writes_state
+            || !yul_effects.state_writes.is_empty()
+            || yul_effects.has_unknown_call
+            || has_unknown_mutability_calls(state, uri, root, &func)
+            || func.children().all(|n| n.kind() != BLOCK)
+            || func.children().any(|n| n.kind() == MODIFIER_INVOCATION)
+            || func
+                .children_with_tokens()
+                .filter_map(|e| e.into_token())
+                .any(|t| t.kind() == PAYABLE_KW)
+        {
+            continue;
+        }
+
+        if reads_state || !yul_effects.state_reads.is_empty() {
+            out.push(lsp_types::Diagnostic {
+                range: to_proto::range(li, function_name_range(&func)),
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                source: Some("solsp".to_string()),
+                message: "function can be marked `view`".to_string(),
+                ..Default::default()
+            });
+        } else {
+            out.push(lsp_types::Diagnostic {
+                range: to_proto::range(li, function_name_range(&func)),
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                source: Some("solsp".to_string()),
+                message: "function can be marked `pure`".to_string(),
+                ..Default::default()
+            });
+        }
     }
     out
+}
+
+struct YulMutabilityEffects {
+    state_reads: Vec<solsp_syntax::SyntaxNode>,
+    state_writes: Vec<solsp_syntax::SyntaxNode>,
+    has_unknown_call: bool,
+}
+
+fn yul_mutability_effects(function: &solsp_syntax::SyntaxNode) -> YulMutabilityEffects {
+    use solsp_syntax::SyntaxKind::{NAME_REF, YUL_FUNCTION_CALL};
+
+    let mut effects = YulMutabilityEffects {
+        state_reads: Vec::new(),
+        state_writes: Vec::new(),
+        has_unknown_call: false,
+    };
+    for call in function
+        .descendants()
+        .filter(|node| node.kind() == YUL_FUNCTION_CALL)
+    {
+        let Some(callee) = call.descendants().find(|node| node.kind() == NAME_REF) else {
+            effects.has_unknown_call = true;
+            continue;
+        };
+        let text = callee.text().to_string();
+        let name = text.trim();
+        if yul_builtin_writes_state(&name) {
+            effects.state_writes.push(callee);
+        } else if yul_builtin_reads_state(&name) {
+            effects.state_reads.push(callee);
+        } else if !yul_builtin_is_pure(&name) {
+            effects.has_unknown_call = true;
+        }
+    }
+    effects
+}
+
+fn yul_builtin_writes_state(name: &str) -> bool {
+    matches!(
+        name,
+        "sstore"
+            | "tstore"
+            | "log0"
+            | "log1"
+            | "log2"
+            | "log3"
+            | "log4"
+            | "create"
+            | "create2"
+            | "call"
+            | "callcode"
+            | "delegatecall"
+            | "selfdestruct"
+    )
+}
+
+fn yul_builtin_reads_state(name: &str) -> bool {
+    matches!(
+        name,
+        "sload"
+            | "tload"
+            | "balance"
+            | "selfbalance"
+            | "extcodesize"
+            | "extcodecopy"
+            | "extcodehash"
+            | "origin"
+            | "caller"
+            | "callvalue"
+            | "gasprice"
+            | "coinbase"
+            | "timestamp"
+            | "number"
+            | "difficulty"
+            | "prevrandao"
+            | "gaslimit"
+            | "chainid"
+            | "basefee"
+            | "blobbasefee"
+            | "blobhash"
+            | "gas"
+    )
+}
+
+fn yul_builtin_is_pure(name: &str) -> bool {
+    matches!(
+        name,
+        "stop"
+            | "add"
+            | "sub"
+            | "mul"
+            | "div"
+            | "sdiv"
+            | "mod"
+            | "smod"
+            | "exp"
+            | "not"
+            | "lt"
+            | "gt"
+            | "slt"
+            | "sgt"
+            | "eq"
+            | "iszero"
+            | "and"
+            | "or"
+            | "xor"
+            | "byte"
+            | "shl"
+            | "shr"
+            | "sar"
+            | "addmod"
+            | "mulmod"
+            | "signextend"
+            | "keccak256"
+            | "pc"
+            | "pop"
+            | "mload"
+            | "mstore"
+            | "mstore8"
+            | "msize"
+            | "mcopy"
+            | "calldataload"
+            | "calldatasize"
+            | "calldatacopy"
+            | "codesize"
+            | "codecopy"
+            | "returndatasize"
+            | "returndatacopy"
+            | "return"
+            | "revert"
+    )
+}
+
+fn state_variable_is_constant_or_immutable(var: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::{CONSTANT_KW, IMMUTABLE_KW};
+    var.children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .any(|token| matches!(token.kind(), CONSTANT_KW | IMMUTABLE_KW))
+}
+
+fn has_unknown_mutability_calls(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    function: &solsp_syntax::SyntaxNode,
+) -> bool {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::CALL_EXPR;
+
+    for call in function
+        .descendants()
+        .filter(|node| node.kind() == CALL_EXPR)
+    {
+        let Some(callee) = call.first_child() else {
+            return true;
+        };
+        let Some((target_uri, def)) = resolve_callee(state, uri, root, &callee, arg_count(&call))
+        else {
+            return true;
+        };
+        match def.kind {
+            DefKind::Function => {
+                let Some(target_root) = parse_root(state, &target_uri) else {
+                    return true;
+                };
+                let target_node = def.full_ptr.to_node(&target_root);
+                if !function_has_view_or_pure(&target_node) {
+                    return true;
+                }
+            }
+            DefKind::Error => {}
+            _ => return true,
+        }
+    }
+    false
+}
+
+fn function_has_view_or_pure(function: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::{PURE_KW, VIEW_KW};
+    function
+        .children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .any(|token| matches!(token.kind(), VIEW_KW | PURE_KW))
+}
+
+fn state_write_lhs(name_ref: &solsp_syntax::SyntaxNode) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::{ASSIGN_EXPR, NAME_REF};
+    let asn = name_ref.ancestors().find(|n| n.kind() == ASSIGN_EXPR)?;
+    let lhs = asn.first_child()?;
+    if !lhs.text_range().contains_range(name_ref.text_range()) {
+        return None;
+    }
+    let base = if lhs.kind() == NAME_REF {
+        lhs.clone()
+    } else {
+        lhs.descendants().find(|n| n.kind() == NAME_REF)?
+    };
+    (base.text_range() == name_ref.text_range()).then_some(lhs)
 }
 
 /// Flag statements that follow a `return` / `revert` / `break` / `continue` in the same

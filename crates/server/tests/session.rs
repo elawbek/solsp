@@ -99,15 +99,18 @@ fn full_lsp_session() {
 
     let uri = Url::parse("file:///Vault.sol").unwrap();
 
-    // 2. didOpen a clean contract → diagnostics should be empty ---------------
+    // 2. didOpen a clean contract → no error diagnostics ----------------------
     let src = "contract C {\n    function f() public {}\n}\n";
     send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
     let diag_note = next_notification(&client, "textDocument/publishDiagnostics");
     let diags: PublishDiagnosticsParams = serde_json::from_value(diag_note.params).unwrap();
     assert_eq!(diags.uri, uri);
     assert!(
-        diags.diagnostics.is_empty(),
-        "clean parse should publish no diagnostics, got {:?}",
+        !diags
+            .diagnostics
+            .iter()
+            .any(|diag| diag.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+        "clean parse should publish no error diagnostics, got {:?}",
         diags.diagnostics
     );
 
@@ -4113,6 +4116,216 @@ fn state_write_in_view_is_diagnosed() {
         .filter(|d| d.message.contains("write to state"))
         .collect();
     assert_eq!(errs.len(), 1, "{:?}", diags.diagnostics);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn state_read_in_pure_is_diagnosed() {
+    let uri = Url::parse("file:///pure-read.sol").unwrap();
+    let src =
+        "contract C { uint256 x; function bad() public pure returns (uint256) { return x; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(
+        diags
+            .diagnostics
+            .iter()
+            .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                && d.message == "cannot read state in a `pure` function"),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn constants_and_immutables_are_allowed_in_pure_functions() {
+    let uri = Url::parse("file:///pure-constants.sol").unwrap();
+    let src = "contract C { uint256 constant C1 = 1; uint256 immutable i; function ok() public pure returns (uint256) { return C1 + i; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|d| d.message == "cannot read state in a `pure` function"),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn read_only_function_can_be_view_and_stateless_function_can_be_pure() {
+    let uri = Url::parse("file:///mutability-hints.sol").unwrap();
+    let src = "contract C { uint256 x; function readOnly() public returns (uint256) { return x; } function stateless() public returns (uint256) { return 1; } function writes() public { x = 1; } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|d| {
+            d.severity == Some(lsp_types::DiagnosticSeverity::WARNING)
+                && d.message == "function can be marked `view`"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        diags.diagnostics.iter().any(|d| {
+            d.severity == Some(lsp_types::DiagnosticSeverity::WARNING)
+                && d.message == "function can be marked `pure`"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+    assert!(
+        !diags
+            .diagnostics
+            .iter()
+            .any(|d| { d.message.contains("writes") && d.message.contains("marked") }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn function_with_state_changing_internal_call_gets_no_mutability_hint() {
+    let uri = Url::parse("file:///mutability-call.sol").unwrap();
+    let src = "contract C { uint256 x; function set() internal { x = 1; } function viaCall() public { set(); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(
+        !diags.diagnostics.iter().any(|d| {
+            d.message == "function can be marked `view`"
+                || d.message == "function can be marked `pure`"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn assembly_state_write_gets_no_mutability_hint() {
+    let uri = Url::parse("file:///mutability-yul.sol").unwrap();
+    let src = "contract C { function writeSlot() public { assembly { sstore(0, 1) } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(
+        !diags.diagnostics.iter().any(|d| {
+            d.message == "function can be marked `view`"
+                || d.message == "function can be marked `pure`"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn assembly_state_write_in_view_is_diagnosed() {
+    let uri = Url::parse("file:///mutability-yul-view.sol").unwrap();
+    let src = "contract C { function writeSlot() public view { assembly { sstore(0, 1) } } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diags: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert!(
+        diags.diagnostics.iter().any(|d| {
+            d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)
+                && d.message == "cannot write to state in a `view`/`pure` function"
+        }),
+        "{:?}",
+        diags.diagnostics
+    );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);
