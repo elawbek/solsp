@@ -534,6 +534,9 @@ fn unused_state_variable_diagnostics(
         let Some(name) = declaration_name(&var) else {
             continue;
         };
+        if name.to_ascii_lowercase().contains("deprecated") {
+            continue;
+        }
         let target = RefTarget {
             uri: uri.clone(),
             range: declaration_name_range(&var),

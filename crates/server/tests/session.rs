@@ -944,7 +944,7 @@ fn override_used_by_base_is_not_diagnosed_as_unused() {
 #[test]
 fn unused_private_state_variable_is_diagnosed() {
     let uri = Url::parse("file:///unused-state.sol").unwrap();
-    let src = "contract C {\n    uint256 private used;\n    uint256 private unused;\n    uint256 public publicVar;\n    function run() public { used = 1; }\n}\n";
+    let src = "contract C {\n    uint256 private used;\n    uint256 private unused;\n    uint256 private deprecatedUnused;\n    uint256 private oldDeprecatedValue;\n    uint256 public publicVar;\n    function run() public { used = 1; }\n}\n";
 
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
@@ -972,6 +972,8 @@ fn unused_private_state_variable_is_diagnosed() {
             .diagnostics
             .iter()
             .any(|diag| diag.message == "state variable `used` is never used"
+                || diag.message == "state variable `deprecatedUnused` is never used"
+                || diag.message == "state variable `oldDeprecatedValue` is never used"
                 || diag.message == "state variable `publicVar` is never used"),
         "{:?}",
         diags.diagnostics
