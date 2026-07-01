@@ -27,10 +27,7 @@
     "Programming Languages"
   ],
   "activationEvents": [
-    "onLanguage:solidity",
-    "onCommand:solsp.showReferences",
-    "onCommand:solsp.showInheritanceGraph",
-    "onCommand:solsp.showFunctionCallGraph"
+    "onCommand:solsp.showReferences"
   ],
   "main": "./out/extension.js",
   "contributes": {
