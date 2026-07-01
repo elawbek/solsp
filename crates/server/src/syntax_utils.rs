@@ -8,6 +8,23 @@ pub(super) fn node_ident(n: &solsp_syntax::SyntaxNode) -> Option<String> {
         .map(|t| t.text().to_string())
 }
 
+/// The identifier text of a `NAME_REF`.
+pub(super) fn nameref_text(nr: &solsp_syntax::SyntaxNode) -> Option<String> {
+    nr.children_with_tokens()
+        .filter_map(|e| e.into_token())
+        .find(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
+        .map(|t| t.text().to_string())
+}
+
+/// The argument count of the call whose callee is the identifier at `offset`.
+pub(super) fn arity_at(root: &solsp_syntax::SyntaxNode, offset: rowan::TextSize) -> Option<usize> {
+    let token = root
+        .token_at_offset(offset)
+        .find(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)?;
+    let name_ref = token.parent()?;
+    solsp_hir::resolve::call_arity(&name_ref)
+}
+
 /// The `(name, type)` of each parameter of a function/constructor (its first
 /// `PARAM_LIST`).
 pub(super) fn param_name_types(decl: &solsp_syntax::SyntaxNode) -> Vec<(String, String)> {

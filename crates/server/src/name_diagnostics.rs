@@ -84,6 +84,29 @@ fn yul_assignment_target_defined(
     cross_file_definition(state, uri, root, name, None).is_some()
 }
 
+fn name_defined(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    nr: &solsp_syntax::SyntaxNode,
+    name: &str,
+) -> bool {
+    if is_builtin_name(name) {
+        return true;
+    }
+    if solsp_hir::resolve::resolve(nr).is_some()
+        || solsp_hir::resolve::top_level_definition(root, name, None).is_some()
+    {
+        return true;
+    }
+    if let Some(c) = enclosing_contract(nr) {
+        if inherited_member(state, uri, root, &c, name, None).is_some() {
+            return true;
+        }
+    }
+    cross_file_definition(state, uri, root, name, None).is_some()
+}
+
 fn is_yul_binding_name(node: &solsp_syntax::SyntaxNode) -> bool {
     use solsp_syntax::SyntaxKind::{NAME, YUL_FUNCTION_DEF, YUL_PARAM_LIST, YUL_VAR_DECL};
     node.kind() == NAME

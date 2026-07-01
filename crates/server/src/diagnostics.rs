@@ -37,7 +37,7 @@ pub(super) fn publish_diagnostics(
                     )
                 });
                 extend_timed(&mut diags, "type_check", uri, || {
-                    super::type_check_diagnostics(state, uri, &root, li, deadline)
+                    super::call_resolution::type_check_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "assignment", uri, || {
                     super::type_diagnostics::assignment_diagnostics(state, uri, &root, li, deadline)
