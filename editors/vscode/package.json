@@ -3,8 +3,16 @@
   "displayName": "SolSP",
   "description": "Solidity language support powered by the bundled solsp language server.",
   "version": "0.0.1",
-  "publisher": "solsp",
+  "publisher": "kebwale",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/elawbek/solsp.git"
+  },
+  "homepage": "https://github.com/elawbek/solsp#readme",
+  "bugs": {
+    "url": "https://github.com/elawbek/solsp/issues"
+  },
   "keywords": [
     "solidity",
     "ethereum",

@@ -88,7 +88,6 @@ try {
       "package",
       "--target",
       target,
-      "--allow-missing-repository",
       "--no-rewrite-relative-links",
       "--out",
       out,

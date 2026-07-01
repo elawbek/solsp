@@ -5,8 +5,6 @@ rust-analyzer style: a hand-written parser produces a lossless CST (rowan),
 analysis is layered over the tree and a salsa-backed source database, and the
 server speaks LSP over stdio.
 
-Design and roadmap live in `docs/superpowers/specs/` (gitignored — local only).
-
 ## Layout
 
 ```
@@ -46,6 +44,7 @@ The server currently advertises and implements:
 - `textDocument/hover`
 - `textDocument/completion`
 - `textDocument/signatureHelp`
+- Call Hierarchy prepare/incoming/outgoing calls
 - `textDocument/publishDiagnostics`
 
 The implementation is intentionally conservative: unknown or unmodeled types are
@@ -74,6 +73,10 @@ generally skipped rather than reported, to avoid noisy false positives.
   member expressions, index expressions, arrays, mappings, storage references,
   and function return values.
 - User-type inheritance checks for implicit convertibility.
+- ABI selector/topic computation for Solidity declarations and Yul hex
+  references.
+- Cached indexes for file definitions, imports, contract members, type-name
+  resolution, identifier ranges, and import-path directory listings.
 
 ### Navigation
 
@@ -95,6 +98,10 @@ generally skipped rather than reported, to avoid noisy false positives.
   avoid flooding the server with thousands of `codeLens/resolve` reference
   scans while scrolling. Cheap graph CodeLens commands remain enabled.
 - CodeLens command integration with VS Code's `editor.action.showReferences`.
+- Call Hierarchy for functions, including incoming and outgoing calls across
+  loaded files.
+- Function call graph command output as Mermaid graph JSON.
+- Inheritance graph command output as Mermaid graph JSON.
 
 ### Hover
 
@@ -155,6 +162,13 @@ generally skipped rather than reported, to avoid noisy false positives.
   call insertion and signature/detail metadata.
 - Callable completions insert snippet parentheses and trigger signature help.
 - Completion items include kind and type/detail metadata where available.
+- Import path completion inside Solidity import strings:
+  - `/` triggers completion only inside import paths
+  - `./` and `../` complete relative paths
+  - bare paths complete from the project root
+  - directories and `.sol` files are listed, while hidden/build directories and
+    non-Solidity files are filtered out
+  - directory listings are cached briefly for responsive typing
 
 ### Signature help
 
@@ -177,6 +191,8 @@ generally skipped rather than reported, to avoid noisy false positives.
   errors, user-defined types, comments, literals, and keywords.
 - Semantic coloring for inline assembly / Yul definitions, parameters, return
   names, paths, and function calls.
+- Solidity TextMate grammar bundled for first-pass editor highlighting before
+  semantic tokens arrive.
 
 ### Diagnostics
 
@@ -263,6 +279,20 @@ generally skipped rather than reported, to avoid noisy false positives.
 - Quick fix to mark a concrete contract `abstract` when it has unimplemented
   abstract/interface functions.
 
+### Graphs and call hierarchy
+
+- Native LSP Call Hierarchy prepare/incoming/outgoing support.
+- Incoming calls are resolved through direct calls, member calls, inherited
+  functions, imported functions, and overload targets where enough type
+  information is available.
+- Outgoing calls list direct callees from the current function.
+- `SolSP: Show Inheritance Graph` command builds a Mermaid graph for the
+  selected contract or current file context.
+- `SolSP: Show Function Call Graph` command builds a bounded Mermaid call graph
+  from the selected function.
+- Graph nodes include file/range metadata so the VS Code webview can navigate
+  back into source.
+
 ### VS Code extension
 
 - VS Code client launches `solsp-server` over stdio for `solidity` files.
@@ -275,6 +305,16 @@ generally skipped rather than reported, to avoid noisy false positives.
 - CodeLens reference counts open VS Code's native references UI.
 - The client id is `solsp`, so VS Code's `solsp.trace.server` JSON-RPC trace
   setting works.
+- Bundled syntax grammar for `.sol` files.
+- Bundled platform-specific server binary in release VSIX packages.
+- Platform packaging script builds/stages `solsp-server` for:
+  - `linux-x64`
+  - `linux-arm64`
+  - `win32-x64`
+  - `win32-arm64`
+  - `darwin-x64`
+  - `darwin-arm64`
+- GitHub Actions workflow builds platform VSIX artifacts for those targets.
 
 ## Build
 
