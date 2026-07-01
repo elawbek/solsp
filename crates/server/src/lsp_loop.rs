@@ -152,19 +152,25 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
     match req.method.as_str() {
         DocumentSymbolRequest::METHOD => {
             match req.extract::<DocumentSymbolParams>(DocumentSymbolRequest::METHOD) {
-                Ok((id, params)) => Response::new_ok(id, super::document_symbols(state, params)),
+                Ok((id, params)) => {
+                    Response::new_ok(id, super::navigation::document_symbols(state, params))
+                }
                 Err(e) => extract_err_response(id, e),
             }
         }
         SemanticTokensFullRequest::METHOD => {
             match req.extract::<SemanticTokensParams>(SemanticTokensFullRequest::METHOD) {
-                Ok((id, params)) => Response::new_ok(id, super::semantic_tokens(state, params)),
+                Ok((id, params)) => {
+                    Response::new_ok(id, super::navigation::semantic_tokens(state, params))
+                }
                 Err(e) => extract_err_response(id, e),
             }
         }
         GotoDefinition::METHOD => match req.extract::<GotoDefinitionParams>(GotoDefinition::METHOD)
         {
-            Ok((id, params)) => Response::new_ok(id, super::goto_definition(state, params)),
+            Ok((id, params)) => {
+                Response::new_ok(id, super::navigation::goto_definition(state, params))
+            }
             Err(e) => extract_err_response(id, e),
         },
         References::METHOD => match req.extract::<ReferenceParams>(References::METHOD) {

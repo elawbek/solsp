@@ -2,6 +2,8 @@
 
 use super::*;
 
+const LARGE_FILE_CODE_LENS_LINE_LIMIT: usize = 5_000;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RefTarget {
     pub(crate) uri: Url,
@@ -398,43 +400,44 @@ pub(super) fn code_lens(state: &ServerState, params: CodeLensParams) -> Option<V
     let uri = params.text_document.uri;
     let file = state.file(&uri)?;
     let li = state.line_index(&uri)?;
+    let reference_counts_enabled = state
+        .line_count(&uri)
+        .is_none_or(|lines| lines <= LARGE_FILE_CODE_LENS_LINE_LIMIT);
     let root = solsp_base_db::parse(state.db(), file).syntax();
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for token in root
-        .descendants_with_tokens()
-        .filter_map(|e| e.into_token())
-        .filter(|t| t.kind() == solsp_syntax::SyntaxKind::IDENT)
-    {
-        let Some(def) = solsp_hir::resolve::definition_at(&root, token.text_range().start()) else {
+    for decl in root.descendants().filter(is_code_lens_declaration) {
+        let Some(name_range) = code_lens_name_range(&decl) else {
             continue;
         };
-        if !is_code_lens_definition(def.kind) || def_name_range(&root, &def) != token.text_range() {
+        let Some(query_name) = declaration_name_for_lens(&decl) else {
             continue;
-        }
-        if !seen.insert(token.text_range()) {
+        };
+        if !seen.insert(name_range) {
             continue;
         }
         let target = RefTarget {
             uri: uri.clone(),
-            range: token.text_range(),
+            range: name_range,
         };
-        let position = to_proto::range(li, token.text_range()).start;
-        out.push(CodeLens {
-            range: lsp_types::Range {
-                start: position,
-                end: position,
-            },
-            command: None,
-            data: Some(serde_json::json!({
-                "uri": target.uri,
-                "queryName": token.text(),
-                "targetStart": u32::from(target.range.start()),
-                "targetEnd": u32::from(target.range.end()),
-            })),
-        });
-        if let Some(command) = code_lens_graph_command(def.kind, &uri, position) {
+        let position = to_proto::range(li, name_range).start;
+        if reference_counts_enabled {
+            out.push(CodeLens {
+                range: lsp_types::Range {
+                    start: position,
+                    end: position,
+                },
+                command: None,
+                data: Some(serde_json::json!({
+                    "uri": target.uri,
+                    "queryName": query_name,
+                    "targetStart": u32::from(target.range.start()),
+                    "targetEnd": u32::from(target.range.end()),
+                })),
+            });
+        }
+        if let Some(command) = code_lens_graph_command_for_decl(&decl, &uri, position) {
             out.push(CodeLens {
                 range: lsp_types::Range {
                     start: position,
@@ -448,15 +451,68 @@ pub(super) fn code_lens(state: &ServerState, params: CodeLensParams) -> Option<V
     Some(out)
 }
 
-fn code_lens_graph_command(
-    kind: solsp_hir::resolve::DefKind,
+fn is_code_lens_declaration(node: &solsp_syntax::SyntaxNode) -> bool {
+    use solsp_syntax::SyntaxKind::{
+        CONTRACT_DEF, ENUM_DEF, ERROR_DEF, EVENT_DEF, FUNCTION_DEF, MODIFIER_DEF, STATE_VAR_DEF,
+        STRUCT_DEF, USER_DEFINED_VALUE_TYPE,
+    };
+    matches!(
+        node.kind(),
+        CONTRACT_DEF
+            | FUNCTION_DEF
+            | MODIFIER_DEF
+            | STATE_VAR_DEF
+            | STRUCT_DEF
+            | ENUM_DEF
+            | EVENT_DEF
+            | ERROR_DEF
+            | USER_DEFINED_VALUE_TYPE
+    )
+}
+
+fn code_lens_name_range(decl: &solsp_syntax::SyntaxNode) -> Option<rowan::TextRange> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, FUNCTION_DEF, MODIFIER_DEF, NAME};
+    match decl.kind() {
+        CONTRACT_DEF => decl
+            .children()
+            .find(|child| child.kind() == NAME)
+            .and_then(ident_range),
+        FUNCTION_DEF | MODIFIER_DEF => decl
+            .children()
+            .find(|child| child.kind() == NAME)
+            .and_then(ident_range),
+        _ => decl
+            .children()
+            .find_map(|child| (child.kind() == NAME).then(|| ident_range(child)).flatten()),
+    }
+}
+
+fn ident_range(name: solsp_syntax::SyntaxNode) -> Option<rowan::TextRange> {
+    use solsp_syntax::SyntaxKind::IDENT;
+    name.children_with_tokens()
+        .filter_map(|element| element.into_token())
+        .find(|token| token.kind() == IDENT)
+        .map(|token| token.text_range())
+}
+
+fn declaration_name_for_lens(decl: &solsp_syntax::SyntaxNode) -> Option<String> {
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, FUNCTION_DEF, MODIFIER_DEF};
+    match decl.kind() {
+        CONTRACT_DEF => solsp_hir::resolve::contract_def_name(decl),
+        FUNCTION_DEF | MODIFIER_DEF => function_name(decl),
+        _ => declaration_name(decl),
+    }
+}
+
+fn code_lens_graph_command_for_decl(
+    decl: &solsp_syntax::SyntaxNode,
     uri: &Url,
     position: lsp_types::Position,
 ) -> Option<Command> {
-    use solsp_hir::resolve::DefKind::*;
-    let (title, command) = match kind {
-        Contract | Interface | Library => ("inheritance graph", "solsp.showInheritanceGraph"),
-        Function | Modifier => ("call graph", "solsp.showFunctionCallGraph"),
+    use solsp_syntax::SyntaxKind::{CONTRACT_DEF, FUNCTION_DEF, MODIFIER_DEF};
+    let (title, command) = match decl.kind() {
+        CONTRACT_DEF => ("inheritance graph", "solsp.showInheritanceGraph"),
+        FUNCTION_DEF | MODIFIER_DEF => ("call graph", "solsp.showFunctionCallGraph"),
         _ => return None,
     };
     Some(Command {
@@ -519,9 +575,4 @@ pub(super) fn code_lens_resolve(state: &ServerState, mut lens: CodeLens) -> Code
         })]),
     });
     lens
-}
-
-fn is_code_lens_definition(kind: solsp_hir::resolve::DefKind) -> bool {
-    use solsp_hir::resolve::DefKind::*;
-    !matches!(kind, Local | Parameter | Field | Variant)
 }

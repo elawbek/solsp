@@ -91,6 +91,9 @@ generally skipped rather than reported, to avoid noisy false positives.
 - Cross-file Rename Symbol over loaded references.
 - Rename validation for Solidity identifiers and keyword rejection.
 - CodeLens reference counts above supported declarations.
+- On large files, reference-count CodeLens entries are intentionally disabled to
+  avoid flooding the server with thousands of `codeLens/resolve` reference
+  scans while scrolling. Cheap graph CodeLens commands remain enabled.
 - CodeLens command integration with VS Code's `editor.action.showReferences`.
 
 ### Hover
@@ -233,6 +236,22 @@ generally skipped rather than reported, to avoid noisy false positives.
   budgeted background sweeps.
 - Forge-std cheatcode/logging calls (`vm`, `console`, `console2`) are skipped in
   expensive type-check paths to reduce noise and latency.
+
+### Performance behavior
+
+- `didOpen` keeps the editor responsive by doing only syntax error publishing
+  immediately; semantic diagnostics are scheduled for idle/background work.
+- `didChange` debounces diagnostics and only reloads the import graph when import
+  directives change.
+- Reference-count CodeLens is disabled for files over the large-file threshold
+  (currently 5,000 physical lines). This is deliberate: large generated/helper
+  files can contain thousands of declarations, and resolving every reference
+  count can starve hover and other interactive requests.
+- Local ignored perf tests cover large-file parse and CodeLens behavior. The
+  default fixture path is
+  `/home/epc/projects/smart-contracts/test/helpers/Solarray.sol`; override it
+  with `SOLSP_SOLARRAY_PATH` or profile a workspace with
+  `SOLSP_PERF_WORKSPACE`.
 
 ### Code actions
 

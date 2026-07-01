@@ -20,6 +20,7 @@ pub mod parser;
 pub use syntax_kind::SyntaxKind;
 
 use rowan::{GreenNode, TextRange};
+use std::time::{Duration, Instant};
 
 /// The rowan language marker for Solidity. Ties our [`SyntaxKind`] to rowan trees.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -63,17 +64,59 @@ impl Parse {
     }
 }
 
+/// Coarse parser pipeline timings for local performance tests and LSP profiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ParseTimings {
+    pub lexer: Duration,
+    pub input: Duration,
+    pub parser: Duration,
+    pub tree: Duration,
+    pub total: Duration,
+    pub token_count: usize,
+    pub event_count: usize,
+}
+
 /// Parse Solidity source into a lossless syntax tree. Total: never panics, never
 /// fails; problems are surfaced via [`Parse::errors`] and the tree spans the whole
 /// input byte-for-byte.
 pub fn parse(text: &str) -> Parse {
+    parse_with_timings(text).0
+}
+
+/// Like [`parse`], but also returns coarse phase timings.
+pub fn parse_with_timings(text: &str) -> (Parse, ParseTimings) {
+    let total_started = Instant::now();
+    let started = Instant::now();
     let tokens = lexer::tokenize(text);
+    let lexer = started.elapsed();
+
+    let started = Instant::now();
     let input = input::Input::new(&tokens);
+    let input_time = started.elapsed();
+
+    let started = Instant::now();
     let mut p = parser::Parser::new(&input);
     grammar::source_file(&mut p);
     let events = p.finish();
+    let parser = started.elapsed();
+
+    let event_count = events.len();
+    let started = Instant::now();
     let (green, errors) = event::build_tree(text, &tokens, events);
-    Parse { green, errors }
+    let tree = started.elapsed();
+
+    (
+        Parse { green, errors },
+        ParseTimings {
+            lexer,
+            input: input_time,
+            parser,
+            tree,
+            total: total_started.elapsed(),
+            token_count: tokens.len(),
+            event_count,
+        },
+    )
 }
 
 #[cfg(test)]

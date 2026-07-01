@@ -224,6 +224,12 @@ impl ServerState {
         self.files.get(uri.as_str()).map(|e| &e.line_index)
     }
 
+    /// Number of physical lines in the tracked document.
+    pub fn line_count(&self, uri: &Url) -> Option<usize> {
+        let file = self.file(uri)?;
+        Some(file.text(&self.db).lines().count())
+    }
+
     /// A snapshot of an open document's current text (for applying incremental edits).
     pub fn text(&self, uri: &Url) -> Option<String> {
         let file = self.file(uri)?;
