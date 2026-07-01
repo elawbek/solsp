@@ -61,7 +61,9 @@ use contract_diagnostics::{
     function_label, function_name, function_name_range, function_visibility, member_visibility,
 };
 use import_resolution::{cross_file_definition, cross_file_target};
-use import_surface::{collect_file_exports, imported_symbols, namespace_alias_items};
+use import_surface::{
+    collect_file_exports, import_path_items, imported_symbols, namespace_alias_items,
+};
 use inheritance::{collect_base_members, collect_inherited_members, is_subtype};
 use member_resolution::{
     arg_count, dotted_receiver, enclosing_contract, inherited_member, inherited_name_at,

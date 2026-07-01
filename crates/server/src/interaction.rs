@@ -70,6 +70,20 @@ fn completion_items(state: &ServerState, params: &CompletionParams) -> Option<Ve
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
+    if let Some(trigger) = params
+        .context
+        .as_ref()
+        .and_then(|context| context.trigger_character.as_deref())
+    {
+        return match trigger {
+            "/" => Some(import_path_items(state, &uri, &root, offset).unwrap_or_default()),
+            "." => Some(member_completion(state, &uri, &root, offset).unwrap_or_default()),
+            _ => None,
+        };
+    }
+    if let Some(items) = import_path_items(state, &uri, &root, offset) {
+        return Some(items);
+    }
     if is_inside_yul_block(&root, offset) {
         return Some(yul_completion_items(state, &uri, &root, offset));
     }

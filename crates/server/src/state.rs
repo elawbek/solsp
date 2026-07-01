@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use lsp_types::Url;
 use salsa::Setter;
@@ -20,6 +21,8 @@ struct FileEntry {
     file: SourceFile,
     line_index: LineIndex,
 }
+
+const IMPORT_DIR_CACHE_TTL: Duration = Duration::from_secs(2);
 
 /// One of a file's imports with its target already resolved to a URI (the filesystem
 /// lookup is the expensive part, so it is done once and cached).
@@ -35,6 +38,13 @@ pub struct ResolvedImport {
 pub struct FileIndex {
     pub defs: Vec<Definition>,
     pub imports: Vec<ResolvedImport>,
+}
+
+#[derive(Clone)]
+pub(super) struct ImportPathEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub is_sol: bool,
 }
 
 /// All open documents plus the salsa database they live in. The main loop is
@@ -56,6 +66,9 @@ pub struct ServerState {
     /// Per-file identifier token ranges, grouped by exact identifier text. Reference
     /// scans ask for one name many times, so avoid re-walking the full syntax tree.
     identifier_cache: RefCell<HashMap<String, Rc<IdentifierIndex>>>,
+    /// Directory listings for import-path completion. Short TTL keeps typing fast while
+    /// still noticing newly-created files soon after.
+    import_dir_cache: RefCell<ImportDirCache>,
 }
 
 /// A contract's cached member list (own body + same-file C3 bases, in lookup order).
@@ -69,6 +82,7 @@ pub type TypeKey = (String, String, Option<rowan::TextRange>);
 /// A resolved type name → the file it lives in and its definition (`None` = unresolved).
 type TypeCache = HashMap<TypeKey, Option<(Url, Definition)>>;
 type IdentifierIndex = HashMap<String, Vec<rowan::TextRange>>;
+type ImportDirCache = HashMap<PathBuf, (Instant, Rc<Vec<ImportPathEntry>>)>;
 
 impl ServerState {
     /// Open or replace a document with `text`: update its salsa input (reusing the
@@ -174,6 +188,34 @@ impl ServerState {
         let ranges = index.get(name).cloned().unwrap_or_default();
         self.identifier_cache.borrow_mut().insert(key, index);
         Some(ranges)
+    }
+
+    /// Cached directory entries used by import-path completion.
+    pub(super) fn import_dir_entries(&self, dir: &Path) -> Option<Rc<Vec<ImportPathEntry>>> {
+        let key = fs::canonicalize(dir).ok()?;
+        if let Some((refreshed_at, entries)) = self.import_dir_cache.borrow().get(&key) {
+            if refreshed_at.elapsed() < IMPORT_DIR_CACHE_TTL {
+                return Some(entries.clone());
+            }
+        }
+
+        let mut entries = Vec::new();
+        for entry in fs::read_dir(&key).ok()?.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let is_dir = path.is_dir();
+            let is_sol = path.extension().is_some_and(|ext| ext == "sol");
+            entries.push(ImportPathEntry {
+                name,
+                is_dir,
+                is_sol,
+            });
+        }
+        let entries = Rc::new(entries);
+        self.import_dir_cache
+            .borrow_mut()
+            .insert(key, (Instant::now(), entries.clone()));
+        Some(entries)
     }
 
     /// Drop a document (on `didClose`).
@@ -376,7 +418,7 @@ fn file_uri(path: PathBuf) -> Option<Url> {
 
 /// The project root: the nearest ancestor of `start` carrying a `remappings.txt` /
 /// `foundry.toml` / `node_modules` / `.git` marker.
-fn project_root(start: &Path) -> Option<PathBuf> {
+pub(super) fn project_root(start: &Path) -> Option<PathBuf> {
     start
         .ancestors()
         .find(|d| {

@@ -8,13 +8,14 @@ use lsp_types::{
     CallHierarchyIncomingCall, CallHierarchyIncomingCallsParams, CallHierarchyItem,
     CallHierarchyOutgoingCall, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeActionContext, CodeActionOrCommand, CodeActionParams, CodeLens, CodeLensParams,
-    CompletionItem, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverContents, HoverParams, InitializeParams, InitializeResult,
-    Position, PublishDiagnosticsParams, Range, ReferenceContext, ReferenceParams, RenameParams,
-    SemanticTokensParams, SemanticTokensResult, SignatureHelp, SignatureHelpParams, SymbolKind,
-    TextDocumentContentChangeEvent, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceEdit,
+    CompletionContext, CompletionItem, CompletionParams, CompletionResponse, CompletionTriggerKind,
+    DidChangeTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverContents,
+    HoverParams, InitializeParams, InitializeResult, Position, PublishDiagnosticsParams, Range,
+    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensParams, SemanticTokensResult,
+    SignatureHelp, SignatureHelpParams, SymbolKind, TextDocumentContentChangeEvent,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier, WorkspaceEdit,
 };
 use std::thread;
 
@@ -97,6 +98,13 @@ fn full_lsp_session() {
     let init: InitializeResult = serde_json::from_value(resp.result.unwrap()).unwrap();
     assert!(init.capabilities.document_symbol_provider.is_some());
     assert!(init.capabilities.semantic_tokens_provider.is_some());
+    let triggers = init
+        .capabilities
+        .completion_provider
+        .as_ref()
+        .and_then(|provider| provider.trigger_characters.as_ref())
+        .expect("completion trigger characters");
+    assert!(triggers.contains(&"/".to_string()), "{triggers:?}");
     send_notification(&client, "initialized", lsp_types::InitializedParams {});
 
     let uri = Url::parse("file:///Vault.sol").unwrap();
@@ -3068,6 +3076,166 @@ fn yul_completion_includes_abi_selectors() {
     send_notification(&client, "exit", serde_json::Value::Null);
     server_thread.join().expect("server thread panicked");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn completion_import_path_lists_files_after_slash() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_import_path_completion");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("interfaces")).unwrap();
+    fs::write(dir.join("Token.sol"), "contract Token {}\n").unwrap();
+    fs::write(
+        dir.join("interfaces").join("IToken.sol"),
+        "interface IToken {}\n",
+    )
+    .unwrap();
+    fs::write(dir.join("Notes.txt"), "ignore\n").unwrap();
+    let main = dir.join("Main.sol");
+    fs::write(&main, "import \"./\";\ncontract Main {}\n").unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let request_labels = |id: i32, line: u32, character: u32, trigger: &str| -> Vec<String> {
+        send_request(
+            &client,
+            id,
+            "textDocument/completion",
+            CompletionParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&main_uri),
+                    position: Position { line, character },
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+                context: Some(CompletionContext {
+                    trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                    trigger_character: Some(trigger.to_string()),
+                }),
+            },
+        );
+        let resp = next_response(&client);
+        let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+        match r {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        }
+        .into_iter()
+        .map(|item| item.label)
+        .collect()
+    };
+
+    let line0 = main_src.lines().next().unwrap();
+    let labels = request_labels(2, 0, line0.find("./").unwrap() as u32 + 2, "/");
+    assert!(labels.contains(&"Token.sol".to_string()), "{labels:?}");
+    assert!(labels.contains(&"interfaces".to_string()), "{labels:?}");
+    assert!(!labels.contains(&"Notes.txt".to_string()), "{labels:?}");
+
+    let outside_slash = request_labels(3, 1, "contract Main {}".len() as u32, "/");
+    assert!(outside_slash.is_empty(), "{outside_slash:?}");
+
+    let outside_dot = request_labels(4, 1, 1, ".");
+    assert!(outside_dot.is_empty(), "{outside_dot:?}");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn completion_import_path_supports_project_root_paths_and_retriggers_dirs() {
+    use std::fs;
+
+    let root = std::env::temp_dir().join("solsp_import_path_root_completion");
+    let _ = fs::remove_dir_all(&root);
+    fs::create_dir_all(root.join("contracts").join("tokens")).unwrap();
+    fs::create_dir_all(root.join("test")).unwrap();
+    fs::write(root.join("foundry.toml"), "[profile.default]\n").unwrap();
+    fs::write(
+        root.join("contracts").join("tokens").join("Token.sol"),
+        "contract Token {}\n",
+    )
+    .unwrap();
+    let main = root.join("test").join("Main.sol");
+    fs::write(&main, "import \"contracts/\";\ncontract Main {}\n").unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let line0 = main_src.lines().next().unwrap();
+    send_request(
+        &client,
+        2,
+        "textDocument/completion",
+        CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: doc_id(&main_uri),
+                position: Position {
+                    line: 0,
+                    character: line0.find("contracts/").unwrap() as u32 + "contracts/".len() as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+            context: Some(CompletionContext {
+                trigger_kind: CompletionTriggerKind::TRIGGER_CHARACTER,
+                trigger_character: Some("/".to_string()),
+            }),
+        },
+    );
+    let resp = next_response(&client);
+    let r: CompletionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let items = match r {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let dir = items
+        .iter()
+        .find(|item| item.label == "tokens")
+        .unwrap_or_else(|| panic!("missing tokens: {items:?}"));
+    assert!(dir.command.is_none(), "{dir:?}");
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&root);
 }
 
 #[test]

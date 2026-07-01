@@ -40,8 +40,8 @@ pub fn server_capabilities() -> ServerCapabilities {
         })),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         completion_provider: Some(CompletionOptions {
-            // `.` triggers member completion; bare-identifier completion is implicit.
-            trigger_characters: Some(vec![".".to_string()]),
+            // `.` triggers member completion; `/` triggers import path completion.
+            trigger_characters: Some(vec![".".to_string(), "/".to_string()]),
             ..Default::default()
         }),
         signature_help_provider: Some(lsp_types::SignatureHelpOptions {
