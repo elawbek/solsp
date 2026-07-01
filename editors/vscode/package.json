@@ -20,6 +20,7 @@
   ],
   "activationEvents": [
     "onLanguage:solidity",
+    "onCommand:solsp.showReferences",
     "onCommand:solsp.showInheritanceGraph",
     "onCommand:solsp.showFunctionCallGraph"
   ],

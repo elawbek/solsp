@@ -16,12 +16,13 @@ let client: LanguageClient | undefined;
 let graphOutput: vscode.OutputChannel | undefined;
 
 export function activate(context: vscode.ExtensionContext): void {
-  const command = resolveServerPath(context.extensionPath);
   context.subscriptions.push(
     vscode.commands.registerCommand("solsp.showReferences", showReferences),
     vscode.commands.registerCommand("solsp.showInheritanceGraph", showInheritanceGraph),
     vscode.commands.registerCommand("solsp.showFunctionCallGraph", showFunctionCallGraph),
   );
+
+  const command = resolveServerPath(context.extensionPath);
   const serverOptions: ServerOptions = {
     run: { command, transport: TransportKind.stdio },
     debug: { command, transport: TransportKind.stdio },

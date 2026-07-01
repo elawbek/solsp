@@ -205,6 +205,11 @@ generally skipped rather than reported, to avoid noisy false positives.
   - constant and immutable state reads are allowed in `pure`
   - internal/library/unknown calls are handled conservatively to avoid false
     `view`/`pure` hints
+  - storage aliases and storage-returning helpers are tracked for write-through
+    effects such as field/index assignment, `push`/`pop`, unary mutation, and
+    `delete`
+  - rebinding a storage reference itself, such as assigning a storage return
+    variable, is not treated as a state write
   - inline assembly/Yul effects are modeled for `sload`, `sstore`, `tload`,
     `tstore`, logs, calls, creates, selfdestruct, environment reads, and pure
     arithmetic/memory opcodes

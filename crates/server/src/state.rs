@@ -53,6 +53,9 @@ pub struct ServerState {
     /// Resolved type names. Cleared wholesale on any `set` (an entry may point into the
     /// edited file from any querying file), so it acts within an edit epoch.
     type_cache: RefCell<TypeCache>,
+    /// Per-file identifier token ranges, grouped by exact identifier text. Reference
+    /// scans ask for one name many times, so avoid re-walking the full syntax tree.
+    identifier_cache: RefCell<HashMap<String, Rc<IdentifierIndex>>>,
 }
 
 /// A contract's cached member list (own body + same-file C3 bases, in lookup order).
@@ -65,6 +68,7 @@ type MemberCache = HashMap<String, HashMap<rowan::TextRange, MemberDefs>>;
 pub type TypeKey = (String, String, Option<rowan::TextRange>);
 /// A resolved type name → the file it lives in and its definition (`None` = unresolved).
 type TypeCache = HashMap<TypeKey, Option<(Url, Definition)>>;
+type IdentifierIndex = HashMap<String, Vec<rowan::TextRange>>;
 
 impl ServerState {
     /// Open or replace a document with `text`: update its salsa input (reusing the
@@ -78,6 +82,7 @@ impl ServerState {
         self.index_cache.borrow_mut().remove(&key);
         self.member_cache.borrow_mut().remove(&key);
         self.type_cache.borrow_mut().clear();
+        self.identifier_cache.borrow_mut().remove(&key);
         if let Some(file) = self.files.get(&key).map(|e| e.file) {
             file.set_text(&mut self.db).to(text);
             self.files.insert(key, FileEntry { file, line_index });
@@ -144,9 +149,41 @@ impl ServerState {
         defs
     }
 
+    /// Exact identifier token ranges for `name` in a tracked file, using a per-file index.
+    pub fn identifier_ranges(&self, uri: &Url, name: &str) -> Option<Vec<rowan::TextRange>> {
+        let key = uri.to_string();
+        if let Some(index) = self.identifier_cache.borrow().get(&key) {
+            return Some(index.get(name).cloned().unwrap_or_default());
+        }
+
+        let file = self.file(uri)?;
+        let root = solsp_base_db::parse(&self.db, file).syntax();
+        let mut index = IdentifierIndex::new();
+        for token in root
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .filter(|token| token.kind() == solsp_syntax::SyntaxKind::IDENT)
+        {
+            index
+                .entry(token.text().to_string())
+                .or_default()
+                .push(token.text_range());
+        }
+
+        let index = Rc::new(index);
+        let ranges = index.get(name).cloned().unwrap_or_default();
+        self.identifier_cache.borrow_mut().insert(key, index);
+        Some(ranges)
+    }
+
     /// Drop a document (on `didClose`).
     pub fn remove(&mut self, uri: &Url) {
+        let key = uri.to_string();
         self.files.remove(uri.as_str());
+        self.index_cache.borrow_mut().remove(&key);
+        self.member_cache.borrow_mut().remove(&key);
+        self.identifier_cache.borrow_mut().remove(&key);
+        self.type_cache.borrow_mut().clear();
     }
 
     /// On `didClose`, refresh the file from disk rather than dropping it: it may still
@@ -191,6 +228,12 @@ impl ServerState {
     pub fn text(&self, uri: &Url) -> Option<String> {
         let file = self.file(uri)?;
         Some(file.text(&self.db).clone())
+    }
+
+    /// Cheap substring test over the tracked document without cloning its text.
+    pub fn text_contains(&self, uri: &Url, needle: &str) -> bool {
+        self.file(uri)
+            .is_some_and(|file| file.text(&self.db).contains(needle))
     }
 
     /// Load a file from disk into the db if it is not already tracked (a disk-loaded

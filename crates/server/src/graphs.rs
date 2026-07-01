@@ -7,8 +7,8 @@ use lsp_types::{
 use crate::{
     arg_count, callee_display_name, declaration_name, declaration_name_range, definition_target,
     enclosing_contract, function_name_range, inherited_name_at, is_cheatcode_receiver,
-    member_resolve, parse_root, resolve_base, resolve_callee, state::ServerState, to_proto,
-    typed_overload_target, RefTarget,
+    member_resolve, parse_root, references::RefTarget, resolve_base, resolve_callee,
+    state::ServerState, to_proto, typed_overload_target,
 };
 
 pub(crate) fn call_hierarchy_prepare(

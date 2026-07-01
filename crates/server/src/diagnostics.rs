@@ -19,6 +19,7 @@ pub(super) fn publish_diagnostics(
     semantic: bool,
     budget: Option<std::time::Duration>,
 ) -> Result<()> {
+    let started = std::time::Instant::now();
     let diagnostics = match (state.file(uri), state.line_index(uri)) {
         (Some(file), Some(li)) => {
             let parse = solsp_base_db::parse(state.db(), file);
@@ -30,61 +31,122 @@ pub(super) fn publish_diagnostics(
             if semantic && parse.errors().is_empty() {
                 let deadline = budget.map(|b| std::time::Instant::now() + b);
                 let root = parse.syntax();
-                diags.extend(super::undefined_name_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::type_check_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::assignment_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::return_type_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::cast_diagnostics(state, uri, &root, li, deadline));
-                diags.extend(super::binary_op_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::comparison_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::condition_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::unreachable_diagnostics(&root, li, deadline));
-                diags.extend(super::mutability_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::missing_visibility_diagnostics(&root, li, deadline));
-                diags.extend(super::unused_function_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::unused_state_variable_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::unused_event_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::unused_error_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::abstract_contract_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::invalid_import_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::unused_import_diagnostics(
-                    state, uri, &root, li, deadline,
-                ));
-                diags.extend(super::unused_local_diagnostics(&root, li, deadline));
+                extend_timed(&mut diags, "undefined_name", uri, || {
+                    super::undefined_name_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "type_check", uri, || {
+                    super::type_check_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "assignment", uri, || {
+                    super::assignment_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "return_type", uri, || {
+                    super::return_type_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "cast", uri, || {
+                    super::cast_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "binary_op", uri, || {
+                    super::binary_op_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "comparison", uri, || {
+                    super::comparison_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "condition", uri, || {
+                    super::condition_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "unreachable", uri, || {
+                    super::unreachable_diagnostics(&root, li, deadline)
+                });
+                extend_timed(&mut diags, "mutability", uri, || {
+                    super::mutability::mutability_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "missing_visibility", uri, || {
+                    super::missing_visibility_diagnostics(&root, li, deadline)
+                });
+                extend_timed(&mut diags, "unused_function", uri, || {
+                    super::usage_diagnostics::unused_function_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
+                });
+                extend_timed(&mut diags, "unused_state_variable", uri, || {
+                    super::usage_diagnostics::unused_state_variable_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
+                });
+                extend_timed(&mut diags, "unused_event", uri, || {
+                    super::usage_diagnostics::unused_event_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
+                });
+                extend_timed(&mut diags, "unused_error", uri, || {
+                    super::usage_diagnostics::unused_error_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
+                });
+                extend_timed(&mut diags, "abstract_contract", uri, || {
+                    super::abstract_contract_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "invalid_import", uri, || {
+                    super::invalid_import_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "unused_import", uri, || {
+                    super::unused_import_diagnostics(state, uri, &root, li, deadline)
+                });
+                extend_timed(&mut diags, "unused_local", uri, || {
+                    super::unused_local_diagnostics(&root, li, deadline)
+                });
             }
             diags
         }
         _ => Vec::new(),
     };
+    let count = diagnostics.len();
+    crate::perf::log_elapsed(
+        || {
+            format!(
+                "diagnostics semantic={semantic} budget={:?} count={count} {}",
+                budget,
+                uri.as_str()
+            )
+        },
+        started,
+    );
     send_diagnostics(connection, uri.clone(), diagnostics)
+}
+
+pub(super) fn publish_syntax_diagnostics_if_errors(
+    connection: &Connection,
+    state: &ServerState,
+    uri: &Url,
+) -> Result<bool> {
+    let (Some(file), Some(li)) = (state.file(uri), state.line_index(uri)) else {
+        return Ok(false);
+    };
+    let parse = solsp_base_db::parse(state.db(), file);
+    if parse.errors().is_empty() {
+        return Ok(false);
+    }
+    let diagnostics =
+        to_proto::diagnostics(&solsp_ide::diagnostics::diagnostics(parse.errors()), li);
+    send_diagnostics(connection, uri.clone(), diagnostics)?;
+    Ok(true)
+}
+
+fn extend_timed(
+    out: &mut Vec<lsp_types::Diagnostic>,
+    name: &'static str,
+    uri: &Url,
+    f: impl FnOnce() -> Vec<lsp_types::Diagnostic>,
+) {
+    let started = std::time::Instant::now();
+    let mut diagnostics = f();
+    let count = diagnostics.len();
+    crate::perf::log_elapsed(
+        || format!("diagnostic phase {name} count={count} {}", uri.as_str()),
+        started,
+    );
+    out.append(&mut diagnostics);
 }
 
 /// Send a `textDocument/publishDiagnostics` notification.
