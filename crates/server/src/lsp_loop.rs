@@ -228,16 +228,18 @@ fn handle_request(state: &ServerState, req: Request) -> Response {
             }
         }
         HoverRequest::METHOD => match req.extract::<HoverParams>(HoverRequest::METHOD) {
-            Ok((id, params)) => Response::new_ok(id, super::hover(state, params)),
+            Ok((id, params)) => Response::new_ok(id, super::interaction::hover(state, params)),
             Err(e) => extract_err_response(id, e),
         },
         Completion::METHOD => match req.extract::<CompletionParams>(Completion::METHOD) {
-            Ok((id, params)) => Response::new_ok(id, super::completion(state, params)),
+            Ok((id, params)) => Response::new_ok(id, super::interaction::completion(state, params)),
             Err(e) => extract_err_response(id, e),
         },
         SignatureHelpRequest::METHOD => {
             match req.extract::<SignatureHelpParams>(SignatureHelpRequest::METHOD) {
-                Ok((id, params)) => Response::new_ok(id, super::signature_help(state, params)),
+                Ok((id, params)) => {
+                    Response::new_ok(id, super::interaction::signature_help(state, params))
+                }
                 Err(e) => extract_err_response(id, e),
             }
         }
