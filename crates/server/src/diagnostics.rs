@@ -32,37 +32,41 @@ pub(super) fn publish_diagnostics(
                 let deadline = budget.map(|b| std::time::Instant::now() + b);
                 let root = parse.syntax();
                 extend_timed(&mut diags, "undefined_name", uri, || {
-                    super::undefined_name_diagnostics(state, uri, &root, li, deadline)
+                    super::name_diagnostics::undefined_name_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
                 });
                 extend_timed(&mut diags, "type_check", uri, || {
                     super::type_check_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "assignment", uri, || {
-                    super::assignment_diagnostics(state, uri, &root, li, deadline)
+                    super::type_diagnostics::assignment_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "return_type", uri, || {
-                    super::return_type_diagnostics(state, uri, &root, li, deadline)
+                    super::type_diagnostics::return_type_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
                 });
                 extend_timed(&mut diags, "cast", uri, || {
-                    super::cast_diagnostics(state, uri, &root, li, deadline)
+                    super::type_diagnostics::cast_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "binary_op", uri, || {
-                    super::binary_op_diagnostics(state, uri, &root, li, deadline)
+                    super::type_diagnostics::binary_op_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "comparison", uri, || {
-                    super::comparison_diagnostics(state, uri, &root, li, deadline)
+                    super::type_diagnostics::comparison_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "condition", uri, || {
-                    super::condition_diagnostics(state, uri, &root, li, deadline)
+                    super::type_diagnostics::condition_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "unreachable", uri, || {
-                    super::unreachable_diagnostics(&root, li, deadline)
+                    super::flow_diagnostics::unreachable_diagnostics(&root, li, deadline)
                 });
                 extend_timed(&mut diags, "mutability", uri, || {
                     super::mutability::mutability_diagnostics(state, uri, &root, li, deadline)
                 });
                 extend_timed(&mut diags, "missing_visibility", uri, || {
-                    super::missing_visibility_diagnostics(&root, li, deadline)
+                    super::contract_diagnostics::missing_visibility_diagnostics(&root, li, deadline)
                 });
                 extend_timed(&mut diags, "unused_function", uri, || {
                     super::usage_diagnostics::unused_function_diagnostics(
@@ -85,16 +89,22 @@ pub(super) fn publish_diagnostics(
                     )
                 });
                 extend_timed(&mut diags, "abstract_contract", uri, || {
-                    super::abstract_contract_diagnostics(state, uri, &root, li, deadline)
+                    super::contract_diagnostics::abstract_contract_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
                 });
                 extend_timed(&mut diags, "invalid_import", uri, || {
-                    super::invalid_import_diagnostics(state, uri, &root, li, deadline)
+                    super::import_diagnostics::invalid_import_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
                 });
                 extend_timed(&mut diags, "unused_import", uri, || {
-                    super::unused_import_diagnostics(state, uri, &root, li, deadline)
+                    super::import_diagnostics::unused_import_diagnostics(
+                        state, uri, &root, li, deadline,
+                    )
                 });
                 extend_timed(&mut diags, "unused_local", uri, || {
-                    super::unused_local_diagnostics(&root, li, deadline)
+                    super::usage_diagnostics::unused_local_diagnostics(&root, li, deadline)
                 });
             }
             diags

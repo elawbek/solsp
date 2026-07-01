@@ -182,6 +182,54 @@ pub(super) fn unused_error_diagnostics(
     out
 }
 
+/// Flag a single local declaration whose name is never referenced again in its function.
+pub(super) fn unused_local_diagnostics(
+    root: &solsp_syntax::SyntaxNode,
+    li: &solsp_ide::LineIndex,
+    deadline: Option<std::time::Instant>,
+) -> Vec<lsp_types::Diagnostic> {
+    use solsp_syntax::SyntaxKind::{FUNCTION_DEF, IDENT, L_PAREN, NAME, VAR_DECL, VAR_DECL_STMT};
+    let mut out = Vec::new();
+    for stmt in root.descendants().filter(|n| n.kind() == VAR_DECL_STMT) {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            break;
+        }
+        let is_tuple = stmt
+            .children_with_tokens()
+            .filter_map(|e| e.into_token())
+            .any(|t| t.kind() == L_PAREN);
+        let decls: Vec<_> = stmt.children().filter(|c| c.kind() == VAR_DECL).collect();
+        if is_tuple || decls.len() != 1 {
+            continue;
+        }
+        let Some(name_node) = decls[0].children().find(|c| c.kind() == NAME) else {
+            continue;
+        };
+        let Some(name) = nameref_text(&name_node) else {
+            continue;
+        };
+        let Some(func) = stmt.ancestors().find(|n| n.kind() == FUNCTION_DEF) else {
+            continue;
+        };
+        let uses = func
+            .descendants_with_tokens()
+            .filter_map(|e| e.into_token())
+            .filter(|t| t.kind() == IDENT && t.text() == name)
+            .count();
+        if uses == 1 {
+            out.push(lsp_types::Diagnostic {
+                range: to_proto::range(li, name_node.text_range()),
+                severity: Some(lsp_types::DiagnosticSeverity::WARNING),
+                source: Some("solsp".to_string()),
+                message: format!("unused local variable `{name}`"),
+                tags: Some(vec![lsp_types::DiagnosticTag::UNNECESSARY]),
+                ..Default::default()
+            });
+        }
+    }
+    out
+}
+
 fn overridden_base_function_is_referenced(
     state: &ServerState,
     uri: &Url,

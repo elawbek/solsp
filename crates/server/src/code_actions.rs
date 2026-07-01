@@ -1,6 +1,11 @@
 //! Code actions and quick-fix edit builders.
 
 use super::*;
+use crate::contract_diagnostics::{
+    contract_body_end_offset, contract_body_has_members, function_has_visibility,
+    is_abstract_contract, is_abstract_function, is_contract_contract, missing_inherited_functions,
+    MissingFunction,
+};
 
 /// `textDocument/codeAction` -> quick fixes for concrete contracts that still owe
 /// abstract/interface functions.
