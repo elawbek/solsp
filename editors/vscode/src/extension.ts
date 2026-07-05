@@ -22,13 +22,16 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("solsp.showFunctionCallGraph", showFunctionCallGraph),
   );
 
-  const command = resolveServerPath(context.extensionPath);
+  const command = resolveServerPath(context.extensionPath, context.extensionMode);
   const serverOptions: ServerOptions = {
     run: { command, transport: TransportKind.stdio },
     debug: { command, transport: TransportKind.stdio },
   };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: "file", language: "solidity" }],
+    synchronize: {
+      fileEvents: vscode.workspace.createFileSystemWatcher("**/*.sol"),
+    },
   };
 
   // The client id `solsp` also keys the `solsp.trace.server` setting, so the
@@ -467,7 +470,10 @@ export function deactivate(): Thenable<void> | undefined {
 /// Host can pin `SOLSP_SERVER_PATH`; otherwise use a bundled binary from the installed
 /// extension. Dev builds then probe Cargo outputs so F5 works no matter which folder
 /// the Extension Development Host opened. Finally fall back to the bare name on `PATH`.
-function resolveServerPath(extensionPath: string): string {
+function resolveServerPath(
+  extensionPath: string,
+  extensionMode: vscode.ExtensionMode,
+): string {
   const configured = vscode.workspace
     .getConfiguration("solsp")
     .get<string>("server.path");
@@ -481,11 +487,20 @@ function resolveServerPath(extensionPath: string): string {
   }
 
   const exe = process.platform === "win32" ? "solsp-server.exe" : "solsp-server";
+  const devServer = resolveCargoServerPath(extensionPath, exe);
+  if (extensionMode === vscode.ExtensionMode.Development && devServer) {
+    return devServer;
+  }
+
   const bundled = path.join(extensionPath, "server", exe);
   if (fs.existsSync(bundled)) {
     return bundled;
   }
 
+  return devServer ?? exe;
+}
+
+function resolveCargoServerPath(extensionPath: string, exe: string): string | undefined {
   // Roots to probe for `target/{debug,release}/<exe>`: open folders first, then the
   // repo root inferred from the extension's own location.
   const roots = [
@@ -500,5 +515,5 @@ function resolveServerPath(extensionPath: string): string {
       }
     }
   }
-  return exe;
+  return undefined;
 }

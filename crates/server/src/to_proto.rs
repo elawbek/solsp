@@ -87,6 +87,7 @@ fn symbol_kind(kind: IdeSymbolKind) -> LspSymbolKind {
         IdeSymbolKind::Constructor => LspSymbolKind::CONSTRUCTOR,
         IdeSymbolKind::Modifier => LspSymbolKind::FUNCTION,
         IdeSymbolKind::StateVariable => LspSymbolKind::FIELD,
+        IdeSymbolKind::Field => LspSymbolKind::FIELD,
         IdeSymbolKind::Struct => LspSymbolKind::STRUCT,
         IdeSymbolKind::Enum => LspSymbolKind::ENUM,
         IdeSymbolKind::Event => LspSymbolKind::EVENT,

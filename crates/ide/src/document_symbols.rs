@@ -6,7 +6,7 @@ use rowan::TextRange;
 use solsp_syntax::{
     ast::{
         AstNode, ContractDef, ContractKind, EnumDef, ErrorDef, EventDef, FunctionDef, ModifierDef,
-        Name, SourceFile, StateVarDef, StructDef, UserDefinedValueType,
+        Name, SourceFile, StateVarDef, StructDef, StructField, UserDefinedValueType,
     },
     SyntaxKind, SyntaxNode, SyntaxToken,
 };
@@ -21,6 +21,7 @@ pub enum SymbolKind {
     Constructor,
     Modifier,
     StateVariable,
+    Field,
     Struct,
     Enum,
     Event,
@@ -72,11 +73,7 @@ fn symbol_for(node: &SyntaxNode) -> Option<DocumentSymbol> {
             SymbolKind::StateVariable,
             StateVarDef::cast(node.clone())?.name(),
         ),
-        STRUCT_DEF => leaf(
-            node,
-            SymbolKind::Struct,
-            StructDef::cast(node.clone())?.name(),
-        ),
+        STRUCT_DEF => struct_symbol(StructDef::cast(node.clone())?),
         ENUM_DEF => leaf(node, SymbolKind::Enum, EnumDef::cast(node.clone())?.name()),
         EVENT_DEF => leaf(
             node,
@@ -98,6 +95,22 @@ fn symbol_for(node: &SyntaxNode) -> Option<DocumentSymbol> {
         _ => return None,
     };
     Some(sym)
+}
+
+fn struct_symbol(s: StructDef) -> DocumentSymbol {
+    let children = s.fields().map(struct_field_symbol).collect();
+    let (name, selection_range) = name_and_selection(s.syntax(), s.name());
+    DocumentSymbol {
+        name,
+        kind: SymbolKind::Struct,
+        range: s.syntax().text_range(),
+        selection_range,
+        children,
+    }
+}
+
+fn struct_field_symbol(field: StructField) -> DocumentSymbol {
+    leaf(field.syntax(), SymbolKind::Field, field.name())
 }
 
 /// A contract/interface/library: kind from `ContractDef::kind`, children = its
@@ -272,6 +285,15 @@ mod tests {
             .find(|s| s.kind == SymbolKind::Constructor)
             .unwrap();
         assert_eq!(ctor.name, "constructor"); // synthesized label
+        let s = c
+            .children
+            .iter()
+            .find(|s| s.kind == SymbolKind::Struct)
+            .unwrap();
+        assert_eq!(s.children.len(), 1);
+        assert_eq!(s.children[0].name, "a");
+        assert_eq!(s.children[0].kind, SymbolKind::Field);
+        assert_eq!(&src[s.children[0].selection_range], "a");
     }
 
     #[test]

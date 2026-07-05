@@ -3,8 +3,8 @@
 use anyhow::Result;
 use lsp_server::{Connection, ErrorCode, Message, Notification, Request, Response};
 use lsp_types::notification::{
-    DidChangeTextDocument, DidCloseTextDocument, DidOpenTextDocument, DidSaveTextDocument,
-    Notification as _,
+    DidChangeTextDocument, DidChangeWatchedFiles, DidCloseTextDocument, DidOpenTextDocument,
+    DidSaveTextDocument, Notification as _,
 };
 use lsp_types::request::{
     CallHierarchyIncomingCalls, CallHierarchyOutgoingCalls, CallHierarchyPrepare,
@@ -15,8 +15,8 @@ use lsp_types::request::{
 use lsp_types::{
     CallHierarchyIncomingCallsParams, CallHierarchyOutgoingCallsParams, CallHierarchyPrepareParams,
     CodeActionParams, CodeLens, CodeLensParams, CompletionParams, DocumentSymbolParams,
-    GotoDefinitionParams, HoverParams, ReferenceParams, RenameParams, SemanticTokensParams,
-    SignatureHelpParams, Url,
+    FileChangeType, GotoDefinitionParams, HoverParams, ReferenceParams, RenameParams,
+    SemanticTokensParams, SignatureHelpParams, Url,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -315,7 +315,50 @@ fn handle_notification(
             };
             let uri = params.text_document.uri;
             pending_diagnostics.remove(&uri);
+            state.reload_or_drop(&uri);
+            if state.file(&uri).is_some() {
+                state.load_import_graph(&uri);
+            }
             publish_diagnostics(connection, state, &uri, true, None)?;
+        }
+        DidChangeWatchedFiles::METHOD => {
+            let Some(params) = extract_notification::<DidChangeWatchedFiles>(not) else {
+                return Ok(());
+            };
+            for event in params.changes {
+                if event
+                    .uri
+                    .to_file_path()
+                    .ok()
+                    .and_then(|p| p.extension().map(|e| e == "sol"))
+                    != Some(true)
+                {
+                    continue;
+                }
+                pending_diagnostics.remove(&event.uri);
+                match event.typ {
+                    FileChangeType::DELETED => {
+                        state.remove(&event.uri);
+                        send_diagnostics(connection, event.uri, Vec::new())?;
+                    }
+                    FileChangeType::CREATED | FileChangeType::CHANGED => {
+                        state.reload_or_drop(&event.uri);
+                        if state.file(&event.uri).is_some() {
+                            state.load_import_graph(&event.uri);
+                            publish_diagnostics(
+                                connection,
+                                state,
+                                &event.uri,
+                                true,
+                                Some(std::time::Duration::from_millis(150)),
+                            )?;
+                        } else {
+                            send_diagnostics(connection, event.uri, Vec::new())?;
+                        }
+                    }
+                    _ => {}
+                }
+            }
         }
         DidCloseTextDocument::METHOD => {
             let Some(params) = extract_notification::<DidCloseTextDocument>(not) else {

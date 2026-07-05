@@ -809,6 +809,84 @@ fn cross_file_goto_definition() {
 }
 
 #[test]
+fn watched_file_change_reloads_imported_contract_index() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join("solsp_watched_reload");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let token = dir.join("Token.sol");
+    let main = dir.join("Main.sol");
+    fs::write(&token, "contract Token { function oldName() public {} }\n").unwrap();
+    fs::write(
+        &main,
+        "import {Token} from \"Token.sol\";\ncontract Main { Token t; function f() public { t.newName(); } }\n",
+    )
+    .unwrap();
+
+    let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let token_uri = Url::from_file_path(fs::canonicalize(&token).unwrap()).unwrap();
+    let main_src = fs::read_to_string(&main).unwrap();
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&main_uri, &main_src),
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    fs::write(&token, "contract Token { function newName() public {} }\n").unwrap();
+    send_notification(
+        &client,
+        "workspace/didChangeWatchedFiles",
+        lsp_types::DidChangeWatchedFilesParams {
+            changes: vec![lsp_types::FileEvent {
+                uri: token_uri.clone(),
+                typ: lsp_types::FileChangeType::CHANGED,
+            }],
+        },
+    );
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let character = main_src.lines().nth(1).unwrap().find("newName").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/definition",
+        GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&main_uri),
+                position: Position { line: 1, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let def: GotoDefinitionResponse = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let GotoDefinitionResponse::Scalar(loc) = def else {
+        panic!("expected reloaded imported definition");
+    };
+    assert_eq!(loc.uri, token_uri);
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn same_file_references() {
     let uri = Url::parse("file:///refs.sol").unwrap();
     let src = "contract C { uint256 stored; function f() public { stored = 1; uint256 storedLocal = stored; } }";
