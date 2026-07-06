@@ -9,6 +9,25 @@ pub(super) fn positional_arg_hover(
     root: &solsp_syntax::SyntaxNode,
     offset: rowan::TextSize,
 ) -> Option<Hover> {
+    use solsp_syntax::SyntaxKind::IDENT;
+
+    if root.token_at_offset(offset).any(|t| t.kind() == IDENT) {
+        return None;
+    }
+    let (_, label, range) = positional_arg_label(state, uri, root, offset)?;
+    Some(markup_hover(
+        format!("```solidity\n{label}\n```"),
+        Some(to_proto::range(state.line_index(uri)?, range)),
+    ))
+}
+
+/// The parameter expected at a positional call argument offset.
+pub(super) fn positional_arg_label(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<(String, String, rowan::TextRange)> {
     use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR};
 
     let tok = root
@@ -37,12 +56,10 @@ pub(super) fn positional_arg_hover(
     let candidate = select_positional_candidate(state, uri, root, &candidates, &args)?;
     let params = named_arg_fields(candidate.0, &candidate.1);
     let (pname, ptype) = params.get(arg_index)?;
-    Some(markup_hover(
-        format!("```solidity\n{}\n```", parameter_label(ptype, pname)),
-        Some(to_proto::range(
-            state.line_index(uri)?,
-            args[arg_index].text_range(),
-        )),
+    Some((
+        name,
+        parameter_label(ptype, pname),
+        args[arg_index].text_range(),
     ))
 }
 

@@ -4301,31 +4301,118 @@ fn positional_arg_hover_shows_expected_parameter() {
     send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
     let _ = next_notification(&client, "textDocument/publishDiagnostics");
 
+    let local = src.find("_createDexPair(m").unwrap() + "_createDexPair(".len();
+    send_request(
+        &client,
+        2,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: local as u32,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(m) = hov.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(m.value.contains("*(local)*"), "hover was {:?}", m.value);
+    assert!(m.value.contains("address m"), "hover was {:?}", m.value);
+    assert!(m.value.contains("address mine"), "hover was {:?}", m.value);
+
     let call = src.find("_createDexPair(m, 100)").unwrap();
     let args_start = call + "_createDexPair(".len();
-    for (id, character, expected) in [
-        (2, args_start as u32, "address mine"),
-        (3, (args_start + "m, ".len()) as u32, "uint256 amount"),
-    ] {
-        send_request(
-            &client,
-            id,
-            "textDocument/hover",
-            HoverParams {
-                text_document_position_params: TextDocumentPositionParams {
-                    text_document: doc_id(&uri),
-                    position: Position { line: 0, character },
+    send_request(
+        &client,
+        3,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position {
+                    line: 0,
+                    character: (args_start + "m, ".len()) as u32,
                 },
-                work_done_progress_params: Default::default(),
             },
-        );
-        let resp = next_response(&client);
-        let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
-        let HoverContents::Markup(m) = hov.contents else {
-            panic!("expected markup hover");
-        };
-        assert!(m.value.contains(expected), "hover was {:?}", m.value);
-    }
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(m) = hov.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        m.value.contains("uint256 amount"),
+        "hover was {:?}",
+        m.value
+    );
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
+fn positional_arg_hover_combines_member_and_parameter_context() {
+    let uri = Url::parse("file:///arg_member_hover.sol").unwrap();
+    let src = "contract C { struct Amounts { uint256 primaryTokenAmount; } \
+               function _legacyLockPearlForUser0(uint256 amount) internal {} \
+               function g(Amounts[] memory amounts, uint256 packIndex) public { \
+               _legacyLockPearlForUser0(amounts[packIndex].primaryTokenAmount); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let character = src.rfind("primaryTokenAmount").unwrap() as u32;
+    send_request(
+        &client,
+        2,
+        "textDocument/hover",
+        HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: doc_id(&uri),
+                position: Position { line: 0, character },
+            },
+            work_done_progress_params: Default::default(),
+        },
+    );
+    let resp = next_response(&client);
+    let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+    let HoverContents::Markup(m) = hov.contents else {
+        panic!("expected markup hover");
+    };
+    assert!(
+        m.value.contains("primaryTokenAmount"),
+        "hover was {:?}",
+        m.value
+    );
+    assert!(
+        m.value.contains("uint256 amount"),
+        "hover was {:?}",
+        m.value
+    );
+    assert!(
+        m.value.contains("Argument for `_legacyLockPearlForUser0`"),
+        "hover was {:?}",
+        m.value
+    );
 
     send_request(&client, 9, "shutdown", serde_json::Value::Null);
     let _ = next_response(&client);

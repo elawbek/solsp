@@ -10,55 +10,73 @@ pub(super) fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     let li = state.line_index(&uri)?;
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
+    let with_arg_context = |hover| with_positional_arg_context(state, &uri, &root, offset, hover);
     if let Some(h) = yul_builtin_hover(&root, offset) {
-        return Some(h);
+        return Some(with_arg_context(h));
     }
     if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
-        return Some(h);
-    }
-    if let Some(h) = positional_arg_hover(state, &uri, &root, offset) {
-        return Some(h);
+        return Some(with_arg_context(h));
     }
     if let Some((turi, def)) = typed_overload_target(state, &uri, &root, offset) {
         let troot = parse_root(state, &turi)?;
-        return Some(markup_hover(
+        return Some(with_arg_context(markup_hover(
             solsp_ide::navigation::hover_text(&troot, &def),
             None,
-        ));
+        )));
     }
     if let Some(info) = solsp_ide::navigation::hover(&root, offset) {
-        return Some(markup_hover(
+        return Some(with_arg_context(markup_hover(
             info.contents,
             Some(to_proto::range(li, info.range)),
-        ));
+        )));
     }
     if let Some((target_uri, def)) = member_resolve(state, &uri, &root, offset) {
         let troot = parse_root(state, &target_uri)?;
-        return Some(markup_hover(
+        return Some(with_arg_context(markup_hover(
             solsp_ide::navigation::hover_text(&troot, &def),
             None,
-        ));
+        )));
     }
     if let Some((target_uri, def)) = inherited_name_at(state, &uri, &root, offset) {
         let troot = parse_root(state, &target_uri)?;
-        return Some(markup_hover(
+        return Some(with_arg_context(markup_hover(
             solsp_ide::navigation::hover_text(&troot, &def),
             None,
-        ));
+        )));
     }
     if let Some(h) = builtin_member_hover(state, &uri, &root, offset) {
-        return Some(h);
+        return Some(with_arg_context(h));
     }
-    let name = solsp_ide::navigation::name_at(&root, offset)?;
-    let arity = arity_at(&root, offset);
-    if let Some((turi, def)) = cross_file_definition(state, &uri, &root, &name, arity) {
-        let troot = parse_root(state, &turi)?;
-        return Some(markup_hover(
-            solsp_ide::navigation::hover_text(&troot, &def),
-            None,
-        ));
+    if let Some(name) = solsp_ide::navigation::name_at(&root, offset) {
+        let arity = arity_at(&root, offset);
+        if let Some((turi, def)) = cross_file_definition(state, &uri, &root, &name, arity) {
+            let troot = parse_root(state, &turi)?;
+            return Some(with_arg_context(markup_hover(
+                solsp_ide::navigation::hover_text(&troot, &def),
+                None,
+            )));
+        }
     }
-    None
+    positional_arg_hover(state, &uri, &root, offset)
+}
+
+fn with_positional_arg_context(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+    mut hover: Hover,
+) -> Hover {
+    let Some((callee, label, _)) = positional_arg_label(state, uri, root, offset) else {
+        return hover;
+    };
+    let lsp_types::HoverContents::Markup(markup) = &mut hover.contents else {
+        return hover;
+    };
+    markup.value.push_str(&format!(
+        "\n\n---\n\nArgument for `{callee}`:\n```solidity\n{label}\n```"
+    ));
+    hover
 }
 
 /// `textDocument/completion` -> member completion after `.`, else scope completion.
