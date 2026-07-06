@@ -16,6 +16,9 @@ pub(super) fn hover(state: &ServerState, params: HoverParams) -> Option<Hover> {
     if let Some(h) = named_arg_hover(state, &uri, &root, offset) {
         return Some(h);
     }
+    if let Some(h) = positional_arg_hover(state, &uri, &root, offset) {
+        return Some(h);
+    }
     if let Some((turi, def)) = typed_overload_target(state, &uri, &root, offset) {
         let troot = parse_root(state, &turi)?;
         return Some(markup_hover(

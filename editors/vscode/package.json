@@ -2,7 +2,7 @@
   "name": "solsp",
   "displayName": "SolSP",
   "description": "Solidity language support powered by the bundled solsp language server.",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "publisher": "kebwale",
   "license": "MIT",
   "repository": {

@@ -2,6 +2,95 @@
 
 use super::*;
 
+/// Hover for a positional call argument: show the parameter expected by the callee.
+pub(super) fn positional_arg_hover(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<Hover> {
+    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR};
+
+    let tok = root
+        .token_at_offset(offset)
+        .left_biased()
+        .or_else(|| root.token_at_offset(offset).right_biased())?;
+    let arg_list = tok.parent()?.ancestors().find(|n| n.kind() == ARG_LIST)?;
+    let call = arg_list.parent()?;
+    if call.kind() != CALL_EXPR {
+        return None;
+    }
+    let callee = call.first_child()?;
+    if callee.text_range().contains(offset) {
+        return None;
+    }
+
+    let args: Vec<_> = arg_list.children().collect();
+    let arg_index = args
+        .iter()
+        .position(|arg| arg.text_range().contains(offset))?;
+    let name = callee_display_name(&callee)?;
+    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    let droot = parse_root(state, &def_uri)?;
+    let def_node = def.full_ptr.to_node(&droot);
+    let candidates = signature_candidates(&def, &def_node, &name, &droot);
+    let candidate = select_positional_candidate(state, uri, root, &candidates, &args)?;
+    let params = named_arg_fields(candidate.0, &candidate.1);
+    let (pname, ptype) = params.get(arg_index)?;
+    Some(markup_hover(
+        format!("```solidity\n{}\n```", parameter_label(ptype, pname)),
+        Some(to_proto::range(
+            state.line_index(uri)?,
+            args[arg_index].text_range(),
+        )),
+    ))
+}
+
+fn select_positional_candidate<'a>(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    candidates: &'a [(solsp_hir::resolve::DefKind, solsp_syntax::SyntaxNode)],
+    args: &[solsp_syntax::SyntaxNode],
+) -> Option<&'a (solsp_hir::resolve::DefKind, solsp_syntax::SyntaxNode)> {
+    let arity_matches: Vec<_> = candidates
+        .iter()
+        .filter(|(kind, node)| named_arg_fields(*kind, node).len() == args.len())
+        .collect();
+    if arity_matches.len() == 1 {
+        return Some(arity_matches[0]);
+    }
+
+    let arg_tys: Vec<typecheck::Ty> = args
+        .iter()
+        .map(|arg| infer_arg_ty(state, uri, root, arg))
+        .collect();
+    let is_base = |a: &str, b: &str| is_subtype(state, uri, root, a, b);
+    let mut typed_matches = arity_matches.into_iter().filter(|(kind, node)| {
+        let params = named_arg_fields(*kind, node);
+        args.iter().enumerate().all(|(i, _)| {
+            params
+                .get(i)
+                .map(|(_, ptype)| typecheck::parse_ty(ptype))
+                .is_some_and(|pty| typecheck::implicitly_convertible(&arg_tys[i], &pty, &is_base))
+        })
+    });
+    let candidate = typed_matches.next()?;
+    if typed_matches.next().is_some() {
+        None
+    } else {
+        Some(candidate)
+    }
+}
+
+fn parameter_label(ty: &str, name: &str) -> String {
+    match (ty.is_empty(), name.is_empty()) {
+        (true, _) => name.to_string(),
+        (_, true) => ty.to_string(),
+        _ => format!("{ty} {name}"),
+    }
+}
+
 /// The display name of a call's callee: `f` / `S` / `obj.method` / `new T`.
 pub(super) fn callee_display_name(callee: &solsp_syntax::SyntaxNode) -> Option<String> {
     use solsp_syntax::SyntaxKind::{MEMBER_EXPR, NAME_REF, NEW_EXPR, PATH_EXPR};

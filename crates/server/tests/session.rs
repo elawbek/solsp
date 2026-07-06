@@ -4284,6 +4284,56 @@ fn signature_help_for_positional_call() {
 }
 
 #[test]
+fn positional_arg_hover_shows_expected_parameter() {
+    let uri = Url::parse("file:///arg_hover.sol").unwrap();
+    let src = "contract C { function _createDexPair(address mine, uint256 amount) internal {} \
+               function g() public { address m; _createDexPair(m, 100); } }";
+
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || {
+        let caps = serde_json::to_value(solsp_server::server_capabilities()).unwrap();
+        server.initialize(caps).expect("handshake");
+        solsp_server::run(&server).expect("run");
+    });
+    send_request(&client, 1, "initialize", InitializeParams::default());
+    let _ = next_response(&client);
+    send_notification(&client, "initialized", lsp_types::InitializedParams {});
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, src));
+    let _ = next_notification(&client, "textDocument/publishDiagnostics");
+
+    let call = src.find("_createDexPair(m, 100)").unwrap();
+    let args_start = call + "_createDexPair(".len();
+    for (id, character, expected) in [
+        (2, args_start as u32, "address mine"),
+        (3, (args_start + "m, ".len()) as u32, "uint256 amount"),
+    ] {
+        send_request(
+            &client,
+            id,
+            "textDocument/hover",
+            HoverParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position { line: 0, character },
+                },
+                work_done_progress_params: Default::default(),
+            },
+        );
+        let resp = next_response(&client);
+        let hov: Hover = serde_json::from_value(resp.result.unwrap()).unwrap();
+        let HoverContents::Markup(m) = hov.contents else {
+            panic!("expected markup hover");
+        };
+        assert!(m.value.contains(expected), "hover was {:?}", m.value);
+    }
+
+    send_request(&client, 9, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn signature_help_on_inherited_internal_method() {
     use std::fs;
 

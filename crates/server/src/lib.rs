@@ -52,8 +52,8 @@ use builtins::{
     synthetic_members, yul_builtin, yul_builtin_items,
 };
 use call_resolution::{
-    callee_display_name, is_cheatcode_receiver, resolve_named_callee, signature_candidates,
-    typed_overload_target,
+    callee_display_name, is_cheatcode_receiver, positional_arg_hover, resolve_named_callee,
+    signature_candidates, typed_overload_target,
 };
 use completion_items::completion_items_from;
 use contract_diagnostics::{
