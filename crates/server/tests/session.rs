@@ -760,6 +760,92 @@ fn hover_bytes_length_builtin_member() {
 }
 
 #[test]
+fn import_path_edits_load_new_dependencies_without_saving() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!("solsp_import_path_edits_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for name in ["A", "B", "C"] {
+        fs::write(dir.join(format!("{name}.sol")), "contract Token {}\n").unwrap();
+    }
+    let main = dir.join("Main.sol");
+    let initial =
+        "pragma solidity ^0.8.20; import {Token} from './A.sol';\ncontract Main { Token t; }";
+    fs::write(&main, initial).unwrap();
+    let uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, initial));
+
+    for (id, target) in [(1, "A"), (2, "B"), (3, "C")] {
+        if target == "B" {
+            // Exercise the editor's incremental didChange path.
+            let offset = initial.find("./A.sol").unwrap() as u32;
+            send_notification(
+                &client,
+                "textDocument/didChange",
+                DidChangeTextDocumentParams {
+                    text_document: VersionedTextDocumentIdentifier {
+                        uri: uri.clone(),
+                        version: 1,
+                    },
+                    content_changes: vec![TextDocumentContentChangeEvent {
+                        range: Some(Range::new(
+                            Position::new(0, offset),
+                            Position::new(0, offset + 7),
+                        )),
+                        range_length: None,
+                        text: "./B.sol".into(),
+                    }],
+                },
+            );
+        } else if target == "C" {
+            // The full-document sync path must also recognize a leading comment.
+            let changed = "/* header */ import/* comment */{Token} from './C.sol';\ncontract Main { Token t; }";
+            send_notification(
+                &client,
+                "textDocument/didChange",
+                change_params(&uri, 2, changed),
+            );
+        }
+        send_request(
+            &client,
+            id,
+            "textDocument/definition",
+            GotoDefinitionParams {
+                text_document_position_params: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position::new(1, 17),
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        );
+        let response = next_response(&client);
+        let definition: Option<GotoDefinitionResponse> =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        let Some(GotoDefinitionResponse::Scalar(location)) = definition else {
+            panic!("missing definition after importing {target}: {definition:?}");
+        };
+        let expected =
+            Url::from_file_path(fs::canonicalize(dir.join(format!("{target}.sol"))).unwrap())
+                .unwrap();
+        assert_eq!(location.uri, expected);
+        assert_eq!(location.range.start, Position::new(0, 9));
+    }
+    assert_eq!(
+        fs::read_to_string(&main).unwrap(),
+        initial,
+        "all edits stayed in the editor buffer"
+    );
+    send_request(&client, 4, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn cross_file_goto_definition() {
     use std::fs;
 

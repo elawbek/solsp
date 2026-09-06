@@ -507,41 +507,36 @@ fn publish_due_pending_diagnostics(
     Ok(true)
 }
 
-fn import_directive_fingerprint(text: &str) -> Vec<String> {
-    let mut imports = Vec::new();
-    let mut current = String::new();
-    let mut in_import = false;
+/// Significant tokens of each import directive, independent of line layout.
+/// Use the shared lexer so comments, quoted semicolons and escaped quotes follow
+/// the same token boundaries as parsing. Incomplete directives are retained too.
+fn import_directive_fingerprint(text: &str) -> Vec<Vec<(solsp_syntax::SyntaxKind, String)>> {
+    use solsp_syntax::SyntaxKind::{IMPORT_KW, SEMICOLON};
 
-    for line in text.lines().map(str::trim) {
-        if !in_import {
-            if !is_import_start(line) {
-                continue;
-            }
-            current.clear();
-            in_import = true;
+    let mut imports = Vec::new();
+    let mut current = None;
+    let mut offset = 0;
+    for token in solsp_syntax::lexer::tokenize(text) {
+        let end = offset + token.len as usize;
+        let spelling = &text[offset..end];
+        offset = end;
+        if token.kind.is_trivia() {
+            continue;
         }
-        if !current.is_empty() {
-            current.push(' ');
+        if current.is_none() && token.kind != IMPORT_KW {
+            continue;
         }
-        current.push_str(line);
-        if line.contains(';') {
-            imports.push(current.clone());
-            current.clear();
-            in_import = false;
+        current
+            .get_or_insert_with(Vec::new)
+            .push((token.kind, spelling.to_owned()));
+        if token.kind == SEMICOLON {
+            imports.push(current.take().unwrap());
         }
     }
-    if in_import && !current.is_empty() {
-        imports.push(current);
+    if let Some(directive) = current {
+        imports.push(directive);
     }
     imports
-}
-
-fn is_import_start(line: &str) -> bool {
-    line == "import"
-        || line
-            .strip_prefix("import")
-            .and_then(|rest| rest.chars().next())
-            .is_some_and(|ch| ch.is_whitespace() || matches!(ch, '"' | '\'' | '{' | '*'))
 }
 
 #[cfg(test)]
@@ -567,6 +562,87 @@ mod tests {
             import_directive_fingerprint(before),
             import_directive_fingerprint(after)
         );
+    }
+
+    #[test]
+    fn import_fingerprint_tracks_inline_directives() {
+        for (before, after) in [
+            (
+                "pragma solidity ^0.8.20; import './A.sol';",
+                "pragma solidity ^0.8.20; import './B.sol';",
+            ),
+            (
+                "/* header */ import './A.sol';",
+                "/* header */ import './B.sol';",
+            ),
+            (
+                "import/* comment */'./A.sol';",
+                "import/* comment */'./B.sol';",
+            ),
+            (
+                "import './A.sol'; import './B.sol';",
+                "import './A.sol'; import './C.sol';",
+            ),
+            (
+                "pragma solidity ^0.8.20; contract C {}",
+                "pragma solidity ^0.8.20; import './A.sol'; contract C {}",
+            ),
+        ] {
+            assert_ne!(
+                import_directive_fingerprint(before),
+                import_directive_fingerprint(after),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_fingerprint_ignores_trivia_and_non_import_text() {
+        for (before, after) in [
+            (
+                "import './A.sol'; contract C {}",
+                "import './A.sol'; contract C { uint x; }",
+            ),
+            (
+                "/*\nimport './A.sol';\n*/ contract C {}",
+                "/*\nimport './B.sol';\n*/ contract C {}",
+            ),
+            (
+                "contract C { string s = \"import './A.sol';\"; }",
+                "contract C { string s = \"import './B.sol';\"; }",
+            ),
+            ("// import './A.sol';", "// import './B.sol';"),
+            (
+                "import { A as B } from './A.sol';",
+                "/* header */ import/* ; */{\nA as B\n} from './A.sol';",
+            ),
+        ] {
+            assert_eq!(
+                import_directive_fingerprint(before),
+                import_directive_fingerprint(after),
+                "{before}"
+            );
+        }
+    }
+
+    #[test]
+    fn import_fingerprint_tracks_names_after_semicolons_in_paths_and_comments() {
+        for (before, after) in [
+            (
+                "import './A;B.sol'\nas First;",
+                "import './A;B.sol'\nas Second;",
+            ),
+            (
+                "import { A /* ; */\n} from './A.sol';",
+                "import { A /* ; */\n} from './B.sol';",
+            ),
+        ] {
+            assert_ne!(
+                import_directive_fingerprint(before),
+                import_directive_fingerprint(after),
+                "{before}"
+            );
+        }
     }
 
     #[test]
