@@ -760,6 +760,233 @@ fn hover_bytes_length_builtin_member() {
 }
 
 #[test]
+fn dependency_creation_deletion_and_recreation_refresh_consumers() {
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
+
+    for arrival in ["watcher", "open", "save"] {
+        let dir = std::env::temp_dir().join(format!(
+            "solsp_dependency_creation_{}_{arrival}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let main = dir.join("Main.sol");
+        let dependency = dir.join("Dependency.sol");
+        let src = "import {value} from './Dependency.sol'; contract Main { function run() public pure returns (uint) { return value(1); } }";
+        fs::write(&main, src).unwrap();
+        let main_uri = Url::from_file_path(fs::canonicalize(&main).unwrap()).unwrap();
+        let dependency_uri = Url::from_file_path(&dependency).unwrap();
+        let (server, client) = Connection::memory();
+        let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+        let next_consumer_diagnostics = || {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let message = client
+                    .receiver
+                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                    .expect("consumer diagnostics were not refreshed");
+                if let Message::Notification(note) = message {
+                    if note.method == "textDocument/publishDiagnostics" {
+                        let params: PublishDiagnosticsParams =
+                            serde_json::from_value(note.params).unwrap();
+                        if params.uri == main_uri {
+                            return params.diagnostics;
+                        }
+                    }
+                }
+            }
+        };
+        let watcher = |typ| {
+            send_notification(
+                &client,
+                "workspace/didChangeWatchedFiles",
+                lsp_types::DidChangeWatchedFilesParams {
+                    changes: vec![lsp_types::FileEvent {
+                        uri: dependency_uri.clone(),
+                        typ,
+                    }],
+                },
+            )
+        };
+        send_notification(&client, "textDocument/didOpen", open_params(&main_uri, src));
+        let _ = next_consumer_diagnostics(); // Warm the cached unresolved import.
+        fs::write(
+            &dependency,
+            "function value(uint x, uint y) pure returns (uint) { return x + y; }",
+        )
+        .unwrap();
+        match arrival {
+            "open" => send_notification(
+                &client,
+                "textDocument/didOpen",
+                open_params(&dependency_uri, &fs::read_to_string(&dependency).unwrap()),
+            ),
+            "save" => send_notification(
+                &client,
+                "textDocument/didSave",
+                serde_json::json!({"textDocument": {"uri": dependency_uri}}),
+            ),
+            _ => watcher(lsp_types::FileChangeType::CREATED),
+        }
+        let diagnostics = next_consumer_diagnostics();
+        assert!(
+            diagnostics
+                .iter()
+                .any(|d| d.message.contains("argument(s)")),
+            "{diagnostics:?}"
+        );
+        if arrival == "open" {
+            send_notification(
+                &client,
+                "textDocument/didClose",
+                serde_json::json!({"textDocument": {"uri": dependency_uri}}),
+            );
+            let _ = next_consumer_diagnostics();
+        }
+        fs::remove_file(&dependency).unwrap();
+        watcher(lsp_types::FileChangeType::DELETED);
+        let diagnostics = next_consumer_diagnostics();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.message.contains("argument(s)")),
+            "stale signature: {diagnostics:?}"
+        );
+        fs::write(
+            &dependency,
+            "function value(uint x) pure returns (uint) { return x; }",
+        )
+        .unwrap();
+        watcher(lsp_types::FileChangeType::CREATED);
+        let diagnostics = next_consumer_diagnostics();
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR)),
+            "{diagnostics:?}"
+        );
+        send_request(&client, 1, "shutdown", serde_json::Value::Null);
+        let _ = next_response(&client);
+        send_notification(&client, "exit", serde_json::Value::Null);
+        server_thread.join().expect("server thread panicked");
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn dependency_edits_republish_direct_and_transitive_diagnostics() {
+    use std::{
+        collections::HashSet,
+        fs,
+        time::{Duration, Instant},
+    };
+
+    let dir = std::env::temp_dir().join(format!(
+        "solsp_dependent_diagnostics_{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let good = "function value(uint x) pure returns (uint) { return x; }";
+    let bad = "function value(uint x, uint y) pure returns (uint) { return x + y; }";
+    fs::write(dir.join("Shared.sol"), good).unwrap();
+    fs::write(dir.join("Bridge.sol"), "import './Shared.sol';").unwrap();
+    let mut mains = Vec::new();
+    for (name, dependency) in [("Direct", "Shared"), ("Transitive", "Bridge")] {
+        let src = format!("import {{value}} from './{dependency}.sol'; contract {name} {{ function run() public pure returns (uint) {{ return value(1); }} }}");
+        let path = dir.join(format!("{name}.sol"));
+        fs::write(&path, &src).unwrap();
+        mains.push((
+            Url::from_file_path(fs::canonicalize(path).unwrap()).unwrap(),
+            src,
+        ));
+    }
+    let shared = Url::from_file_path(fs::canonicalize(dir.join("Shared.sol")).unwrap()).unwrap();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+
+    // Wait for BOTH consumers. A missing publication fails with a bounded timeout.
+    let expect_consumers = |has_arity_error: bool| {
+        let mut remaining: HashSet<_> = mains.iter().map(|(uri, _)| uri.clone()).collect();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !remaining.is_empty() {
+            let message = client
+                .receiver
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap_or_else(|_| panic!("no updated diagnostics for {remaining:?}"));
+            if let Message::Notification(note) = message {
+                if note.method == "textDocument/publishDiagnostics" {
+                    let params: PublishDiagnosticsParams =
+                        serde_json::from_value(note.params).unwrap();
+                    if remaining.remove(&params.uri) {
+                        assert_eq!(
+                            params
+                                .diagnostics
+                                .iter()
+                                .any(|d| d.message.contains("argument(s)")),
+                            has_arity_error,
+                            "{params:?}"
+                        );
+                    }
+                }
+            }
+        }
+    };
+    for (uri, src) in &mains {
+        send_notification(&client, "textDocument/didOpen", open_params(uri, src));
+    }
+    expect_consumers(false);
+    // Opening the dependency can introduce an unsaved version too.
+    send_notification(&client, "textDocument/didOpen", open_params(&shared, bad));
+    expect_consumers(true);
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        change_params(&shared, 1, good),
+    );
+    expect_consumers(false);
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        change_params(&shared, 2, bad),
+    );
+    expect_consumers(true);
+    // Closing discards the unsaved version and restores the good disk text.
+    send_notification(
+        &client,
+        "textDocument/didClose",
+        serde_json::json!({"textDocument": {"uri": shared}}),
+    );
+    expect_consumers(false);
+    // A closed dependency can also change through the filesystem watcher.
+    fs::write(dir.join("Shared.sol"), bad).unwrap();
+    send_notification(
+        &client,
+        "workspace/didChangeWatchedFiles",
+        lsp_types::DidChangeWatchedFilesParams {
+            changes: vec![lsp_types::FileEvent {
+                uri: shared.clone(),
+                typ: lsp_types::FileChangeType::CHANGED,
+            }],
+        },
+    );
+    expect_consumers(true);
+    fs::write(dir.join("Shared.sol"), good).unwrap();
+    send_notification(
+        &client,
+        "textDocument/didSave",
+        serde_json::json!({"textDocument": {"uri": shared}}),
+    );
+    expect_consumers(false);
+    send_request(&client, 1, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn import_path_edits_load_new_dependencies_without_saving() {
     use std::fs;
 

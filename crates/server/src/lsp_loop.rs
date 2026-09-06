@@ -284,7 +284,9 @@ fn handle_notification(
             pending_diagnostics.remove(&uri);
             state.open(&uri, params.text_document.text);
             state.load_import_graph(&uri); // pull imported files into the db
+            state.retry_unresolved_imports();
             publish_syntax_diagnostics_if_errors(connection, state, &uri)?;
+            pending_diagnostics.schedule_dependents(state, &uri);
             pending_diagnostics.schedule_semantic(uri);
         }
         DidChangeTextDocument::METHOD => {
@@ -307,6 +309,7 @@ fn handle_notification(
             if imports_changed {
                 state.load_import_graph(&uri);
             }
+            pending_diagnostics.schedule_dependents(state, &uri);
             pending_diagnostics.schedule(uri);
         }
         DidSaveTextDocument::METHOD => {
@@ -319,7 +322,9 @@ fn handle_notification(
             if state.file(&uri).is_some() {
                 state.load_import_graph(&uri);
             }
+            state.retry_unresolved_imports();
             publish_diagnostics(connection, state, &uri, true, None)?;
+            pending_diagnostics.schedule_dependents(state, &uri);
         }
         DidChangeWatchedFiles::METHOD => {
             let Some(params) = extract_notification::<DidChangeWatchedFiles>(not) else {
@@ -344,10 +349,13 @@ fn handle_notification(
                 match event.typ {
                     FileChangeType::DELETED => {
                         state.remove(&event.uri);
-                        send_diagnostics(connection, event.uri, Vec::new())?;
+                        send_diagnostics(connection, event.uri.clone(), Vec::new())?;
                     }
                     FileChangeType::CREATED | FileChangeType::CHANGED => {
                         state.reload_or_drop(&event.uri);
+                        if event.typ == FileChangeType::CREATED {
+                            state.retry_unresolved_imports();
+                        }
                         if state.file(&event.uri).is_some() {
                             state.load_import_graph(&event.uri);
                             publish_diagnostics(
@@ -358,11 +366,12 @@ fn handle_notification(
                                 Some(std::time::Duration::from_millis(150)),
                             )?;
                         } else {
-                            send_diagnostics(connection, event.uri, Vec::new())?;
+                            send_diagnostics(connection, event.uri.clone(), Vec::new())?;
                         }
                     }
                     _ => {}
                 }
+                pending_diagnostics.schedule_dependents(state, &event.uri);
             }
         }
         DidCloseTextDocument::METHOD => {
@@ -376,6 +385,7 @@ fn handle_notification(
             // rather than clearing — unless the file is gone.
             state.close(&uri);
             if state.file(&uri).is_some() {
+                state.load_import_graph(&uri);
                 publish_diagnostics(
                     connection,
                     state,
@@ -384,8 +394,9 @@ fn handle_notification(
                     Some(std::time::Duration::from_millis(150)),
                 )?;
             } else {
-                send_diagnostics(connection, uri, Vec::new())?;
+                send_diagnostics(connection, uri.clone(), Vec::new())?;
             }
+            pending_diagnostics.schedule_dependents(state, &uri);
         }
         _ => {}
     }
@@ -415,13 +426,20 @@ impl PendingDiagnostics {
     }
 
     fn schedule_semantic(&mut self, uri: Url) {
-        self.entries.insert(
-            uri,
-            PendingDiagnostic {
+        let due = Instant::now() + CHANGE_SEMANTIC_IDLE;
+        self.entries
+            .entry(uri)
+            .and_modify(|entry| entry.semantic_due = Some(due))
+            .or_insert(PendingDiagnostic {
                 syntax_due: None,
-                semantic_due: Some(Instant::now() + CHANGE_SEMANTIC_IDLE),
-            },
-        );
+                semantic_due: Some(due),
+            });
+    }
+
+    fn schedule_dependents(&mut self, state: &ServerState, uri: &Url) {
+        for dependent in state.dependent_uris(uri) {
+            self.schedule_semantic(dependent);
+        }
     }
 
     fn remove(&mut self, uri: &Url) {
@@ -542,6 +560,20 @@ fn import_directive_fingerprint(text: &str) -> Vec<Vec<(solsp_syntax::SyntaxKind
 #[cfg(test)]
 mod tests {
     use super::import_directive_fingerprint;
+
+    #[test]
+    fn dependent_refresh_preserves_pending_syntax_deadline() {
+        let uri = lsp_types::Url::parse("file:///consumer.sol").unwrap();
+        let mut pending = super::PendingDiagnostics::default();
+        pending.schedule(uri.clone());
+        let due = pending.entries[&uri].syntax_due.unwrap();
+        pending.schedule_semantic(uri.clone());
+        assert_eq!(pending.entries[&uri].syntax_due, Some(due));
+        let (published_uri, phase) = pending.take_due(due).unwrap();
+        assert_eq!(published_uri, uri);
+        assert!(phase == super::DiagnosticPhase::Syntax);
+        assert!(pending.entries[&uri].semantic_due.is_some());
+    }
 
     #[test]
     fn import_fingerprint_ignores_body_edits() {

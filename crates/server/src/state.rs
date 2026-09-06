@@ -71,6 +71,11 @@ pub struct ServerState {
     /// Directory listings for import-path completion. Short TTL keeps typing fast while
     /// still noticing newly-created files soon after.
     import_dir_cache: RefCell<ImportDirCache>,
+    /// Import edges are refreshed when loading the graph, not on every keystroke.
+    import_dependencies: HashMap<Url, HashSet<Url>>,
+    import_dependents: HashMap<Url, HashSet<Url>>,
+    /// Retry unresolved paths when a filesystem creation may make them resolvable.
+    unresolved_imports: HashSet<Url>,
 }
 
 /// A contract's cached member list (own body + same-file C3 bases, in lookup order).
@@ -262,6 +267,9 @@ impl ServerState {
         self.member_cache.borrow_mut().remove(&key);
         self.identifier_cache.borrow_mut().remove(&key);
         self.type_cache.borrow_mut().clear();
+        self.replace_import_targets(uri, HashSet::new());
+        self.unresolved_imports.remove(uri);
+        // Keep incoming edges: consumers still import this path, even while absent.
     }
 
     /// Refresh a closed file from disk, or drop it if it no longer exists.
@@ -353,15 +361,81 @@ impl ServerState {
     }
 
     /// The relative-import target URIs of a tracked file (empty if untracked).
-    fn import_targets(&self, uri: &Url) -> Vec<Url> {
+    fn import_targets(&mut self, uri: &Url) -> HashSet<Url> {
         let Some(file) = self.file(uri) else {
-            return Vec::new();
+            return HashSet::new();
         };
         let root = solsp_base_db::parse(&self.db, file).syntax();
-        solsp_hir::imports::imports(&root)
-            .iter()
-            .filter_map(|imp| resolve_import_uri(uri, &imp.path))
-            .collect()
+        let mut targets = HashSet::new();
+        let mut unresolved = false;
+        for import in solsp_hir::imports::imports(&root) {
+            if let Some(target) = resolve_import_uri(uri, &import.path) {
+                targets.insert(target);
+            } else {
+                unresolved = true;
+            }
+        }
+        if unresolved {
+            self.unresolved_imports.insert(uri.clone());
+        } else {
+            self.unresolved_imports.remove(uri);
+        }
+        self.replace_import_targets(uri, targets.clone());
+        targets
+    }
+
+    fn replace_import_targets(&mut self, uri: &Url, targets: HashSet<Url>) {
+        if self.import_dependencies.get(uri) == Some(&targets) {
+            return;
+        }
+        if let Some(previous) = self.import_dependencies.remove(uri) {
+            for target in previous {
+                if let Some(dependents) = self.import_dependents.get_mut(&target) {
+                    dependents.remove(uri);
+                    if dependents.is_empty() {
+                        self.import_dependents.remove(&target);
+                    }
+                }
+            }
+        }
+        for target in &targets {
+            self.import_dependents
+                .entry(target.clone())
+                .or_default()
+                .insert(uri.clone());
+        }
+        if !targets.is_empty() {
+            self.import_dependencies.insert(uri.clone(), targets);
+        }
+    }
+
+    /// Loaded consumers affected by a change, including transitive imports.
+    /// The visited set excludes the changed file and bounds cycles and diamonds.
+    pub(super) fn dependent_uris(&self, uri: &Url) -> Vec<Url> {
+        let mut seen = HashSet::from([uri.clone()]);
+        let mut queue = vec![uri.clone()];
+        let mut result = Vec::new();
+        while let Some(target) = queue.pop() {
+            for dependent in self.import_dependents.get(&target).into_iter().flatten() {
+                if seen.insert(dependent.clone()) {
+                    queue.push(dependent.clone());
+                    if self.file(dependent).is_some() {
+                        result.push(dependent.clone());
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// A created file may satisfy a previously missing relative or remapped import.
+    /// Reuse normal resolution, and invalidate cached unresolved import bindings.
+    pub(super) fn retry_unresolved_imports(&mut self) {
+        let sources: Vec<_> = self.unresolved_imports.iter().cloned().collect();
+        for uri in sources {
+            self.index_cache.borrow_mut().remove(uri.as_str());
+            self.load_import_graph(&uri);
+        }
     }
 }
 
@@ -493,4 +567,55 @@ fn load_remappings(root: &Path) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reverse_import_graph_handles_cycles_diamonds_and_replaced_edges() {
+        let mut state = ServerState::default();
+        let [base, left, right, top, unrelated] = ["base", "left", "right", "top", "unrelated"]
+            .map(|name| Url::parse(&format!("file:///{name}.sol")).unwrap());
+        for uri in [&base, &left, &right, &top, &unrelated] {
+            state.set(uri, String::new());
+        }
+        state.replace_import_targets(&left, HashSet::from([base.clone()]));
+        state.replace_import_targets(&right, HashSet::from([base.clone()]));
+        state.replace_import_targets(&top, HashSet::from([left.clone(), right.clone()]));
+        state.replace_import_targets(&base, HashSet::from([top.clone()]));
+        let affected = state.dependent_uris(&base);
+        assert_eq!(
+            affected.len(),
+            3,
+            "cycles and diamonds must not duplicate consumers"
+        );
+        assert_eq!(
+            affected.into_iter().collect::<HashSet<_>>(),
+            HashSet::from([left.clone(), right.clone(), top.clone()])
+        );
+        // Retargeting/removing imports must discard the old reverse links.
+        state.replace_import_targets(&left, HashSet::from([unrelated.clone()]));
+        state.replace_import_targets(&right, HashSet::new());
+        assert!(state.dependent_uris(&base).is_empty());
+        assert_eq!(
+            state
+                .dependent_uris(&unrelated)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([left.clone(), top.clone(), base.clone()])
+        );
+        // A removed consumer no longer imports anything, but its consumers still
+        // need diagnostics when that missing path is restored.
+        state.remove(&left);
+        assert!(state.dependent_uris(&unrelated).is_empty());
+        assert_eq!(
+            state
+                .dependent_uris(&left)
+                .into_iter()
+                .collect::<HashSet<_>>(),
+            HashSet::from([top, base])
+        );
+    }
 }
