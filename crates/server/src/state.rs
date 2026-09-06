@@ -20,6 +20,8 @@ use solsp_ide::LineIndex;
 struct FileEntry {
     file: SourceFile,
     line_index: LineIndex,
+    /// Until didClose, the editor owns the text even if the disk changes.
+    is_open: bool,
 }
 
 const IMPORT_DIR_CACHE_TTL: Duration = Duration::from_secs(2);
@@ -85,9 +87,9 @@ type IdentifierIndex = HashMap<String, Vec<rowan::TextRange>>;
 type ImportDirCache = HashMap<PathBuf, (Instant, Rc<Vec<ImportPathEntry>>)>;
 
 impl ServerState {
-    /// Open or replace a document with `text`: update its salsa input (reusing the
-    /// same `SourceFile` handle on re-set, so the revision bump invalidates exactly
-    /// its dependents) and rebuild its line index.
+    /// Replace a tracked document's text without changing its open/closed state.
+    /// Reuse its salsa input so the revision bump invalidates exactly its dependents,
+    /// and rebuild the line index.
     pub fn set(&mut self, uri: &Url, text: String) {
         let key = uri.to_string();
         let line_index = LineIndex::new(&text);
@@ -97,13 +99,47 @@ impl ServerState {
         self.member_cache.borrow_mut().remove(&key);
         self.type_cache.borrow_mut().clear();
         self.identifier_cache.borrow_mut().remove(&key);
-        if let Some(file) = self.files.get(&key).map(|e| e.file) {
+        if let Some((file, is_open)) = self.files.get(&key).map(|e| (e.file, e.is_open)) {
             file.set_text(&mut self.db).to(text);
-            self.files.insert(key, FileEntry { file, line_index });
+            self.files.insert(
+                key,
+                FileEntry {
+                    file,
+                    line_index,
+                    is_open,
+                },
+            );
         } else {
             let file = SourceFile::new(&self.db, key.clone(), text);
-            self.files.insert(key, FileEntry { file, line_index });
+            self.files.insert(
+                key,
+                FileEntry {
+                    file,
+                    line_index,
+                    is_open: false,
+                },
+            );
         }
+    }
+
+    /// Claim editor ownership of a document's content on didOpen.
+    pub(super) fn open(&mut self, uri: &Url, text: String) {
+        self.set(uri, text);
+        self.files.get_mut(uri.as_str()).unwrap().is_open = true;
+    }
+
+    pub(super) fn is_open(&self, uri: &Url) -> bool {
+        self.files
+            .get(uri.as_str())
+            .is_some_and(|entry| entry.is_open)
+    }
+
+    /// Release editor ownership on didClose and restore the current disk content.
+    pub(super) fn close(&mut self, uri: &Url) {
+        if let Some(entry) = self.files.get_mut(uri.as_str()) {
+            entry.is_open = false;
+        }
+        self.reload_or_drop(uri);
     }
 
     /// The cached [`FileIndex`] for a tracked file (built on first use). `None` if the
@@ -218,7 +254,7 @@ impl ServerState {
         Some(entries)
     }
 
-    /// Drop a document (on `didClose`).
+    /// Drop a tracked document and its indexes.
     pub fn remove(&mut self, uri: &Url) {
         let key = uri.to_string();
         self.files.remove(uri.as_str());
@@ -228,11 +264,12 @@ impl ServerState {
         self.type_cache.borrow_mut().clear();
     }
 
-    /// On `didClose`, refresh the file from disk rather than dropping it: it may still
-    /// be imported by open files, so cross-file resolution must keep seeing it (with
-    /// the saved-on-disk content, discarding any unsaved editor edits). If it no longer
-    /// exists on disk, drop it.
+    /// Refresh a closed file from disk, or drop it if it no longer exists.
+    /// Open documents retain their editor-owned text until didClose.
     pub fn reload_or_drop(&mut self, uri: &Url) {
+        if self.is_open(uri) {
+            return;
+        }
         if let Ok(path) = uri.to_file_path() {
             if let Ok(text) = fs::read_to_string(&path) {
                 self.set(uri, text);

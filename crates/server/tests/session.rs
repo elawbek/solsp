@@ -809,6 +809,104 @@ fn cross_file_goto_definition() {
 }
 
 #[test]
+fn open_document_preserves_editor_text_until_close() {
+    use lsp_types::FileChangeType;
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!("solsp_open_buffer_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Buffer.sol");
+    let uri = Url::from_file_path(&path).unwrap();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    let mut request_id = 0;
+    let mut symbol_name = || {
+        request_id += 1;
+        send_request(
+            &client,
+            request_id,
+            "textDocument/documentSymbol",
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        );
+        let result = next_response(&client).result.unwrap();
+        result[0]["name"].as_str().map(str::to_owned)
+    };
+
+    for event_type in [
+        FileChangeType::CHANGED,
+        FileChangeType::DELETED,
+        FileChangeType::CREATED,
+    ] {
+        fs::write(&path, "contract Disk {}\n").unwrap();
+        send_notification(
+            &client,
+            "textDocument/didOpen",
+            open_params(&uri, "contract Unsaved {}\n"),
+        );
+        assert_eq!(symbol_name().as_deref(), Some("Unsaved"));
+
+        fs::remove_file(&path).unwrap();
+        if event_type != FileChangeType::DELETED {
+            fs::write(&path, "contract External {}\n").unwrap();
+        }
+        send_notification(
+            &client,
+            "workspace/didChangeWatchedFiles",
+            lsp_types::DidChangeWatchedFilesParams {
+                changes: vec![lsp_types::FileEvent {
+                    uri: uri.clone(),
+                    typ: event_type,
+                }],
+            },
+        );
+        assert_eq!(symbol_name().as_deref(), Some("Unsaved"), "{event_type:?}");
+
+        // The next incremental edit must still address the editor's buffer.
+        send_notification(
+            &client,
+            "textDocument/didChange",
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 1,
+                },
+                content_changes: vec![TextDocumentContentChangeEvent {
+                    range: Some(Range::new(Position::new(0, 9), Position::new(0, 16))),
+                    range_length: None,
+                    text: "Edited".to_string(),
+                }],
+            },
+        );
+        assert_eq!(symbol_name().as_deref(), Some("Edited"));
+
+        if event_type != FileChangeType::DELETED {
+            // A save notification may arrive after a subsequent editor change;
+            // the disk still contains the earlier saved version.
+            send_notification(
+                &client,
+                "textDocument/didSave",
+                serde_json::json!({ "textDocument": { "uri": uri } }),
+            );
+            assert_eq!(symbol_name().as_deref(), Some("Edited"));
+        }
+
+        send_notification(
+            &client,
+            "textDocument/didClose",
+            serde_json::json!({ "textDocument": { "uri": uri } }),
+        );
+        let expected = (event_type != FileChangeType::DELETED).then_some("External");
+        assert_eq!(symbol_name().as_deref(), expected);
+    }
+
+    send_request(&client, 100, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn watched_file_change_reloads_imported_contract_index() {
     use std::fs;
 

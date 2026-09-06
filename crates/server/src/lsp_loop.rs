@@ -282,7 +282,7 @@ fn handle_notification(
             };
             let uri = params.text_document.uri;
             pending_diagnostics.remove(&uri);
-            state.set(&uri, params.text_document.text);
+            state.open(&uri, params.text_document.text);
             state.load_import_graph(&uri); // pull imported files into the db
             publish_syntax_diagnostics_if_errors(connection, state, &uri)?;
             pending_diagnostics.schedule_semantic(uri);
@@ -326,6 +326,11 @@ fn handle_notification(
                 return Ok(());
             };
             for event in params.changes {
+                // Disk changes must not replace an editor buffer or cancel its
+                // pending diagnostics, including when the file is deleted.
+                if state.is_open(&event.uri) {
+                    continue;
+                }
                 if event
                     .uri
                     .to_file_path()
@@ -369,7 +374,7 @@ fn handle_notification(
             // Refresh the file from disk (it may still be imported by open files). Keep its
             // project-wide diagnostics in the tree by re-diagnosing the on-disk version,
             // rather than clearing — unless the file is gone.
-            state.reload_or_drop(&uri);
+            state.close(&uri);
             if state.file(&uri).is_some() {
                 publish_diagnostics(
                     connection,
