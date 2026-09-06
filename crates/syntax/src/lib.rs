@@ -87,7 +87,7 @@ pub fn parse(text: &str) -> Parse {
 pub fn parse_with_timings(text: &str) -> (Parse, ParseTimings) {
     let total_started = Instant::now();
     let started = Instant::now();
-    let tokens = lexer::tokenize(text);
+    let (tokens, mut errors) = lexer::tokenize_with_errors(text);
     let lexer = started.elapsed();
 
     let started = Instant::now();
@@ -102,7 +102,8 @@ pub fn parse_with_timings(text: &str) -> (Parse, ParseTimings) {
 
     let event_count = events.len();
     let started = Instant::now();
-    let (green, errors) = event::build_tree(text, &tokens, events);
+    let (green, parser_errors) = event::build_tree(text, &tokens, events);
+    errors.extend(parser_errors);
     let tree = started.elapsed();
 
     (
@@ -522,6 +523,36 @@ contract Vault is Ownable {\n\
                 );
             }
         }
+    }
+
+    #[test]
+    fn lexical_errors_survive_parsing_and_preserve_following_members() {
+        let src = "contract C { string s = unicode\"привет\n; uint tail; } /* open";
+        let parsed = parse(src);
+        assert_eq!(parsed.syntax().text().to_string(), src);
+        assert_eq!(parsed.errors().len(), 2, "{:?}", parsed.errors());
+        for (error, message, fragment) in [
+            (
+                &parsed.errors()[0],
+                "unterminated string literal",
+                "unicode\"привет",
+            ),
+            (&parsed.errors()[1], "unterminated block comment", "/* open"),
+        ] {
+            assert_eq!(error.message, message);
+            assert_eq!(&src[std::ops::Range::<usize>::from(error.range)], fragment);
+        }
+        let body = parsed
+            .syntax()
+            .descendants()
+            .find(|node| node.kind() == SyntaxKind::CONTRACT_BODY)
+            .expect("contract body");
+        assert!(body
+            .children()
+            .any(|node| node.kind() == SyntaxKind::STATE_VAR_DEF
+                && node.children().any(|child| child.kind() == SyntaxKind::NAME
+                    && child.text().to_string().trim() == "tail")));
+        assert_eq!(parse("/*").errors().len(), 1);
     }
 
     #[test]

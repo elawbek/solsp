@@ -1,7 +1,9 @@
 //! Lexer: text -> a flat list of tokens, **including** trivia (whitespace and
 //! comments) so the tree stays lossless (design §3.1). A single byte-cursor pass.
 
+use crate::SyntaxError;
 use crate::SyntaxKind::{self, *};
+use rowan::TextRange;
 
 /// A lexed token: its kind and byte length. Byte offsets are recovered by
 /// accumulating `len` across the stream.
@@ -12,24 +14,36 @@ pub struct Token {
 }
 
 /// Tokenize the whole input. Total function: never panics, covers every byte.
+/// Use [`tokenize_with_errors`] when lexical diagnostics are needed.
 pub fn tokenize(text: &str) -> Vec<Token> {
+    tokenize_with_errors(text).0
+}
+
+/// Tokenize while retaining lexical errors, including errors in trivia.
+/// Malformed strings and comments keep their token kind for parser recovery.
+pub fn tokenize_with_errors(text: &str) -> (Vec<Token>, Vec<SyntaxError>) {
     let mut cursor = Cursor::new(text);
     let mut tokens = Vec::new();
     while !cursor.is_eof() {
         tokens.push(cursor.next_token());
     }
-    tokens
+    (tokens, cursor.errors)
 }
 
 /// Byte-cursor over the source. All scanning is forward-only.
 struct Cursor<'a> {
     src: &'a str,
     pos: usize,
+    errors: Vec<SyntaxError>,
 }
 
 impl<'a> Cursor<'a> {
     fn new(src: &'a str) -> Self {
-        Cursor { src, pos: 0 }
+        Cursor {
+            src,
+            pos: 0,
+            errors: Vec::new(),
+        }
     }
 
     fn is_eof(&self) -> bool {
@@ -84,7 +98,7 @@ impl<'a> Cursor<'a> {
             self.block_comment();
             COMMENT
         } else if c == '"' || c == '\'' {
-            self.string_body(c);
+            self.string_body(c, start);
             STRING
         } else {
             self.punctuation()
@@ -104,32 +118,37 @@ impl<'a> Cursor<'a> {
         // `hex"..."` / `unicode"..."` are single string literals, not ident+string.
         if (text == "hex" || text == "unicode") && matches!(self.first(), Some('"') | Some('\'')) {
             let quote = self.first().unwrap();
-            self.string_body(quote);
+            self.string_body(quote, start);
             return STRING;
         }
         SyntaxKind::from_keyword(text).unwrap_or(IDENT)
     }
 
     /// Consume a quoted body starting at the opening quote. Handles `\` escapes;
-    /// stops at the matching quote, a bare newline (recovery), or EOF (lossless).
-    fn string_body(&mut self, quote: char) {
+    /// stops at the matching quote, a bare line break (recovery), or EOF (lossless).
+    fn string_body(&mut self, quote: char, start: usize) {
         self.bump(); // opening quote
         while let Some(c) = self.first() {
             match c {
                 '\\' => {
-                    self.bump(); // backslash
-                    self.bump(); // escaped char (if any)
+                    // Consume the backslash, then the escaped character.
+                    // A CRLF continuation is one escaped line break.
+                    self.bump();
+                    if self.bump() == Some('\r') && self.first() == Some('\n') {
+                        self.bump();
+                    }
                 }
-                '\n' => break, // unterminated line; let the parser flag it
+                c if is_line_break(c) => break,
                 c if c == quote => {
                     self.bump(); // closing quote
-                    break;
+                    return;
                 }
                 _ => {
                     self.bump();
                 }
             }
         }
+        self.error(start, "unterminated string literal");
     }
 
     /// `// ...` to end of line (newline not included).
@@ -141,14 +160,23 @@ impl<'a> Cursor<'a> {
 
     /// `/* ... */`; runs to the closing `*/` or EOF (lossless).
     fn block_comment(&mut self) {
+        let start = self.pos;
         self.bump(); // /
         self.bump(); // *
         while let Some(c) = self.bump() {
             if c == '*' && self.first() == Some('/') {
                 self.bump(); // /
-                break;
+                return;
             }
         }
+        self.error(start, "unterminated block comment");
+    }
+
+    fn error(&mut self, start: usize, message: &str) {
+        self.errors.push(SyntaxError {
+            message: message.to_owned(),
+            range: TextRange::new((start as u32).into(), (self.pos as u32).into()),
+        });
     }
 
     /// Scan a numeric literal: decimal/hex integer, optional fraction, optional
@@ -249,6 +277,13 @@ impl<'a> Cursor<'a> {
 
 fn is_whitespace(c: char) -> bool {
     c.is_whitespace()
+}
+
+fn is_line_break(c: char) -> bool {
+    matches!(
+        c,
+        '\n' | '\r' | '\u{000b}' | '\u{000c}' | '\u{0085}' | '\u{2028}' | '\u{2029}'
+    )
 }
 
 fn is_ident_start(c: char) -> bool {
@@ -421,6 +456,89 @@ mod tests {
                 (IDENT, "b"),
             ]
         );
+    }
+
+    #[test]
+    fn unterminated_literals_report_exact_byte_ranges() {
+        for literal in [
+            "\"",
+            "'oops",
+            "\"oops\\",
+            "\"oops\\\"",
+            "hex\"00",
+            "hex'00",
+            "unicode\"привет",
+            "unicode'🌍",
+            "/*",
+            "/* open",
+            "/** doc",
+            "/**",
+            "/*/",
+        ] {
+            let prefix = "// 🌍\n ";
+            let src = format!("{prefix}{literal}");
+            let (tokens, errors) = tokenize_with_errors(&src);
+            assert_eq!(errors.len(), 1, "{src:?}: {errors:?}");
+            let (kind, message) = if literal.starts_with("/*") {
+                (COMMENT, "unterminated block comment")
+            } else {
+                (STRING, "unterminated string literal")
+            };
+            assert_eq!(tokens.last().unwrap().kind, kind);
+            assert_eq!(errors[0].message, message);
+            assert_eq!(
+                errors[0].range,
+                TextRange::new((prefix.len() as u32).into(), (src.len() as u32).into())
+            );
+            assert_lossless(&src);
+        }
+    }
+
+    #[test]
+    fn unterminated_strings_recover_at_line_breaks() {
+        for line_break in [
+            "\n", "\r\n", "\r", "\u{000b}", "\u{000c}", "\u{0085}", "\u{2028}", "\u{2029}",
+        ] {
+            for literal in ["\"oops", "'oops", "hex\"00", "unicode\"🌍"] {
+                let src = format!("{literal}{line_break}contract Next {{}}");
+                let (tokens, errors) = tokenize_with_errors(&src);
+                assert_eq!(errors.len(), 1, "{src:?}: {errors:?}");
+                assert_eq!(u32::from(errors[0].range.end()) as usize, literal.len());
+                assert_eq!(tokens[0].kind, STRING);
+                assert_eq!(tokens[1].kind, WHITESPACE);
+                assert_eq!(tokens[2].kind, CONTRACT_KW);
+                assert_lossless(&src);
+            }
+        }
+    }
+
+    #[test]
+    fn closed_literals_and_escaped_line_breaks_have_no_errors() {
+        for src in [
+            "\"\"",
+            "''",
+            "\"escaped\\\"quote\"",
+            "'escaped\\'quote'",
+            "\"backslash\\\\\"",
+            "hex\"00ff\"",
+            "hex'00ff'",
+            "unicode\"привет 🌍\"",
+            "unicode'привет'",
+            "\"a\\\nb\"",
+            "\"a\\\r\nb\"",
+            "\"a\\\rb\"",
+            "unicode\"🌍\\\r\nb\"",
+            "//",
+            "// no newline",
+            "/**/",
+            "/* closed */",
+            "/** doc */",
+            "/* \" * /\n */",
+        ] {
+            let (_, errors) = tokenize_with_errors(src);
+            assert!(errors.is_empty(), "{src:?}: {errors:?}");
+            assert_lossless(src);
+        }
     }
 
     #[test]

@@ -113,6 +113,52 @@ fn missing_expressions_publish_and_clear_diagnostics() {
 }
 
 #[test]
+fn unterminated_tokens_publish_and_clear_diagnostics() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    let uri = Url::parse("file:///unterminated-tokens.sol").unwrap();
+    let broken = "contract C { string s = unicode\"привет\n; } /* open";
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, broken));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diagnostics: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert_eq!(diagnostics.uri, uri);
+    assert_eq!(diagnostics.diagnostics.len(), 2, "{diagnostics:?}");
+    for (diag, message, start, end) in [
+        (
+            &diagnostics.diagnostics[0],
+            "unterminated string literal",
+            Position::new(0, 24),
+            Position::new(0, 38),
+        ),
+        (
+            &diagnostics.diagnostics[1],
+            "unterminated block comment",
+            Position::new(1, 4),
+            Position::new(1, 11),
+        ),
+    ] {
+        assert_eq!(diag.message, message);
+        assert_eq!(diag.severity, Some(lsp_types::DiagnosticSeverity::ERROR));
+        assert_eq!(diag.range, Range::new(start, end));
+    }
+
+    let fixed = "contract C { string s = unicode\"привет\"\n; } /* open */";
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        change_params(&uri, 1, fixed),
+    );
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diagnostics: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert_eq!(diagnostics.uri, uri);
+    assert!(diagnostics.diagnostics.is_empty(), "{diagnostics:?}");
+    send_request(&client, 1, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn full_lsp_session() {
     let (server, client) = Connection::memory();
 
