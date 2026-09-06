@@ -3534,12 +3534,17 @@ fn remapped_and_node_modules_imports_resolve() {
         p
     };
     // project root marker + a remapping; a remapped package and a node_modules package.
-    mk("remappings.txt", "@lib/=packages/mylib/\n");
-    let thing = mk("packages/mylib/Thing.sol", "contract Thing {}\n");
+    mk(
+        "remappings.txt",
+        "@lib/=packages/mylib/\n@lib/special/=packages/override/\n",
+    );
+    // Both targets exist: only the longer prefix should determine navigation.
+    mk("packages/mylib/special/Thing.sol", "contract Thing {}\n");
+    let thing = mk("packages/override/Thing.sol", "contract Thing {}\n");
     let modd = mk("node_modules/pkg/Mod.sol", "contract Mod {}\n");
     let main = mk(
         "src/Main.sol",
-        "import {Thing} from \"@lib/Thing.sol\";\n\
+        "import {Thing} from \"@lib/special/Thing.sol\";\n\
          import {Mod} from \"pkg/Mod.sol\";\n\
          contract Main { Thing t; Mod m; }\n",
     );
@@ -3588,7 +3593,7 @@ fn remapped_and_node_modules_imports_resolve() {
         loc
     };
 
-    // `Thing` (remapped @lib/) → packages/mylib/Thing.sol
+    // `Thing` (remapped @lib/special/) → packages/override/Thing.sol
     let ch = line2.find("Thing t").unwrap() as u32;
     assert_eq!(definition(2, ch + 1).uri, thing_uri);
     // `Mod` (node_modules/pkg) → node_modules/pkg/Mod.sol

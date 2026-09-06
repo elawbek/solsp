@@ -474,10 +474,10 @@ pub fn collect_sol_files(root: &Path) -> Vec<Url> {
     out
 }
 
-/// Resolve an import path against the importing file's URI into the target file URI,
-/// trying in order: relative to the importing file (`./X.sol`, `../Y.sol`, bare
-/// `X.sol`); remappings (`remappings.txt` + `foundry.toml`) from the project root; then
-/// `node_modules/<path>` or forge `lib/<path>`. `None` if nothing resolves to a file.
+/// Resolve an import path against the importing file's URI into the target file URI.
+/// A matching remapping selects the target before filesystem lookup. Otherwise try
+/// file-relative paths, project/source roots, then `node_modules` and forge `lib`.
+/// `None` if the selected target or all unmapped candidates are missing.
 pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
     if path.is_empty() {
         return None;
@@ -485,21 +485,30 @@ pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
     let base_path = base.to_file_path().ok()?;
     let dir = base_path.parent()?;
 
-    // 1. relative to the importing file.
+    let root = project_root(dir);
+    if let Some(root) = &root {
+        let remappings = load_remappings(root);
+        // max_by_key selects the last entry on equal lengths. File existence must
+        // not change which rule wins or cause fallback to a less specific rule.
+        if let Some((prefix, target)) = remappings
+            .iter()
+            .filter(|(prefix, _)| !prefix.is_empty() && path.starts_with(prefix))
+            .max_by_key(|(prefix, _)| prefix.len())
+        {
+            // Remapping is literal prefix substitution, not a directory join:
+            // targets can be files or partial names and need not end in '/'.
+            let remapped = format!("{target}{}", &path[prefix.len()..]);
+            return file_uri(root.join(remapped));
+        }
+    }
+
+    // Without a remapping, try relative to the importing file first.
     if let Some(uri) = file_uri(dir.join(path)) {
         return Some(uri);
     }
 
-    // 2 & 3. package / remapped imports, resolved against the project root.
-    let root = project_root(dir)?;
-    for (prefix, target) in load_remappings(&root) {
-        if let Some(rest) = path.strip_prefix(&prefix) {
-            if let Some(uri) = file_uri(root.join(&target).join(rest)) {
-                return Some(uri);
-            }
-        }
-    }
-    // 4. project-root-relative — Foundry resolves a bare `contracts/X.sol` from the
+    let root = root?;
+    // Project-root-relative — Foundry resolves a bare `contracts/X.sol` from the
     //    project root (`src = 'contracts'`), and relative to common source dirs.
     if let Some(uri) = file_uri(root.join(path)) {
         return Some(uri);
@@ -509,7 +518,7 @@ pub fn resolve_import_uri(base: &Url, path: &str) -> Option<Url> {
             return Some(uri);
         }
     }
-    // 5. package roots.
+    // Package roots.
     for base_dir in ["node_modules", "lib"] {
         if let Some(uri) = file_uri(root.join(base_dir).join(path)) {
             return Some(uri);
@@ -572,6 +581,89 @@ fn load_remappings(root: &Path) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remappings_select_longest_prefix_before_checking_files() {
+        let dir =
+            std::env::temp_dir().join(format!("solsp_remapping_precedence_{}", std::process::id()));
+        for relative in [
+            "src/Main.sol",
+            "src/@pkg/token/Thing.sol",
+            "lib/general/token/Thing.sol",
+            "lib/specific/Thing.sol",
+            "src/Local.sol",
+        ] {
+            let path = dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "contract Thing {}").unwrap();
+        }
+        let main = file_uri(dir.join("src/Main.sol")).unwrap();
+        let expected = file_uri(dir.join("lib/specific/Thing.sol"));
+        for (text, toml) in [
+            ("@pkg/=lib/general/\n@pkg/token/=lib/specific/\n", ""),
+            ("@pkg/token/=lib/specific/\n@pkg/=lib/general/\n", ""),
+            ("", "[profile.default]\nremappings = [\"@pkg/=lib/general/\", \"@pkg/token/=lib/specific/\"]"),
+            ("", "[profile.default]\nremappings = [\"@pkg/token/=lib/specific/\", \"@pkg/=lib/general/\"]"),
+            ("@pkg/=lib/general/\n", "[profile.default]\nremappings = [\"@pkg/token/=lib/specific/\"]"),
+        ] {
+            fs::write(dir.join("remappings.txt"), text).unwrap();
+            fs::write(dir.join("foundry.toml"), toml).unwrap();
+            assert_eq!(resolve_import_uri(&main, "@pkg/token/Thing.sol"), expected, "{text}\n{toml}");
+            assert_eq!(resolve_import_uri(&main, "./Local.sol"), file_uri(dir.join("src/Local.sol")));
+        }
+        fs::write(dir.join("foundry.toml"), "").unwrap();
+        fs::write(
+            dir.join("remappings.txt"),
+            "@pkg/=lib/general/\n@pkg/token/=lib/missing/\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_import_uri(&main, "@pkg/token/Thing.sol"),
+            None,
+            "a missing specific target must not select the broader or local file"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn remapping_ties_and_literal_prefix_substitution() {
+        let dir = std::env::temp_dir().join(format!(
+            "solsp_remapping_substitution_{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("lib")).unwrap();
+        for relative in [
+            "Main.sol",
+            "lib/First.sol",
+            "lib/Second.sol",
+            "lib/Thing.sol",
+        ] {
+            fs::write(dir.join(relative), "contract Thing {}").unwrap();
+        }
+        let main = file_uri(dir.join("Main.sol")).unwrap();
+        for (mapping, import, target) in [
+            (
+                "@pkg/Thing.sol=lib/First.sol\n@pkg/Thing.sol=lib/Second.sol\n",
+                "@pkg/Thing.sol",
+                "lib/Second.sol",
+            ),
+            (
+                "@pkg/Thing.sol=lib/Second.sol\n@pkg/Thing.sol=lib/First.sol\n",
+                "@pkg/Thing.sol",
+                "lib/First.sol",
+            ),
+            ("@pkg/T=lib/T\n", "@pkg/Thing.sol", "lib/Thing.sol"),
+            ("@pkg/=\n", "@pkg/lib/Thing.sol", "lib/Thing.sol"),
+        ] {
+            fs::write(dir.join("remappings.txt"), mapping).unwrap();
+            assert_eq!(
+                resolve_import_uri(&main, import),
+                file_uri(dir.join(target)),
+                "{mapping}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn reverse_import_graph_handles_cycles_diamonds_and_replaced_edges() {
