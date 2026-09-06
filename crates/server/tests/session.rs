@@ -2477,6 +2477,491 @@ fn cross_file_rename_imported_symbol() {
 }
 
 #[test]
+fn rename_and_references_distinguish_import_alias_bindings() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!("solsp_alias_bindings_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let sources = [
+        ("Token.sol", "contract Token {}\n"),
+        (
+            "Main.sol",
+            "import {Token as Alias} from \"./Token.sol\";\ncontract Main { Alias value; function f(uint Alias) public pure returns (uint) { return Alias; } }\n",
+        ),
+        (
+            "Other.sol",
+            "import {Token as Alias} from \"./Token.sol\";\ncontract Other { Alias value; }\n",
+        ),
+        (
+            "Same.sol",
+            "import {Token as Token} from \"./Token.sol\";\ncontract Same { Token value; }\n",
+        ),
+        (
+            "Consumer.sol",
+            "import {Alias} from \"./Main.sol\";\ncontract Consumer { Alias value; }\n",
+        ),
+        (
+            "Namespace.sol",
+            "import * as N from \"./Main.sol\";\ncontract Namespace { N.Alias value; }\n",
+        ),
+        ("Unrelated.sol", "contract Alias {}\n"),
+    ];
+    let uris: Vec<_> = sources
+        .iter()
+        .map(|(name, text)| {
+            let path = dir.join(name);
+            fs::write(&path, text).unwrap();
+            Url::from_file_path(path).unwrap()
+        })
+        .collect();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    for ((_, text), uri) in sources.iter().zip(&uris) {
+        send_notification(&client, "textDocument/didOpen", open_params(uri, text));
+    }
+
+    // Rename the original declaration, the source name in the import, and then
+    // the local alias from both its declaration and a use in another file.
+    let cases = [
+        (
+            0,
+            0,
+            9,
+            "Coin",
+            vec![
+                (0, "contract Coin {}\n".to_string()),
+                (1, sources[1].1.replacen("{Token as", "{Coin as", 1)),
+                (2, sources[2].1.replacen("{Token as", "{Coin as", 1)),
+                (3, sources[3].1.replacen("{Token as", "{Coin as", 1)),
+            ],
+        ),
+        (
+            1,
+            0,
+            8,
+            "Coin",
+            vec![
+                (0, "contract Coin {}\n".to_string()),
+                (1, sources[1].1.replacen("{Token as", "{Coin as", 1)),
+                (2, sources[2].1.replacen("{Token as", "{Coin as", 1)),
+                (3, sources[3].1.replacen("{Token as", "{Coin as", 1)),
+            ],
+        ),
+        (
+            1,
+            0,
+            17,
+            "LocalToken",
+            vec![
+                (1, sources[1].1.replacen("Alias", "LocalToken", 2)),
+                (4, sources[4].1.replace("Alias", "LocalToken")),
+                (5, sources[5].1.replace("Alias", "LocalToken")),
+            ],
+        ),
+        (
+            4,
+            1,
+            20,
+            "LocalToken",
+            vec![
+                (1, sources[1].1.replacen("Alias", "LocalToken", 2)),
+                (4, sources[4].1.replace("Alias", "LocalToken")),
+                (5, sources[5].1.replace("Alias", "LocalToken")),
+            ],
+        ),
+    ];
+    for (index, line, character, new_name, expected) in cases {
+        send_request(
+            &client,
+            1,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": { "uri": uris[index] },
+                "position": { "line": line, "character": character },
+                "newName": new_name,
+            }),
+        );
+        let edit: WorkspaceEdit =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        let changes = edit.changes.unwrap();
+        assert_eq!(changes.len(), expected.len(), "{new_name}: {changes:?}");
+        for (file, expected_text) in expected {
+            let mut edits = changes
+                .get(&uris[file])
+                .expect("missing file edits")
+                .clone();
+            edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+            let mut text = sources[file].1.to_string();
+            let li = solsp_ide::LineIndex::new(&text);
+            for edit in edits {
+                let start =
+                    u32::from(solsp_server::to_proto::offset(&li, edit.range.start).unwrap())
+                        as usize;
+                let end = u32::from(solsp_server::to_proto::offset(&li, edit.range.end).unwrap())
+                    as usize;
+                text.replace_range(start..end, &edit.new_text);
+            }
+            assert_eq!(text, expected_text, "{}: {new_name}", sources[file].0);
+        }
+    }
+
+    for (file, line, character) in [(0, 0, 9), (1, 1, 16)] {
+        send_request(
+            &client,
+            2,
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": { "uri": uris[file] },
+                "position": { "line": line, "character": character },
+                "context": { "includeDeclaration": false },
+            }),
+        );
+        let locations: Vec<lsp_types::Location> =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        assert_eq!(locations.len(), 12, "{locations:?}");
+        assert!(locations
+            .iter()
+            .all(|loc| loc.uri != uris[0] && loc.uri != uris[6]));
+        for uri in uris.iter().take(6).skip(1) {
+            assert!(locations
+                .iter()
+                .any(|loc| loc.uri == *uri && loc.range.start.line == 1));
+        }
+    }
+
+    send_request(&client, 3, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn renamed_import_alias_preserves_overload_group() {
+    check_import_alias_overloads("bar");
+}
+
+#[test]
+fn same_spelling_import_alias_preserves_overload_group() {
+    check_import_alias_overloads("foo");
+}
+
+fn check_import_alias_overloads(alias: &str) {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!(
+        "solsp_alias_overloads_{alias}_{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let definitions = "function foo() pure returns (uint256) { return 0; }\nfunction foo(uint256 x) pure returns (uint256) { return x; }\nfunction foo(string memory x) pure returns (uint256) { return 0; }\n";
+    let main = format!("import {{foo as {alias}}} from \"./Functions.sol\";\ncontract Main {{ function run() public pure {{\n    {alias}();\n    {alias}(1);\n    {alias}(\"x\");\n}} }}\n");
+    let namespace = format!("import * as N from \"./Main.sol\";\ncontract Consumer {{ function run() public pure {{ N.{alias}(\"x\"); }} }}\n");
+    let bridge = format!("import {{{alias} as exported}} from \"./Main.sol\";\ncontract Bridge {{ function run() public pure {{ exported(\"x\"); }} }}\n");
+    let sources = [
+        ("Functions.sol", definitions),
+        ("Main.sol", main.as_str()),
+        ("Consumer.sol", namespace.as_str()),
+        ("Bridge.sol", bridge.as_str()),
+    ];
+    let uris: Vec<_> = sources
+        .iter()
+        .map(|(name, text)| {
+            let path = dir.join(name);
+            fs::write(&path, text).unwrap();
+            Url::from_file_path(path).unwrap()
+        })
+        .collect();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    for ((_, text), uri) in sources.iter().zip(&uris) {
+        send_notification(&client, "textDocument/didOpen", open_params(uri, text));
+    }
+
+    // An alias rename is independent of the overload selected by a call. Check
+    // the alias declaration, all calls, and a namespace consumer of the alias.
+    let namespace_col = namespace
+        .lines()
+        .nth(1)
+        .unwrap()
+        .find(&format!("N.{alias}"))
+        .unwrap() as u32
+        + 2;
+    for (file, line, character) in [
+        (1, 0, 15),
+        (1, 2, 4),
+        (1, 3, 4),
+        (1, 4, 4),
+        (2, 1, namespace_col),
+    ] {
+        send_request(
+            &client,
+            1,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": {"uri": uris[file]}, "position": {"line": line, "character": character}, "newName": "renamed"
+            }),
+        );
+        let edit: WorkspaceEdit =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        let changes = edit.changes.unwrap();
+        assert_eq!(changes.len(), 3, "{alias} at {file}:{line}: {changes:?}");
+        for (index, expected) in [
+            (
+                1,
+                main.replacen(&format!("as {alias}"), "as renamed", 1)
+                    .replace(&format!("    {alias}("), "    renamed("),
+            ),
+            (2, namespace.replace(&format!("N.{alias}"), "N.renamed")),
+            (
+                3,
+                bridge.replacen(&format!("{{{alias} as"), "{renamed as", 1),
+            ),
+        ] {
+            let mut edits = changes
+                .get(&uris[index])
+                .expect("missing alias consumer")
+                .clone();
+            edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+            let mut text = sources[index].1.to_string();
+            let li = solsp_ide::LineIndex::new(&text);
+            for edit in edits {
+                let start =
+                    u32::from(solsp_server::to_proto::offset(&li, edit.range.start).unwrap())
+                        as usize;
+                let end = u32::from(solsp_server::to_proto::offset(&li, edit.range.end).unwrap())
+                    as usize;
+                text.replace_range(start..end, &edit.new_text);
+            }
+            assert_eq!(text, expected, "{}", sources[index].0);
+        }
+    }
+
+    // References to a particular overload must include its aliased calls and
+    // exclude calls selecting another overload. The import binds all overloads.
+    for overload in 0..3 {
+        send_request(
+            &client,
+            2,
+            "textDocument/references",
+            serde_json::json!({
+                "textDocument": {"uri": uris[0]}, "position": {"line": overload, "character": 9}, "context": {"includeDeclaration": false}
+            }),
+        );
+        let locations: Vec<lsp_types::Location> =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        let calls: Vec<_> = locations
+            .iter()
+            .filter(|loc| loc.uri == uris[1] && loc.range.start.line >= 2)
+            .collect();
+        assert_eq!(calls.len(), 1, "overload {overload}: {locations:?}");
+        assert_eq!(calls[0].range.start.line, overload + 2);
+        assert_eq!(
+            locations
+                .iter()
+                .filter(|loc| loc.uri == uris[1] && loc.range.start.line == 0)
+                .count(),
+            2
+        );
+        assert_eq!(
+            locations
+                .iter()
+                .any(|loc| loc.uri == uris[2] && loc.range.start.line == 1),
+            overload == 2
+        );
+        assert_eq!(
+            locations
+                .iter()
+                .any(|loc| loc.uri == uris[3] && loc.range.start.line == 1),
+            overload == 2
+        );
+        send_request(
+            &client,
+            3,
+            "textDocument/definition",
+            serde_json::json!({
+                "textDocument": {"uri": uris[1]}, "position": {"line": overload + 2, "character": 4}
+            }),
+        );
+        let loc: lsp_types::Location =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        assert_eq!(loc.uri, uris[0]);
+        assert_eq!(loc.range.start.line, overload);
+    }
+    send_request(&client, 4, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn single_overload_rename_preserves_remaining_imports_and_calls() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!("solsp_split_overload_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let definitions = "function foo() pure returns (uint256) { return 0; }\nfunction foo(uint256 x) pure returns (uint256) { return x; }\nfunction foo(string memory x) pure returns (uint256) { return 0; }\n";
+    let consumers = [
+        (
+            "Same",
+            "import {foo as foo} from \"./Functions.sol\";",
+            "foo",
+            true,
+        ),
+        (
+            "Renamed",
+            "import {foo as bar} from \"./Functions.sol\";",
+            "bar",
+            true,
+        ),
+        (
+            "Consumer",
+            "import * as N from \"./Same.sol\";",
+            "N.foo",
+            false,
+        ),
+        (
+            "Bridge",
+            "import {bar as exported} from \"./Renamed.sol\";",
+            "exported",
+            true,
+        ),
+        (
+            "Direct",
+            "import {foo} from \"./Functions.sol\";",
+            "foo",
+            true,
+        ),
+        ("Glob", "import \"./Functions.sol\";", "foo", false),
+    ];
+    let mut sources = vec![("Functions.sol".to_string(), definitions.to_string())];
+    for (name, import, callee, _) in consumers {
+        sources.push((format!("{name}.sol"), format!("{import}\ncontract {name} {{ function run() public pure {{\n    {callee}();\n    {callee}(1);\n    {callee}(\"x\");\n}} }}\n")));
+    }
+    let uris: Vec<_> = sources
+        .iter()
+        .map(|(name, text)| {
+            let path = dir.join(name);
+            fs::write(&path, text).unwrap();
+            Url::from_file_path(path).unwrap()
+        })
+        .collect();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    for ((_, text), uri) in sources.iter().zip(&uris) {
+        send_notification(&client, "textDocument/didOpen", open_params(uri, text));
+    }
+
+    // The source side of an overloaded import does not select one declaration.
+    send_request(
+        &client,
+        1,
+        "textDocument/rename",
+        serde_json::json!({
+            "textDocument": {"uri": uris[1]}, "position": {"line": 0, "character": 8}, "newName": "hello"
+        }),
+    );
+    assert!(next_response(&client).result.unwrap().is_null());
+
+    for selected in 0..3u32 {
+        send_request(
+            &client,
+            2,
+            "textDocument/rename",
+            serde_json::json!({
+                "textDocument": {"uri": uris[0]}, "position": {"line": selected, "character": 9}, "newName": "hello"
+            }),
+        );
+        let edit: WorkspaceEdit =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        let changes = edit.changes.unwrap();
+        assert_eq!(changes.len(), sources.len(), "{changes:?}");
+        for (index, ((name, original), uri)) in sources.iter().zip(&uris).enumerate() {
+            let mut edits = changes.get(uri).expect("missing overload consumer").clone();
+            edits.sort_by_key(|edit| std::cmp::Reverse(edit.range.start));
+            let mut text = original.clone();
+            let li = solsp_ide::LineIndex::new(&text);
+            for edit in edits {
+                let start =
+                    u32::from(solsp_server::to_proto::offset(&li, edit.range.start).unwrap())
+                        as usize;
+                let end = u32::from(solsp_server::to_proto::offset(&li, edit.range.end).unwrap())
+                    as usize;
+                text.replace_range(start..end, &edit.new_text);
+            }
+            let expected: String = original
+                .lines()
+                .enumerate()
+                .map(|(line, content)| {
+                    let content = if index == 0 && line == selected as usize {
+                        content.replacen("foo", "hello", 1)
+                    } else if index > 0 && line == selected as usize + 2 {
+                        let callee = consumers[index - 1].2;
+                        let renamed = if callee.contains('.') {
+                            "N.hello"
+                        } else {
+                            "hello"
+                        };
+                        content.replacen(callee, renamed, 1)
+                    } else if index > 0 && line == 0 && consumers[index - 1].3 {
+                        content.replacen("} from", ", hello} from", 1)
+                    } else {
+                        content.to_string()
+                    };
+                    format!("{content}\n")
+                })
+                .collect();
+            assert_eq!(text, expected, "{name}, overload {selected}");
+            fs::write(uri.to_file_path().unwrap(), &text).unwrap();
+            send_notification(
+                &client,
+                "textDocument/didChange",
+                change_params(uri, selected as i32 * 2 + 1, &text),
+            );
+        }
+
+        // Validate the resulting program, not just the edit list: every call
+        // must still select its own declaration after the entire edit is applied.
+        for (index, (_, _, callee, _)) in consumers.iter().enumerate() {
+            for overload in 0..3u32 {
+                let character = if callee.contains('.') { 6 } else { 4 };
+                send_request(
+                    &client,
+                    3,
+                    "textDocument/definition",
+                    serde_json::json!({
+                        "textDocument": {"uri": uris[index + 1]}, "position": {"line": overload + 2, "character": character}
+                    }),
+                );
+                let response = next_response(&client);
+                let location: lsp_types::Location =
+                    serde_json::from_value(response.result.unwrap()).unwrap();
+                assert_eq!(location.uri, uris[0]);
+                assert_eq!(
+                    location.range.start.line,
+                    overload,
+                    "{} after renaming overload {selected}",
+                    sources[index + 1].0
+                );
+            }
+        }
+        for ((_, original), uri) in sources.iter().zip(&uris) {
+            send_notification(
+                &client,
+                "textDocument/didChange",
+                change_params(uri, selected as i32 * 2 + 2, original),
+            );
+        }
+    }
+    send_request(&client, 4, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
 fn member_access_resolves_cross_file() {
     use std::fs;
 

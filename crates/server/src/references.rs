@@ -48,8 +48,17 @@ pub(super) fn rename(state: &ServerState, params: RenameParams) -> Option<Worksp
     let offset = to_proto::offset(li, pos.position)?;
     let root = solsp_base_db::parse(state.db(), file).syntax();
     let query_name = solsp_ide::navigation::name_at(&root, offset)?;
-    let target = reference_target_at(state, &uri, &root, offset)?;
-    let locations = reference_locations(state, &query_name, &target, true, false);
+    let symbol = resolve_reference(state, &uri, &root, offset)?;
+    // An import source can denote several overloads. Select a declaration or a
+    // call before renaming one of them; an explicit alias can be renamed as a group.
+    if symbol.alias.is_none() && symbol.definitions.len() > 1 {
+        return None;
+    }
+    let target = symbol.rename_target(state)?;
+    if symbol.alias.is_none() && is_overloaded_file_function(state, &target) {
+        return rename_file_overload(state, &query_name, &target, &params.new_name);
+    }
+    let locations = find_locations(state, &query_name, &target, true, ReferenceMode::Rename);
     if locations.is_empty() {
         return None;
     }
@@ -88,6 +97,165 @@ fn is_valid_rename_identifier(name: &str) -> bool {
     solsp_syntax::SyntaxKind::from_keyword(name).is_none()
 }
 
+fn is_overloaded_file_function(state: &ServerState, target: &RefTarget) -> bool {
+    use solsp_hir::resolve::DefKind;
+    let Some(root) = parse_root(state, &target.uri) else {
+        return false;
+    };
+    let Some(index) = state.file_index(&target.uri) else {
+        return false;
+    };
+    let Some(def) = index
+        .defs
+        .iter()
+        .find(|def| def_name_range(&root, def) == target.range)
+    else {
+        return false;
+    };
+    def.kind == DefKind::Function
+        && index
+            .defs
+            .iter()
+            .filter(|other| other.kind == DefKind::Function && other.name == def.name)
+            .count()
+            > 1
+}
+
+/// Moving one declaration out of an exported overload group splits each named
+/// import on its path. Keep the old binding for the remaining overloads, import
+/// the new name alongside it, and update only uses of the selected declaration.
+fn rename_file_overload(
+    state: &ServerState,
+    query_name: &str,
+    target: &RefTarget,
+    new_name: &str,
+) -> Option<WorkspaceEdit> {
+    use solsp_syntax::SyntaxKind::{IDENT, IMPORT_DIRECTIVE};
+    let mut changes: std::collections::HashMap<Url, Vec<TextEdit>> =
+        std::collections::HashMap::new();
+    if query_name == new_name {
+        return Some(WorkspaceEdit::new(changes));
+    }
+    for location in reference_locations(state, query_name, target, true, false) {
+        let root = parse_root(state, &location.uri)?;
+        let li = state.line_index(&location.uri)?;
+        let start = to_proto::offset(li, location.range.start)?;
+        let token = root
+            .token_at_offset(start)
+            .find(|token| token.kind() == IDENT)?;
+        let edit = if token
+            .parent()
+            .is_some_and(|parent| parent.kind() == IMPORT_DIRECTIVE)
+        {
+            // The alias token continues to bind the old overloads. Only its
+            // source entry requests an additional import for the moved function.
+            let Some(edit) =
+                overload_import_edit(state, &location.uri, token.text_range(), new_name)
+            else {
+                continue;
+            };
+            edit
+        } else {
+            TextEdit::new(location.range, new_name.to_string())
+        };
+        let edits = changes.entry(location.uri).or_default();
+        if !edits.contains(&edit) {
+            edits.push(edit);
+        }
+    }
+    Some(WorkspaceEdit::new(changes))
+}
+
+fn overload_import_edit(
+    state: &ServerState,
+    uri: &Url,
+    source_range: rowan::TextRange,
+    new_name: &str,
+) -> Option<TextEdit> {
+    use solsp_hir::imports::ImportKind;
+    for import in &state.file_index(uri)?.imports {
+        let ImportKind::Named(names) = &import.kind else {
+            continue;
+        };
+        if !names.iter().any(|name| name.name_range == source_range) {
+            continue;
+        }
+        if names
+            .iter()
+            .any(|name| name.name == new_name && name.local() == new_name)
+        {
+            return None;
+        }
+        let last = names.last()?;
+        let insertion = rowan::TextRange::empty(last.alias_range.unwrap_or(last.name_range).end());
+        return Some(TextEdit::new(
+            to_proto::range(state.line_index(uri)?, insertion),
+            format!(", {new_name}"),
+        ));
+    }
+    None
+}
+
+#[derive(Clone, Copy)]
+enum ReferenceMode {
+    Declaration,
+    Rename,
+}
+
+fn is_file_declaration(state: &ServerState, target: &RefTarget) -> bool {
+    let Some(root) = parse_root(state, &target.uri) else {
+        return false;
+    };
+    state.file_index(&target.uri).is_some_and(|index| {
+        index
+            .defs
+            .iter()
+            .any(|def| def_name_range(&root, def) == target.range)
+    })
+}
+
+/// Candidate spellings in this file, not a second symbol resolver. Named imports
+/// expose their source and local names; glob/namespace imports can expose aliases
+/// from another file. Exact resolution below rejects unrelated occurrences.
+fn reference_names(
+    state: &ServerState,
+    uri: &Url,
+    query_name: &str,
+    include_imports: bool,
+) -> std::collections::HashSet<String> {
+    use solsp_hir::imports::ImportKind;
+    let mut names = std::collections::HashSet::from([query_name.to_string()]);
+    if !include_imports {
+        return names;
+    }
+    let mut queue = vec![uri.clone()];
+    let mut visited = std::collections::HashSet::new();
+    while let Some(uri) = queue.pop() {
+        if !visited.insert(uri.clone()) {
+            continue;
+        }
+        let Some(index) = state.file_index(&uri) else {
+            continue;
+        };
+        for import in &index.imports {
+            match &import.kind {
+                ImportKind::Named(bindings) => {
+                    for binding in bindings {
+                        names.insert(binding.name.clone());
+                        names.insert(binding.local().to_string());
+                    }
+                }
+                ImportKind::Glob | ImportKind::Namespace(_) => {
+                    if let Some(target) = &import.target {
+                        queue.push(target.clone());
+                    }
+                }
+            }
+        }
+    }
+    names
+}
+
 pub(crate) fn reference_locations(
     state: &ServerState,
     query_name: &str,
@@ -95,15 +263,51 @@ pub(crate) fn reference_locations(
     include_declaration: bool,
     include_abi_hex: bool,
 ) -> Vec<Location> {
+    let mut locations = find_locations(
+        state,
+        query_name,
+        target,
+        include_declaration,
+        ReferenceMode::Declaration,
+    );
+    if include_abi_hex {
+        if let Some(hex) = reference_abi_hex(state, target) {
+            locations.extend(reference_abi_hex_locations(state, target, &hex));
+        }
+    }
+    locations
+}
+
+fn find_locations(
+    state: &ServerState,
+    query_name: &str,
+    target: &RefTarget,
+    include_declaration: bool,
+    mode: ReferenceMode,
+) -> Vec<Location> {
+    let include_imports =
+        matches!(mode, ReferenceMode::Declaration) && is_file_declaration(state, target);
+    let target_name = if matches!(mode, ReferenceMode::Declaration) {
+        parse_root(state, &target.uri)
+            .and_then(|root| solsp_ide::navigation::name_at(&root, target.range.start()))
+    } else {
+        None
+    };
     let mut locations = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for candidate_uri in state.loaded_uris() {
-        if !state.text_contains(&candidate_uri, query_name) {
-            continue;
-        }
-        let Some(ranges) = state.identifier_ranges(&candidate_uri, query_name) else {
-            continue;
-        };
+        let names = reference_names(
+            state,
+            &candidate_uri,
+            target_name.as_deref().unwrap_or(query_name),
+            include_imports,
+        );
+        let ranges: Vec<_> = names
+            .iter()
+            .filter(|name| state.text_contains(&candidate_uri, name))
+            .filter_map(|name| state.identifier_ranges(&candidate_uri, name))
+            .flatten()
+            .collect();
         if ranges.is_empty() {
             continue;
         }
@@ -115,12 +319,16 @@ pub(crate) fn reference_locations(
         };
         let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
         for range in ranges {
-            let Some(found) =
-                reference_target_at(state, &candidate_uri, &candidate_root, range.start())
+            let Some(symbol) =
+                resolve_reference(state, &candidate_uri, &candidate_root, range.start())
             else {
                 continue;
             };
-            if found != *target {
+            let matches = match mode {
+                ReferenceMode::Declaration => symbol.references(state, target),
+                ReferenceMode::Rename => symbol.rename_target(state).as_ref() == Some(target),
+            };
+            if !matches {
                 continue;
             }
             if !include_declaration && candidate_uri == target.uri && range == target.range {
@@ -137,23 +345,6 @@ pub(crate) fn reference_locations(
                     uri: candidate_uri.clone(),
                     range: to_proto::range(candidate_li, range),
                 });
-            }
-        }
-    }
-    if include_abi_hex {
-        if let Some(hex) = reference_abi_hex(state, target) {
-            for loc in reference_abi_hex_locations(state, target, &hex) {
-                let key = format!(
-                    "{}:{}:{}..{}:{}",
-                    loc.uri,
-                    loc.range.start.line,
-                    loc.range.start.character,
-                    loc.range.end.line,
-                    loc.range.end.character
-                );
-                if seen.insert(key) {
-                    locations.push(loc);
-                }
             }
         }
     }

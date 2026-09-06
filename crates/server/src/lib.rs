@@ -96,25 +96,47 @@ fn reference_target_at(
     root: &solsp_syntax::SyntaxNode,
     offset: rowan::TextSize,
 ) -> Option<RefTarget> {
-    if let Some((turi, def)) = typed_overload_target(state, uri, root, offset) {
-        return definition_target(state, turi, &def);
+    resolve_reference(state, uri, root, offset)?.declaration_target(state)
+}
+
+/// Resolve a use once, preserving its import binding through overload selection.
+/// A name inside an import denotes the whole group; a call denotes its selected
+/// overload. Both keep the same alias identity for rename.
+fn resolve_reference(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<import_resolution::ResolvedSymbol> {
+    use import_resolution::ResolvedSymbol;
+    use solsp_syntax::SyntaxKind::{IDENT, IMPORT_DIRECTIVE};
+    let token = root
+        .token_at_offset(offset)
+        .find(|token| token.kind() == IDENT)?;
+    let parent = token.parent()?;
+    if parent.kind() == IMPORT_DIRECTIVE {
+        return import_resolution::import_symbol_at(state, uri, token.text_range());
     }
-    if let Some(def) = solsp_hir::resolve::definition_at(root, offset) {
-        return Some(RefTarget {
-            uri: uri.clone(),
-            range: def_name_range(root, &def),
-        });
-    }
-    if let Some((turi, def)) = member_resolve(state, uri, root, offset) {
-        return definition_target(state, turi, &def);
-    }
-    if let Some((turi, def)) = inherited_name_at(state, uri, root, offset) {
-        return definition_target(state, turi, &def);
-    }
-    let name = solsp_ide::navigation::name_at(root, offset)?;
-    let arity = arity_at(root, offset);
-    let (turi, def) = cross_file_definition(state, uri, root, &name, arity)?;
-    definition_target(state, turi, &def)
+    let namespace = solsp_hir::resolve::member_access(&parent).and_then(|(receiver, name)| {
+        namespace_target_uri(uri, root, &receiver).map(|target| (target, name))
+    });
+    let mut symbol = if let Some(def) = solsp_hir::resolve::definition_at(root, offset) {
+        ResolvedSymbol::single(uri.clone(), def)
+    } else if let Some((target, name)) = namespace {
+        import_resolution::exported_symbol(state, &target, &name)?
+    } else if let Some((target, def)) = member_resolve(state, uri, root, offset) {
+        ResolvedSymbol::single(target, def)
+    } else if let Some((target, def)) = inherited_name_at(state, uri, root, offset) {
+        ResolvedSymbol::single(target, def)
+    } else {
+        import_resolution::imported_symbol(state, uri, token.text())?
+    };
+    let def = symbol.select_definition(state, arity_at(root, offset))?;
+    let selected =
+        call_resolution::typed_overload_from(state, uri, root, offset, &symbol.uri, &def)
+            .unwrap_or(def);
+    symbol.definitions = vec![selected];
+    Some(symbol)
 }
 
 fn definition_target(

@@ -432,7 +432,7 @@ pub(super) fn signature_help(
     let (def_uri, def) = resolve_named_callee(state, &uri, &root, &callee)?;
     let droot = parse_root(state, &def_uri)?;
     let def_node = def.full_ptr.to_node(&droot);
-    let candidates = signature_candidates(&def, &def_node, &name, &droot);
+    let candidates = signature_candidates(&def, &def_node, &droot);
 
     let active = arg_list
         .children_with_tokens()

@@ -30,6 +30,9 @@ pub struct ImportName {
     pub name: String,
     /// The local alias (`as C`); when absent the symbol keeps `name`.
     pub alias: Option<String>,
+    /// The exported name and optional local alias are distinct rename locations.
+    pub name_range: rowan::TextRange,
+    pub alias_range: Option<rowan::TextRange>,
 }
 
 impl ImportName {
@@ -116,14 +119,22 @@ fn extract_named(toks: &[SyntaxToken]) -> Vec<ImportName> {
     while i < inner.len() {
         if inner[i].kind() == IDENT {
             let name = inner[i].text().to_string();
+            let name_range = inner[i].text_range();
             let mut alias = None;
+            let mut alias_range = None;
             if inner.get(i + 1).map(|t| t.kind()) == Some(AS_KW) {
                 if let Some(b) = inner.get(i + 2).filter(|t| t.kind() == IDENT) {
                     alias = Some(b.text().to_string());
+                    alias_range = Some(b.text_range());
                     i += 2; // consume `as B`
                 }
             }
-            names.push(ImportName { name, alias });
+            names.push(ImportName {
+                name,
+                alias,
+                name_range,
+                alias_range,
+            });
         }
         i += 1; // step past commas / stray tokens
     }
@@ -171,11 +182,24 @@ mod tests {
             ImportKind::Named(vec![
                 ImportName {
                     name: "X".into(),
-                    alias: None
+                    alias: None,
+                    name_range: rowan::TextRange::at(
+                        (src.find("{X").unwrap() as u32 + 1).into(),
+                        1.into()
+                    ),
+                    alias_range: None,
                 },
                 ImportName {
                     name: "Y".into(),
-                    alias: Some("Z".into())
+                    alias: Some("Z".into()),
+                    name_range: rowan::TextRange::at(
+                        (src.find("Y as").unwrap() as u32).into(),
+                        1.into()
+                    ),
+                    alias_range: Some(rowan::TextRange::at(
+                        (src.find("Z}").unwrap() as u32).into(),
+                        1.into()
+                    )),
                 },
             ])
         );

@@ -52,7 +52,7 @@ pub(super) fn positional_arg_label(
     let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
     let droot = parse_root(state, &def_uri)?;
     let def_node = def.full_ptr.to_node(&droot);
-    let candidates = signature_candidates(&def, &def_node, &name, &droot);
+    let candidates = signature_candidates(&def, &def_node, &droot);
     let candidate = select_positional_candidate(state, uri, root, &candidates, &args)?;
     let params = named_arg_fields(candidate.0, &candidate.1);
     let (pname, ptype) = params.get(arg_index)?;
@@ -128,7 +128,6 @@ pub(super) fn callee_display_name(callee: &solsp_syntax::SyntaxNode) -> Option<S
 pub(super) fn signature_candidates(
     def: &solsp_hir::resolve::Definition,
     def_node: &solsp_syntax::SyntaxNode,
-    name: &str,
     droot: &solsp_syntax::SyntaxNode,
 ) -> Vec<(solsp_hir::resolve::DefKind, solsp_syntax::SyntaxNode)> {
     use solsp_hir::resolve::DefKind::{Function, Modifier};
@@ -141,7 +140,7 @@ pub(super) fn signature_candidates(
     };
     let mut nodes: Vec<solsp_syntax::SyntaxNode> = pool
         .into_iter()
-        .filter(|d| d.kind == Function && d.name == name)
+        .filter(|d| d.kind == Function && d.name == def.name)
         .map(|d| d.full_ptr.to_node(droot))
         .collect();
     if nodes.is_empty() {
@@ -178,24 +177,46 @@ pub(super) fn typed_overload_target(
     root: &solsp_syntax::SyntaxNode,
     offset: rowan::TextSize,
 ) -> Option<(Url, solsp_hir::resolve::Definition)> {
-    use solsp_hir::resolve::DefKind;
-    use solsp_syntax::SyntaxKind::{ARG_LIST, CALL_EXPR, NAME_REF};
+    call_at(root, offset)?;
+    let symbol = resolve_reference(state, uri, root, offset)?;
+    let def = symbol.definitions.into_iter().next()?;
+    (def.kind == solsp_hir::resolve::DefKind::Function).then_some((symbol.uri, def))
+}
+
+fn call_at(
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+) -> Option<solsp_syntax::SyntaxNode> {
+    use solsp_syntax::SyntaxKind::{CALL_EXPR, NAME_REF};
     let nr = root
         .token_at_offset(offset)
         .find_map(|t| t.parent_ancestors().find(|n| n.kind() == NAME_REF))?;
     let call = nr.ancestors().find(|n| n.kind() == CALL_EXPR)?;
-    let callee = call.first_child()?;
-    if !callee.text_range().contains(offset) {
-        return None;
-    }
-    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    call.first_child()?
+        .text_range()
+        .contains(offset)
+        .then_some(call)
+}
+
+/// Select by argument types from an already resolved declaration's overloads.
+/// This does not resolve the callee again or alter its import binding.
+pub(super) fn typed_overload_from(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    offset: rowan::TextSize,
+    def_uri: &Url,
+    def: &solsp_hir::resolve::Definition,
+) -> Option<solsp_hir::resolve::Definition> {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::ARG_LIST;
+    let call = call_at(root, offset)?;
     if def.kind != DefKind::Function {
         return None;
     }
-    let droot = parse_root(state, &def_uri)?;
+    let droot = parse_root(state, def_uri)?;
     let def_node = def.full_ptr.to_node(&droot);
-    let name = callee_display_name(&callee)?;
-    let candidates = signature_candidates(&def, &def_node, &name, &droot);
+    let candidates = signature_candidates(def, &def_node, &droot);
     if candidates.len() < 2 {
         return None;
     }
@@ -203,10 +224,9 @@ pub(super) fn typed_overload_target(
     let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
         if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {
             al.children().map(|v| (None, v)).collect()
-        } else if let Some(nal) = call.children().find(|n| n.kind() == NAMED_ARG_LIST) {
-            named_arg_pairs(&nal)
         } else {
-            return None;
+            let nal = call.children().find(|n| n.kind() == NAMED_ARG_LIST)?;
+            named_arg_pairs(&nal)
         };
     let arg_tys: Vec<typecheck::Ty> = args
         .iter()
@@ -234,7 +254,7 @@ pub(super) fn typed_overload_target(
         return None;
     }
     let def = solsp_hir::resolve::definition(node)?;
-    Some((def_uri, def))
+    Some(def)
 }
 
 /// A callable's overloads, each as its parameter `(name, type)` list.
@@ -402,9 +422,8 @@ fn resolve_callee_overloads(
     }
     let droot = parse_root(state, &def_uri)?;
     let def_node = def.full_ptr.to_node(&droot);
-    let name = callee_display_name(callee)?;
     Some(
-        signature_candidates(&def, &def_node, &name, &droot)
+        signature_candidates(&def, &def_node, &droot)
             .into_iter()
             .map(|(_, n)| named_arg_fields(DefKind::Function, &n))
             .collect(),
