@@ -473,6 +473,70 @@ contract Vault is Ownable {\n\
     }
 
     #[test]
+    fn rejects_missing_required_expressions_and_preserves_following_items() {
+        for fragment in [
+            "uint x = ;",
+            "uint x = 1 +;",
+            "uint x = true ? : 2;",
+            "uint x = true ? 1 :;",
+            "uint[1 +] xs;",
+            "function f() public { uint x = ; }",
+            "function f() public { x = ; }",
+            "function f() public { (uint x, uint y) = ; }",
+            "function f() public { return 1 *; }",
+            "function f() public { if () {} }",
+            "function f() public { while () {} }",
+            "function f() public { do {} while (); }",
+            "function f() public { for (uint i = ; ; ) {} }",
+            "function f() public { g(1 +, 2); }",
+            "function f() public { xs[1 +]; }",
+        ] {
+            let src = format!("contract C {{ {fragment} uint tail; function after() public {{}} }} contract Next {{}}");
+            let parsed = parse(&src);
+            assert_eq!(
+                parsed.errors().len(),
+                1,
+                "{fragment}: {:?}",
+                parsed.errors()
+            );
+            let root = parsed.syntax();
+            assert_eq!(root.text().to_string(), src, "{fragment}");
+            let contracts: Vec<_> = root
+                .children()
+                .filter(|node| node.kind() == SyntaxKind::CONTRACT_DEF)
+                .collect();
+            assert_eq!(contracts.len(), 2, "{fragment}");
+            let body = contracts[0]
+                .children()
+                .find(|node| node.kind() == SyntaxKind::CONTRACT_BODY)
+                .expect("contract body");
+            for (kind, name) in [
+                (SyntaxKind::STATE_VAR_DEF, "tail"),
+                (SyntaxKind::FUNCTION_DEF, "after"),
+            ] {
+                assert!(
+                    body.children().any(|node| node.kind() == kind
+                        && node.children().any(|child| child.kind() == SyntaxKind::NAME
+                            && child.text().to_string().trim() == name)),
+                    "lost {name} after {fragment}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn optional_expression_slots_remain_valid() {
+        let src = "contract C { uint[] values; uint x; function g() internal {} \
+                   function f(bytes calldata data) external { \
+                   g(); for (;;) { break; } \
+                   bytes calldata a = data[:]; bytes calldata b = data[:1]; bytes calldata c = data[1:]; \
+                   (uint first, , uint last) = (1, 2, 3); return; } }";
+        let parsed = parse(src);
+        assert!(parsed.errors().is_empty(), "{:?}", parsed.errors());
+        assert_eq!(parsed.syntax().text().to_string(), src);
+    }
+
+    #[test]
     fn parses_expression_precedence_in_initializer() {
         // Precedence: `*` binds tighter than `+`; `**` is right-assoc and binds
         // tightest; parentheses group. Wired through a state-var initializer.

@@ -423,9 +423,12 @@ fn bin_bp(kind: SyntaxKind) -> Option<(u8, Assoc)> {
     Some(r)
 }
 
-/// Parse an expression. Entry point used by statements, initializers, args, etc.
+/// Parse a required expression. Optional grammar slots are guarded by callers.
+/// Leave a missing expression's delimiter for the enclosing rule to consume.
 fn expr(p: &mut Parser) {
-    expr_bp(p, 0);
+    if expr_bp(p, 0).is_none() {
+        p.error("expected an expression");
+    }
 }
 
 /// Precedence-climbing core. Parses an operand via `lhs`, then folds binary,
@@ -435,10 +438,7 @@ fn expr(p: &mut Parser) {
 /// `Some` (via `lhs`), and breaks immediately on a non-operator.
 fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<CompletedMarker> {
     let mut lhs = lhs(p)?;
-    loop {
-        let Some((level, assoc)) = bin_bp(p.current()) else {
-            break;
-        };
+    while let Some((level, assoc)) = bin_bp(p.current()) {
         // Left binding power of this operator level. If it does not exceed the
         // caller's threshold, stop and let the caller fold it.
         let left_bp = level * 2;
@@ -450,9 +450,13 @@ fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<CompletedMarker> {
                 // ternary: `cond ? then : else` — right-assoc (level 2).
                 let m = lhs.precede(p);
                 p.bump(QUESTION);
-                expr_bp(p, left_bp - 1); // then-branch
+                if expr_bp(p, left_bp - 1).is_none() {
+                    p.error("expected an expression after '?'");
+                }
                 p.expect(COLON);
-                expr_bp(p, left_bp - 1); // else-branch
+                if expr_bp(p, left_bp - 1).is_none() {
+                    p.error("expected an expression after ':'");
+                }
                 lhs = m.complete(p, TERNARY_EXPR);
             }
             _ => {
@@ -464,7 +468,9 @@ fn expr_bp(p: &mut Parser, min_bp: u8) -> Option<CompletedMarker> {
                 } else {
                     left_bp - 1
                 };
-                expr_bp(p, rhs_min);
+                if expr_bp(p, rhs_min).is_none() {
+                    p.error("expected an expression after operator");
+                }
                 lhs = m.complete(p, node);
             }
         }

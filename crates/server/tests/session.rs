@@ -81,6 +81,38 @@ fn doc_id(uri: &Url) -> TextDocumentIdentifier {
 }
 
 #[test]
+fn missing_expressions_publish_and_clear_diagnostics() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+    let uri = Url::parse("file:///missing-expressions.sol").unwrap();
+    let broken = "contract C { uint public x = ; uint public y = 1 +; }";
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, broken));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diagnostics: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert_eq!(diagnostics.uri, uri);
+    assert_eq!(diagnostics.diagnostics.len(), 2, "{diagnostics:?}");
+    assert!(diagnostics.diagnostics.iter().all(|diag| diag.severity
+        == Some(lsp_types::DiagnosticSeverity::ERROR)
+        && diag.message.contains("expected an expression")));
+
+    let fixed = "contract C { uint public x = 0; uint public y = 1 + 2; }";
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        change_params(&uri, 1, fixed),
+    );
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diagnostics: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    assert_eq!(diagnostics.uri, uri);
+    assert!(diagnostics.diagnostics.is_empty(), "{diagnostics:?}");
+
+    send_request(&client, 1, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().expect("server thread panicked");
+}
+
+#[test]
 fn full_lsp_session() {
     let (server, client) = Connection::memory();
 
