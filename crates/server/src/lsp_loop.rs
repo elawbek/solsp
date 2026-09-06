@@ -55,59 +55,13 @@ pub fn run_with_root(
     let mut scan_pos = 0usize;
     let mut pending_diagnostics = PendingDiagnostics::default();
 
-    loop {
-        if publish_due_pending_diagnostics(connection, &state, &mut pending_diagnostics)? {
-            continue;
-        }
-
-        let msg = if scan_pos < scan_queue.len() {
-            match connection.receiver.try_recv() {
-                Ok(msg) => msg,
-                Err(crossbeam_channel::TryRecvError::Empty) => {
-                    if let Some(timeout) = pending_diagnostics.time_until_next_due(Instant::now()) {
-                        match connection.receiver.recv_timeout(timeout) {
-                            Ok(msg) => msg,
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
-                        }
-                    } else {
-                        // idle: warm + diagnose the next file, then re-check for messages.
-                        let uri = scan_queue[scan_pos].clone();
-                        let started = std::time::Instant::now();
-                        scan_pos += 1;
-                        state.ensure_loaded(&uri);
-                        state.load_import_graph(&uri);
-                        publish_diagnostics(
-                            connection,
-                            &state,
-                            &uri,
-                            true,
-                            Some(std::time::Duration::from_millis(150)),
-                        )?;
-                        if scan_pos >= scan_queue.len() {
-                            scan_queue = Vec::new(); // done — free the list
-                        }
-                        crate::perf::log_elapsed(
-                            || format!("background scan {}", uri.as_str()),
-                            started,
-                        );
-                        continue;
-                    }
-                }
-                Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
-            }
-        } else if let Some(timeout) = pending_diagnostics.time_until_next_due(Instant::now()) {
-            match connection.receiver.recv_timeout(timeout) {
-                Ok(msg) => msg,
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(()),
-            }
-        } else {
-            match connection.receiver.recv() {
-                Ok(msg) => msg,
-                Err(_) => return Ok(()),
-            }
-        };
+    while let Some(msg) = next_message(
+        connection,
+        &mut state,
+        &mut pending_diagnostics,
+        &mut scan_queue,
+        &mut scan_pos,
+    )? {
         match msg {
             Message::Request(req) => {
                 if connection.handle_shutdown(&req)? {
@@ -140,6 +94,50 @@ pub fn run_with_root(
             }
             Message::Response(_resp) => {}
         }
+    }
+    Ok(())
+}
+
+/// Incoming messages retain FIFO order and take precedence over background work.
+/// Recheck the transport after each file, even when many diagnostics are overdue.
+fn next_message(
+    connection: &Connection,
+    state: &mut ServerState,
+    pending: &mut PendingDiagnostics,
+    scan_queue: &mut Vec<Url>,
+    scan_pos: &mut usize,
+) -> Result<Option<Message>> {
+    loop {
+        match connection.receiver.try_recv() {
+            Ok(message) => return Ok(Some(message)),
+            Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(None),
+            Err(crossbeam_channel::TryRecvError::Empty) => {}
+        }
+        if publish_due_pending_diagnostics(connection, state, pending)? {
+            continue;
+        }
+        if let Some(timeout) = pending.time_until_next_due(Instant::now()) {
+            match connection.receiver.recv_timeout(timeout) {
+                Ok(message) => return Ok(Some(message)),
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return Ok(None),
+            }
+        }
+        if *scan_pos < scan_queue.len() {
+            let uri = scan_queue[*scan_pos].clone();
+            let started = Instant::now();
+            *scan_pos += 1;
+            state.ensure_loaded(&uri);
+            state.load_import_graph(&uri);
+            publish_diagnostics(connection, state, &uri, true, Some(CHANGE_SEMANTIC_BUDGET))?;
+            if *scan_pos >= scan_queue.len() {
+                scan_queue.clear();
+                *scan_pos = 0;
+            }
+            crate::perf::log_elapsed(|| format!("background scan {}", uri.as_str()), started);
+            continue;
+        }
+        return Ok(connection.receiver.recv().ok());
     }
 }
 
@@ -561,6 +559,76 @@ fn import_directive_fingerprint(text: &str) -> Vec<Vec<(solsp_syntax::SyntaxKind
 #[cfg(test)]
 mod tests {
     use super::import_directive_fingerprint;
+
+    #[test]
+    fn queued_messages_preempt_overdue_diagnostics_without_reordering_edits() {
+        use super::*;
+        let (server, client) = Connection::memory();
+        let mut state = ServerState::default();
+        let uri = Url::parse("file:///priority.sol").unwrap();
+        state.open(&uri, "contract Before {}".into());
+        let mut pending = PendingDiagnostics::default();
+        pending.schedule(uri.clone());
+        let overdue = Instant::now();
+        pending.entries.get_mut(&uri).unwrap().syntax_due = Some(overdue);
+        pending.entries.get_mut(&uri).unwrap().semantic_due = Some(overdue);
+        let change = Notification::new(
+            "textDocument/didChange".into(),
+            serde_json::json!({
+                "textDocument": {"uri": uri, "version": 1},
+                "contentChanges": [{"text": "contract After {}"}]
+            }),
+        );
+        let query = Request::new(
+            1.into(),
+            "textDocument/documentSymbol".into(),
+            serde_json::json!({"textDocument": {"uri": uri}}),
+        );
+        client.sender.send(Message::Notification(change)).unwrap();
+        client.sender.send(Message::Request(query)).unwrap();
+        let mut scan_queue = vec![uri.clone()];
+        let mut scan_pos = 0;
+        let Message::Notification(change) = next_message(
+            &server,
+            &mut state,
+            &mut pending,
+            &mut scan_queue,
+            &mut scan_pos,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("didChange must precede the request");
+        };
+        assert!(
+            client.receiver.try_recv().is_err(),
+            "no background publications before queued input"
+        );
+        assert_eq!(pending.entries[&uri].syntax_due, Some(overdue));
+        assert_eq!(scan_pos, 0);
+        handle_notification(&server, &mut state, &mut pending, change).unwrap();
+        let Message::Request(query) = next_message(
+            &server,
+            &mut state,
+            &mut pending,
+            &mut scan_queue,
+            &mut scan_pos,
+        )
+        .unwrap()
+        .unwrap() else {
+            panic!("expected request");
+        };
+        let response = handle_request(&state, query);
+        assert_eq!(response.result.unwrap()[0]["name"], "After");
+        assert!(client.receiver.try_recv().is_err());
+        // Deferred checks remain available and see the edited version.
+        pending.entries.get_mut(&uri).unwrap().syntax_due = Some(overdue);
+        assert!(publish_due_pending_diagnostics(&server, &state, &mut pending).unwrap());
+        let Message::Notification(note) = client.receiver.recv().unwrap() else {
+            panic!("expected diagnostics");
+        };
+        assert_eq!(note.method, "textDocument/publishDiagnostics");
+        assert!(pending.entries[&uri].semantic_due.is_some());
+    }
 
     #[test]
     fn dependent_refresh_preserves_pending_syntax_deadline() {

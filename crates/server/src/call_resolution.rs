@@ -209,7 +209,6 @@ pub(super) fn typed_overload_from(
     def: &solsp_hir::resolve::Definition,
 ) -> Option<solsp_hir::resolve::Definition> {
     use solsp_hir::resolve::DefKind;
-    use solsp_syntax::SyntaxKind::ARG_LIST;
     let call = call_at(root, offset)?;
     if def.kind != DefKind::Function {
         return None;
@@ -220,6 +219,38 @@ pub(super) fn typed_overload_from(
     if candidates.len() < 2 {
         return None;
     }
+    select_call_overload(state, uri, root, &call, &candidates)
+}
+
+/// Resolve return types from the same unique overload selection used by navigation.
+/// An ambiguous call has no inferred return type; never borrow the first overload's.
+pub(super) fn resolve_call_definition(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    call: &solsp_syntax::SyntaxNode,
+) -> Option<(Url, solsp_hir::resolve::Definition)> {
+    use solsp_hir::resolve::DefKind;
+    let callee = call.first_child()?;
+    let (def_uri, def) = resolve_named_callee(state, uri, root, &callee)?;
+    if def.kind != DefKind::Function {
+        return Some((def_uri, def));
+    }
+    let droot = parse_root(state, &def_uri)?;
+    let candidates = signature_candidates(&def, &def.full_ptr.to_node(&droot), &droot);
+    let selected = select_call_overload(state, uri, root, call, &candidates)?;
+    Some((def_uri, selected))
+}
+
+fn select_call_overload(
+    state: &ServerState,
+    uri: &Url,
+    root: &solsp_syntax::SyntaxNode,
+    call: &solsp_syntax::SyntaxNode,
+    candidates: &[(solsp_hir::resolve::DefKind, solsp_syntax::SyntaxNode)],
+) -> Option<solsp_hir::resolve::Definition> {
+    use solsp_hir::resolve::DefKind;
+    use solsp_syntax::SyntaxKind::ARG_LIST;
     use solsp_syntax::SyntaxKind::NAMED_ARG_LIST;
     let args: Vec<(Option<String>, solsp_syntax::SyntaxNode)> =
         if let Some(al) = call.children().find(|n| n.kind() == ARG_LIST) {

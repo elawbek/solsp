@@ -163,7 +163,8 @@ pub(super) fn receiver_value_info(
             }
         }
         // a function call -> its return type. Library helpers may return storage refs.
-        let (duri, def) = resolve_named_callee(state, uri, root, &callee)?;
+        let (duri, def) =
+            crate::call_resolution::resolve_call_definition(state, uri, root, receiver)?;
         let droot = parse_root(state, &duri)?;
         let ret = function_return_param(&def.full_ptr.to_node(&droot))?;
         return Some((type_text(&ret)?, is_storage_decl(&ret)));
@@ -500,9 +501,7 @@ pub(super) fn call_result_type(
     element: bool,
 ) -> Option<(Url, solsp_syntax::SyntaxNode)> {
     use solsp_hir::resolve::DefKind;
-    let callee = call.first_child()?;
-    let arity = arg_count(call);
-    let (def_uri, def) = resolve_callee(state, uri, root, &callee, arity)?;
+    let (def_uri, def) = crate::call_resolution::resolve_call_definition(state, uri, root, call)?;
     let def_root = parse_root(state, &def_uri)?;
     let def_node = def.full_ptr.to_node(&def_root);
     match def.kind {

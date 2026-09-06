@@ -31,79 +31,79 @@ pub(super) fn publish_diagnostics(
             if semantic && parse.errors().is_empty() {
                 let deadline = budget.map(|b| std::time::Instant::now() + b);
                 let root = parse.syntax();
-                extend_timed(&mut diags, "undefined_name", uri, || {
+                extend_timed(&mut diags, "undefined_name", uri, deadline, || {
                     super::name_diagnostics::undefined_name_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "type_check", uri, || {
+                extend_timed(&mut diags, "type_check", uri, deadline, || {
                     super::call_resolution::type_check_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "assignment", uri, || {
+                extend_timed(&mut diags, "assignment", uri, deadline, || {
                     super::type_diagnostics::assignment_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "return_type", uri, || {
+                extend_timed(&mut diags, "return_type", uri, deadline, || {
                     super::type_diagnostics::return_type_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "cast", uri, || {
+                extend_timed(&mut diags, "cast", uri, deadline, || {
                     super::type_diagnostics::cast_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "binary_op", uri, || {
+                extend_timed(&mut diags, "binary_op", uri, deadline, || {
                     super::type_diagnostics::binary_op_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "comparison", uri, || {
+                extend_timed(&mut diags, "comparison", uri, deadline, || {
                     super::type_diagnostics::comparison_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "condition", uri, || {
+                extend_timed(&mut diags, "condition", uri, deadline, || {
                     super::type_diagnostics::condition_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "unreachable", uri, || {
+                extend_timed(&mut diags, "unreachable", uri, deadline, || {
                     super::flow_diagnostics::unreachable_diagnostics(&root, li, deadline)
                 });
-                extend_timed(&mut diags, "mutability", uri, || {
+                extend_timed(&mut diags, "mutability", uri, deadline, || {
                     super::mutability::mutability_diagnostics(state, uri, &root, li, deadline)
                 });
-                extend_timed(&mut diags, "missing_visibility", uri, || {
+                extend_timed(&mut diags, "missing_visibility", uri, deadline, || {
                     super::contract_diagnostics::missing_visibility_diagnostics(&root, li, deadline)
                 });
-                extend_timed(&mut diags, "unused_function", uri, || {
+                extend_timed(&mut diags, "unused_function", uri, deadline, || {
                     super::usage_diagnostics::unused_function_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "unused_state_variable", uri, || {
+                extend_timed(&mut diags, "unused_state_variable", uri, deadline, || {
                     super::usage_diagnostics::unused_state_variable_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "unused_event", uri, || {
+                extend_timed(&mut diags, "unused_event", uri, deadline, || {
                     super::usage_diagnostics::unused_event_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "unused_error", uri, || {
+                extend_timed(&mut diags, "unused_error", uri, deadline, || {
                     super::usage_diagnostics::unused_error_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "abstract_contract", uri, || {
+                extend_timed(&mut diags, "abstract_contract", uri, deadline, || {
                     super::contract_diagnostics::abstract_contract_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "invalid_import", uri, || {
+                extend_timed(&mut diags, "invalid_import", uri, deadline, || {
                     super::import_diagnostics::invalid_import_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "unused_import", uri, || {
+                extend_timed(&mut diags, "unused_import", uri, deadline, || {
                     super::import_diagnostics::unused_import_diagnostics(
                         state, uri, &root, li, deadline,
                     )
                 });
-                extend_timed(&mut diags, "unused_local", uri, || {
+                extend_timed(&mut diags, "unused_local", uri, deadline, || {
                     super::usage_diagnostics::unused_local_diagnostics(&root, li, deadline)
                 });
             }
@@ -147,8 +147,12 @@ fn extend_timed(
     out: &mut Vec<lsp_types::Diagnostic>,
     name: &'static str,
     uri: &Url,
+    deadline: Option<std::time::Instant>,
     f: impl FnOnce() -> Vec<lsp_types::Diagnostic>,
 ) {
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return;
+    }
     let started = std::time::Instant::now();
     let mut diagnostics = f();
     let count = diagnostics.len();
@@ -173,4 +177,31 @@ pub(super) fn send_diagnostics(
     let not = Notification::new(PublishDiagnostics::METHOD.to_string(), params);
     connection.sender.send(Message::Notification(not))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expired_budget_does_not_start_another_phase() {
+        let uri = Url::parse("file:///budget.sol").unwrap();
+        let mut diagnostics = Vec::new();
+        extend_timed(
+            &mut diagnostics,
+            "test",
+            &uri,
+            Some(std::time::Instant::now()),
+            || {
+                panic!("an expired phase must not run its setup or tree walks");
+            },
+        );
+        assert!(diagnostics.is_empty());
+        let mut ran = false;
+        extend_timed(&mut diagnostics, "test", &uri, None, || {
+            ran = true;
+            Vec::new()
+        });
+        assert!(ran, "unbudgeted save checks still run");
+    }
 }

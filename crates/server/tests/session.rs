@@ -6283,6 +6283,51 @@ fn new_array_argument_is_not_a_false_positive() {
 }
 
 #[test]
+fn named_overload_results_do_not_hide_real_assignment_errors() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).unwrap());
+    let uri = Url::parse("file:///named-overload-results.sol").unwrap();
+    let source = r#"interface Vm {
+        function envOr(string calldata name, bool defaultValue) external view returns (bool);
+        function envOr(string calldata name, uint256 defaultValue) external view returns (uint256);
+        function unixTime() external view returns (uint256);
+    }
+    contract C { Vm vm;
+        function run(uint timestamp) public view {
+            uint a = vm.envOr({name: "a", defaultValue: vm.unixTime() / 1000});
+            uint b = vm.envOr({defaultValue: timestamp / 15, name: "b"});
+            bool c = vm.envOr({name: "c", defaultValue: true});
+            uint wrongUint = vm.envOr({name: "d", defaultValue: true});
+            bool wrongBool = vm.envOr({name: "e", defaultValue: timestamp});
+        }
+    }"#;
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, source));
+    let note = next_notification(&client, "textDocument/publishDiagnostics");
+    let diagnostics: PublishDiagnosticsParams = serde_json::from_value(note.params).unwrap();
+    let errors: Vec<_> = diagnostics
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Some(lsp_types::DiagnosticSeverity::ERROR))
+        .collect();
+    assert_eq!(errors.len(), 2, "{diagnostics:?}");
+    for (error, marker) in errors.iter().zip(["uint wrongUint", "bool wrongBool"]) {
+        assert!(
+            error.message.contains("not implicitly convertible"),
+            "{error:?}"
+        );
+        let expected = source
+            .lines()
+            .position(|line| line.contains(marker))
+            .unwrap() as u32;
+        assert_eq!(error.range.start.line, expected);
+    }
+    send_request(&client, 1, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn undefined_name_is_diagnosed() {
     let uri = Url::parse("file:///un.sol").unwrap();
     // `bar` is never declared; `foo`, the parameter `p`, the builtin `require`, and the

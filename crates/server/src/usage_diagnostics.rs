@@ -27,15 +27,19 @@ pub(super) fn unused_function_diagnostics(
         let Some(name) = function_name(&function) else {
             continue;
         };
-        if overridden_base_function_is_referenced(state, uri, root, &function, &name) {
-            continue;
+        match overridden_base_function_is_referenced(state, uri, root, &function, &name, deadline) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => break,
         }
         let target = RefTarget {
             uri: uri.clone(),
             range: function_name_range(&function),
         };
-        if has_reference_count_at_least(state, &name, &target, 2, true, false) {
-            continue;
+        match has_reference_count_at_least(state, &name, &target, 2, true, false, deadline) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => break,
         }
         out.push(lsp_types::Diagnostic {
             range: to_proto::range(li, target.range),
@@ -81,8 +85,10 @@ pub(super) fn unused_state_variable_diagnostics(
             uri: uri.clone(),
             range: declaration_name_range(&var),
         };
-        if has_reference_count_at_least(state, &name, &target, 2, true, false) {
-            continue;
+        match has_reference_count_at_least(state, &name, &target, 2, true, false, deadline) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => break,
         }
         out.push(lsp_types::Diagnostic {
             range: to_proto::range(li, target.range),
@@ -120,8 +126,10 @@ pub(super) fn unused_event_diagnostics(
             uri: uri.clone(),
             range: declaration_name_range(&event),
         };
-        if has_reference_count_at_least(state, &name, &target, 2, true, true) {
-            continue;
+        match has_reference_count_at_least(state, &name, &target, 2, true, true, deadline) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => break,
         }
         if abi::event_topic_hex(&event).is_some_and(|topic| abi::yul_contains_hex(root, &topic)) {
             continue;
@@ -162,8 +170,10 @@ pub(super) fn unused_error_diagnostics(
             uri: uri.clone(),
             range: declaration_name_range(&error),
         };
-        if has_reference_count_at_least(state, &name, &target, 2, true, true) {
-            continue;
+        match has_reference_count_at_least(state, &name, &target, 2, true, true, deadline) {
+            Some(true) => continue,
+            Some(false) => {}
+            None => break,
         }
         if abi::error_selector_hex(&error)
             .is_some_and(|selector| abi::yul_contains_hex(root, &selector))
@@ -236,26 +246,27 @@ fn overridden_base_function_is_referenced(
     root: &solsp_syntax::SyntaxNode,
     function: &solsp_syntax::SyntaxNode,
     name: &str,
-) -> bool {
+    deadline: Option<std::time::Instant>,
+) -> Option<bool> {
     if !function_has_override(function) {
-        return false;
+        return Some(false);
     }
     let Some(arity) = function_arity(function) else {
-        return false;
+        return Some(false);
     };
     let Some(contract) = enclosing_contract(function) else {
-        return false;
+        return Some(false);
     };
     let Some((base_uri, base_root, base_def)) =
         overridden_base_function(state, uri, root, &contract, name, arity)
     else {
-        return false;
+        return Some(false);
     };
     let target = RefTarget {
         uri: base_uri,
         range: def_name_range(&base_root, &base_def),
     };
-    has_reference_count_at_least(state, name, &target, 1, false, false)
+    has_reference_count_at_least(state, name, &target, 1, false, false, deadline)
 }
 
 fn overridden_base_function(

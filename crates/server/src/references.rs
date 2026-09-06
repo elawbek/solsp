@@ -214,12 +214,12 @@ fn is_file_declaration(state: &ServerState, target: &RefTarget) -> bool {
     })
 }
 
-/// Candidate spellings in this file, not a second symbol resolver. Named imports
-/// expose their source and local names; glob/namespace imports can expose aliases
-/// from another file. Exact resolution below rejects unrelated occurrences.
+/// A conservative set of spellings of the queried symbol. Follow alias renames
+/// across loaded imports once, rather than adding every imported name for every
+/// candidate file. This is only a lexical filter: exact resolution below still
+/// rejects unrelated symbols, shadowing and aliases from unrelated import paths.
 fn reference_names(
     state: &ServerState,
-    uri: &Url,
     query_name: &str,
     include_imports: bool,
 ) -> std::collections::HashSet<String> {
@@ -228,28 +228,30 @@ fn reference_names(
     if !include_imports {
         return names;
     }
-    let mut queue = vec![uri.clone()];
-    let mut visited = std::collections::HashSet::new();
-    while let Some(uri) = queue.pop() {
-        if !visited.insert(uri.clone()) {
-            continue;
-        }
+    let mut aliases: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    for uri in state.loaded_uris() {
         let Some(index) = state.file_index(&uri) else {
             continue;
         };
         for import in &index.imports {
-            match &import.kind {
-                ImportKind::Named(bindings) => {
-                    for binding in bindings {
-                        names.insert(binding.name.clone());
-                        names.insert(binding.local().to_string());
+            if let ImportKind::Named(bindings) = &import.kind {
+                for binding in bindings {
+                    if let Some(alias) = &binding.alias {
+                        aliases
+                            .entry(binding.name.clone())
+                            .or_default()
+                            .push(alias.clone());
                     }
                 }
-                ImportKind::Glob | ImportKind::Namespace(_) => {
-                    if let Some(target) = &import.target {
-                        queue.push(target.clone());
-                    }
-                }
+            }
+        }
+    }
+    let mut queue = vec![query_name.to_string()];
+    while let Some(name) = queue.pop() {
+        for alias in aliases.get(&name).into_iter().flatten() {
+            if names.insert(alias.clone()) {
+                queue.push(alias.clone());
             }
         }
     }
@@ -295,13 +297,12 @@ fn find_locations(
     };
     let mut locations = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let names = reference_names(
+        state,
+        target_name.as_deref().unwrap_or(query_name),
+        include_imports,
+    );
     for candidate_uri in state.loaded_uris() {
-        let names = reference_names(
-            state,
-            &candidate_uri,
-            target_name.as_deref().unwrap_or(query_name),
-            include_imports,
-        );
         let Some(index) = state.identifier_index(&candidate_uri) else {
             continue;
         };
@@ -354,6 +355,7 @@ fn find_locations(
     locations
 }
 
+/// `None` means the diagnostic budget expired; it must not imply "unused".
 pub(crate) fn has_reference_count_at_least(
     state: &ServerState,
     query_name: &str,
@@ -361,14 +363,21 @@ pub(crate) fn has_reference_count_at_least(
     min_count: usize,
     include_declaration: bool,
     include_abi_hex: bool,
-) -> bool {
+    deadline: Option<std::time::Instant>,
+) -> Option<bool> {
     if min_count == 0 {
-        return true;
+        return Some(true);
     }
 
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return None;
+    }
     let mut count = 0usize;
     let mut seen = std::collections::HashSet::new();
     for candidate_uri in state.loaded_uris() {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return None;
+        }
         let Some(index) = state.identifier_index(&candidate_uri) else {
             continue;
         };
@@ -383,6 +392,9 @@ pub(crate) fn has_reference_count_at_least(
         };
         let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
         for &range in ranges {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return None;
+            }
             let Some(found) =
                 reference_target_at(state, &candidate_uri, &candidate_root, range.start())
             else {
@@ -402,7 +414,7 @@ pub(crate) fn has_reference_count_at_least(
             if seen.insert(key) {
                 count += 1;
                 if count >= min_count {
-                    return true;
+                    return Some(true);
                 }
             }
         }
@@ -410,7 +422,7 @@ pub(crate) fn has_reference_count_at_least(
 
     if include_abi_hex {
         if let Some(hex) = reference_abi_hex(state, target) {
-            for loc in reference_abi_hex_locations(state, target, &hex) {
+            for loc in reference_abi_hex_locations_until(state, target, &hex, deadline)? {
                 let key = (
                     loc.uri.to_string(),
                     loc.range.start.line,
@@ -419,14 +431,18 @@ pub(crate) fn has_reference_count_at_least(
                 if seen.insert(key) {
                     count += 1;
                     if count >= min_count {
-                        return true;
+                        return Some(true);
                     }
                 }
             }
         }
     }
 
-    false
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        None
+    } else {
+        Some(false)
+    }
 }
 
 fn reference_abi_hex(state: &ServerState, target: &RefTarget) -> Option<String> {
@@ -451,12 +467,27 @@ fn reference_abi_hex_locations(
     target: &RefTarget,
     hex: &str,
 ) -> Vec<Location> {
+    reference_abi_hex_locations_until(state, target, hex, None).unwrap_or_default()
+}
+
+fn reference_abi_hex_locations_until(
+    state: &ServerState,
+    target: &RefTarget,
+    hex: &str,
+    deadline: Option<std::time::Instant>,
+) -> Option<Vec<Location>> {
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        return None;
+    }
     let Some((target_owner_uri, target_owner_name)) = reference_abi_owner(state, target) else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for candidate_uri in state.loaded_uris() {
+        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+            return None;
+        }
         let Some(candidate_file) = state.file(&candidate_uri) else {
             continue;
         };
@@ -465,6 +496,9 @@ fn reference_abi_hex_locations(
         };
         let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
         for range in abi::yul_hex_ranges(&candidate_root, hex) {
+            if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                return None;
+            }
             let Some(contract) = node_at_range(&candidate_root, range).and_then(|node| {
                 node.ancestors()
                     .find(|ancestor| ancestor.kind() == solsp_syntax::SyntaxKind::CONTRACT_DEF)
@@ -495,7 +529,11 @@ fn reference_abi_hex_locations(
             }
         }
     }
-    out
+    if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+        None
+    } else {
+        Some(out)
+    }
 }
 
 fn reference_abi_owner(state: &ServerState, target: &RefTarget) -> Option<(Url, String)> {
@@ -769,4 +807,99 @@ pub(super) fn code_lens_resolve(state: &ServerState, mut lens: CodeLens) -> Code
         })]),
     });
     lens
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+
+    #[test]
+    fn candidate_spellings_follow_alias_chains_without_unrelated_imports() {
+        let mut state = ServerState::default();
+        for (name, text) in [
+            (
+                "A",
+                "import {Oracle as First, Other as Noise} from './Source.sol';",
+            ),
+            ("B", "import {First as Second} from './A.sol';"),
+            ("C", "import {Second as First} from './B.sol';"),
+        ] {
+            state.set(
+                &Url::parse(&format!("file:///{name}.sol")).unwrap(),
+                text.into(),
+            );
+        }
+        assert_eq!(
+            reference_names(&state, "Oracle", true),
+            ["Oracle", "First", "Second"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+        assert_eq!(
+            reference_names(&state, "Oracle", false),
+            ["Oracle"].into_iter().map(str::to_string).collect()
+        );
+        state.set(
+            &Url::parse("file:///A.sol").unwrap(),
+            "import {Oracle as Changed} from './Source.sol';".into(),
+        );
+        assert_eq!(
+            reference_names(&state, "Oracle", true),
+            ["Oracle", "Changed"]
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        );
+    }
+
+    #[test]
+    fn incomplete_reference_scan_is_not_reported_as_unused() {
+        let mut state = ServerState::default();
+        let uri = Url::parse("file:///reference-budget.sol").unwrap();
+        state.set(&uri, "contract C { function used() internal {} function run() public { used(); } function unused() private {} }".into());
+        let root = parse_root(&state, &uri).unwrap();
+        let token = root
+            .descendants_with_tokens()
+            .filter_map(|el| el.into_token())
+            .find(|token| token.text() == "used")
+            .unwrap();
+        let target = RefTarget {
+            uri: uri.clone(),
+            range: token.text_range(),
+        };
+        assert_eq!(
+            has_reference_count_at_least(
+                &state,
+                "used",
+                &target,
+                2,
+                true,
+                false,
+                Some(std::time::Instant::now())
+            ),
+            None
+        );
+        assert_eq!(
+            has_reference_count_at_least(&state, "used", &target, 2, true, false, None),
+            Some(true)
+        );
+        assert_eq!(
+            has_reference_count_at_least(&state, "used", &target, 3, true, false, None),
+            Some(false)
+        );
+        let li = state.line_index(&uri).unwrap();
+        let expired = crate::usage_diagnostics::unused_function_diagnostics(
+            &state,
+            &uri,
+            &root,
+            li,
+            Some(std::time::Instant::now()),
+        );
+        assert!(expired.is_empty());
+        let complete =
+            crate::usage_diagnostics::unused_function_diagnostics(&state, &uri, &root, li, None);
+        assert_eq!(complete.len(), 1);
+        assert!(complete[0].message.contains("unused()"));
+    }
 }
