@@ -77,14 +77,22 @@ impl LineIndex {
             .unwrap_or(self.text.len());
         let mut utf16: u32 = 0;
         let mut byte = line_start;
-        for c in self.text[line_start..line_end].chars() {
+        // A line-start boundary includes the preceding line's terminator. LSP
+        // columns address content only, so never count LF or either byte of CRLF.
+        let line_text = &self.text[line_start..line_end];
+        let content = if let Some(without_lf) = line_text.strip_suffix('\n') {
+            without_lf.strip_suffix('\r').unwrap_or(without_lf)
+        } else {
+            line_text
+        };
+        for c in content.chars() {
             if utf16 >= line_col.col {
                 break;
             }
             utf16 += c.len_utf16() as u32;
             byte += c.len_utf8();
         }
-        Some(TextSize::from(byte.min(line_end) as u32))
+        Some(TextSize::from(byte as u32))
     }
 }
 
@@ -107,6 +115,53 @@ mod tests {
             Some(TextSize::from(4))
         );
         assert_eq!(li.offset(LineCol { line: 5, col: 0 }), None); // line past EOF
+    }
+
+    #[test]
+    fn oversized_columns_stop_before_line_endings() {
+        for ending in ["\n", "\r\n"] {
+            for content in ["", "abc", "é🌍"] {
+                let text = format!("{content}{ending}next{ending}");
+                let index = LineIndex::new(&text);
+                let utf16_len = content.encode_utf16().count() as u32;
+                for col in [utf16_len, utf16_len + 1, u32::MAX] {
+                    assert_eq!(
+                        index.offset(LineCol { line: 0, col }),
+                        Some(TextSize::from(content.len() as u32)),
+                        "{text:?}, column {col}"
+                    );
+                }
+                assert_eq!(
+                    index.offset(LineCol {
+                        line: 1,
+                        col: u32::MAX
+                    }),
+                    Some(TextSize::from((content.len() + ending.len() + 4) as u32))
+                );
+                assert_eq!(
+                    index.offset(LineCol {
+                        line: 2,
+                        col: u32::MAX
+                    }),
+                    Some(TextSize::from(text.len() as u32))
+                );
+                assert_eq!(index.offset(LineCol { line: 3, col: 0 }), None);
+            }
+        }
+        for text in ["", "plain", "é🌍"] {
+            assert_eq!(
+                LineIndex::new(text).offset(LineCol {
+                    line: 0,
+                    col: u32::MAX
+                }),
+                Some(TextSize::from(text.len() as u32))
+            );
+        }
+        // Preserve the existing forward clamp inside a UTF-16 surrogate pair.
+        assert_eq!(
+            LineIndex::new("🌍\r\nnext").offset(LineCol { line: 0, col: 1 }),
+            Some(TextSize::from(4))
+        );
     }
 
     #[test]

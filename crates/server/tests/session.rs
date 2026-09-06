@@ -304,6 +304,64 @@ fn incremental_change(
 }
 
 #[test]
+fn oversized_columns_in_edits_preserve_the_following_line() {
+    for ending in ["\n", "\r\n"] {
+        let (server, client) = Connection::memory();
+        let server_thread = thread::spawn(move || solsp_server::run(&server).expect("run"));
+        let uri = Url::parse("file:///oversized-column.sol").unwrap();
+        let source = format!("// remove this 🌍{ending}contract Keep {{}}{ending}");
+        send_notification(&client, "textDocument/didOpen", open_params(&uri, &source));
+        // A range beyond the first line's content must not delete its line ending.
+        // The next edit is relative to that result and renames the second-line contract.
+        send_notification(
+            &client,
+            "textDocument/didChange",
+            DidChangeTextDocumentParams {
+                text_document: VersionedTextDocumentIdentifier {
+                    uri: uri.clone(),
+                    version: 1,
+                },
+                content_changes: vec![
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range::new(Position::new(0, 0), Position::new(0, 999))),
+                        range_length: None,
+                        text: String::new(),
+                    },
+                    TextDocumentContentChangeEvent {
+                        range: Some(Range::new(Position::new(1, 9), Position::new(1, 13))),
+                        range_length: None,
+                        text: "Safe".into(),
+                    },
+                ],
+            },
+        );
+        send_request(
+            &client,
+            1,
+            "textDocument/documentSymbol",
+            DocumentSymbolParams {
+                text_document: doc_id(&uri),
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        );
+        let response = next_response(&client);
+        let symbols: DocumentSymbolResponse =
+            serde_json::from_value(response.result.unwrap()).unwrap();
+        let DocumentSymbolResponse::Nested(symbols) = symbols else {
+            panic!("expected nested symbols");
+        };
+        assert_eq!(symbols.len(), 1, "{ending:?}: {symbols:?}");
+        assert_eq!(symbols[0].name, "Safe", "{ending:?}: {symbols:?}");
+        assert_eq!(symbols[0].selection_range.start, Position::new(1, 9));
+        send_request(&client, 2, "shutdown", serde_json::Value::Null);
+        let _ = next_response(&client);
+        send_notification(&client, "exit", serde_json::Value::Null);
+        server_thread.join().expect("server thread panicked");
+    }
+}
+
+#[test]
 fn incremental_edit_updates_diagnostics() {
     let (server, client) = Connection::memory();
     let server_thread = thread::spawn(move || {
