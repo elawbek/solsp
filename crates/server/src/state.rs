@@ -88,7 +88,7 @@ type MemberCache = HashMap<String, HashMap<rowan::TextRange, MemberDefs>>;
 pub type TypeKey = (String, String, Option<rowan::TextRange>);
 /// A resolved type name → the file it lives in and its definition (`None` = unresolved).
 type TypeCache = HashMap<TypeKey, Option<(Url, Definition)>>;
-type IdentifierIndex = HashMap<String, Vec<rowan::TextRange>>;
+pub(super) type IdentifierIndex = HashMap<String, Vec<rowan::TextRange>>;
 type ImportDirCache = HashMap<PathBuf, (Instant, Rc<Vec<ImportPathEntry>>)>;
 
 impl ServerState {
@@ -206,9 +206,15 @@ impl ServerState {
 
     /// Exact identifier token ranges for `name` in a tracked file, using a per-file index.
     pub fn identifier_ranges(&self, uri: &Url, name: &str) -> Option<Vec<rowan::TextRange>> {
-        let key = uri.to_string();
-        if let Some(index) = self.identifier_cache.borrow().get(&key) {
-            return Some(index.get(name).cloned().unwrap_or_default());
+        self.identifier_index(uri)
+            .map(|index| index.get(name).cloned().unwrap_or_default())
+    }
+
+    /// Share the immutable token index so repeated searches neither rescan text
+    /// nor copy occurrence lists. `set` and `remove` invalidate only this file.
+    pub(super) fn identifier_index(&self, uri: &Url) -> Option<Rc<IdentifierIndex>> {
+        if let Some(index) = self.identifier_cache.borrow().get(uri.as_str()) {
+            return Some(index.clone());
         }
 
         let file = self.file(uri)?;
@@ -226,9 +232,10 @@ impl ServerState {
         }
 
         let index = Rc::new(index);
-        let ranges = index.get(name).cloned().unwrap_or_default();
-        self.identifier_cache.borrow_mut().insert(key, index);
-        Some(ranges)
+        self.identifier_cache
+            .borrow_mut()
+            .insert(uri.to_string(), index.clone());
+        Some(index)
     }
 
     /// Cached directory entries used by import-path completion.
@@ -581,6 +588,35 @@ fn load_remappings(root: &Path) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identifier_indexes_are_shared_and_invalidated_per_file() {
+        let mut state = ServerState::default();
+        let a = Url::parse("file:///A.sol").unwrap();
+        let b = Url::parse("file:///B.sol").unwrap();
+        state.set(&a, "contract Alpha {} // Beta".into());
+        state.set(&b, "contract Other {}".into());
+        let original = state.identifier_index(&a).unwrap();
+        let unrelated = state.identifier_index(&b).unwrap();
+        assert!(Rc::ptr_eq(&original, &state.identifier_index(&a).unwrap()));
+        assert!(original.contains_key("Alpha"));
+        assert!(
+            !original.contains_key("Beta"),
+            "comments are not identifier occurrences"
+        );
+        state.set(&a, "contract Beta {}".into());
+        let updated = state.identifier_index(&a).unwrap();
+        assert!(!Rc::ptr_eq(&original, &updated));
+        assert!(!updated.contains_key("Alpha"));
+        assert!(updated.contains_key("Beta"));
+        assert!(Rc::ptr_eq(&unrelated, &state.identifier_index(&b).unwrap()));
+        state.remove(&a);
+        assert!(state.identifier_index(&a).is_none());
+        state.set(&a, "contract Restored {}".into());
+        let restored = state.identifier_index(&a).unwrap();
+        assert!(restored.contains_key("Restored"));
+        assert!(!restored.contains_key("Beta"));
+    }
 
     #[test]
     fn remappings_select_longest_prefix_before_checking_files() {

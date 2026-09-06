@@ -1434,6 +1434,97 @@ fn watched_file_change_reloads_imported_contract_index() {
 }
 
 #[test]
+fn references_refresh_after_editor_edits_and_disk_changes() {
+    use std::fs;
+
+    let dir = std::env::temp_dir().join(format!("solsp_reference_index_{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("Main.sol");
+    let original = "contract Main { function needle() public pure returns (uint) { return 1; } function run() public pure returns (uint) { return needle(); } }";
+    let changed = original.replace("return needle();", "needle(); return needle();");
+    fs::write(&path, original).unwrap();
+    let uri = Url::from_file_path(fs::canonicalize(&path).unwrap()).unwrap();
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).unwrap());
+    send_notification(&client, "textDocument/didOpen", open_params(&uri, original));
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(
+            &Url::parse("file:///unrelated-references.sol").unwrap(),
+            "contract Other { function needle() public {} function run() public { needle(); } }",
+        ),
+    );
+    let references = |id: i32, expected: Option<usize>| {
+        send_request(
+            &client,
+            id,
+            "textDocument/references",
+            ReferenceParams {
+                text_document_position: TextDocumentPositionParams {
+                    text_document: doc_id(&uri),
+                    position: Position::new(0, original.find("needle").unwrap() as u32),
+                },
+                context: ReferenceContext {
+                    include_declaration: true,
+                },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            },
+        );
+        let locations: Option<Vec<lsp_types::Location>> =
+            serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+        assert_eq!(locations.as_ref().map(Vec::len), expected, "{locations:?}");
+        if let Some(locations) = locations {
+            assert!(
+                locations.iter().all(|location| location.uri == uri),
+                "foreign same-name symbol leaked into references"
+            );
+        }
+    };
+    let watched = |typ| {
+        send_notification(
+            &client,
+            "workspace/didChangeWatchedFiles",
+            lsp_types::DidChangeWatchedFilesParams {
+                changes: vec![lsp_types::FileEvent {
+                    uri: uri.clone(),
+                    typ,
+                }],
+            },
+        )
+    };
+    references(1, Some(2));
+    references(2, Some(2)); // reuse the warmed indexes
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        change_params(&uri, 1, &changed),
+    );
+    references(3, Some(3));
+    send_notification(
+        &client,
+        "textDocument/didClose",
+        serde_json::json!({"textDocument": {"uri": uri}}),
+    );
+    references(4, Some(2));
+    fs::write(&path, changed).unwrap();
+    watched(lsp_types::FileChangeType::CHANGED);
+    references(5, Some(3));
+    fs::remove_file(&path).unwrap();
+    watched(lsp_types::FileChangeType::DELETED);
+    references(6, None);
+    fs::write(&path, original).unwrap();
+    watched(lsp_types::FileChangeType::CREATED);
+    references(7, Some(2));
+    send_request(&client, 8, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().unwrap();
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn same_file_references() {
     let uri = Url::parse("file:///refs.sol").unwrap();
     let src = "contract C { uint256 stored; function f() public { stored = 1; uint256 storedLocal = stored; } }";

@@ -302,13 +302,16 @@ fn find_locations(
             target_name.as_deref().unwrap_or(query_name),
             include_imports,
         );
-        let ranges: Vec<_> = names
+        let Some(index) = state.identifier_index(&candidate_uri) else {
+            continue;
+        };
+        let mut ranges = names
             .iter()
-            .filter(|name| state.text_contains(&candidate_uri, name))
-            .filter_map(|name| state.identifier_ranges(&candidate_uri, name))
+            .filter_map(|name| index.get(name))
             .flatten()
-            .collect();
-        if ranges.is_empty() {
+            .copied()
+            .peekable();
+        if ranges.peek().is_none() {
             continue;
         }
         let Some(candidate_file) = state.file(&candidate_uri) else {
@@ -366,10 +369,10 @@ pub(crate) fn has_reference_count_at_least(
     let mut count = 0usize;
     let mut seen = std::collections::HashSet::new();
     for candidate_uri in state.loaded_uris() {
-        if !state.text_contains(&candidate_uri, query_name) {
+        let Some(index) = state.identifier_index(&candidate_uri) else {
             continue;
-        }
-        let Some(ranges) = state.identifier_ranges(&candidate_uri, query_name) else {
+        };
+        let Some(ranges) = index.get(query_name) else {
             continue;
         };
         if ranges.is_empty() {
@@ -379,7 +382,7 @@ pub(crate) fn has_reference_count_at_least(
             continue;
         };
         let candidate_root = solsp_base_db::parse(state.db(), candidate_file).syntax();
-        for range in ranges {
+        for &range in ranges {
             let Some(found) =
                 reference_target_at(state, &candidate_uri, &candidate_root, range.start())
             else {
