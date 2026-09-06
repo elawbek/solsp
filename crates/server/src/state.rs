@@ -96,8 +96,13 @@ impl ServerState {
     /// Reuse its salsa input so the revision bump invalidates exactly its dependents,
     /// and rebuild the line index.
     pub fn set(&mut self, uri: &Url, text: String) {
-        let key = uri.to_string();
         let line_index = LineIndex::new(&text);
+        self.set_with_line_index(uri, text, line_index);
+    }
+
+    /// Store a document and an already updated index after an edit batch.
+    pub(super) fn set_with_line_index(&mut self, uri: &Url, text: String, line_index: LineIndex) {
+        let key = uri.to_string();
         // the file's tree changes → its cached indexes are stale, and any resolved type
         // pointing into it (from anywhere) too.
         self.index_cache.borrow_mut().remove(&key);

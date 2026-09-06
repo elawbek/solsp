@@ -304,6 +304,79 @@ fn incremental_change(
 }
 
 #[test]
+fn mixed_edit_batch_keeps_document_text_and_index_in_sync() {
+    let (server, client) = Connection::memory();
+    let server_thread = thread::spawn(move || solsp_server::run(&server).unwrap());
+    let uri = Url::parse("file:///mixed-edit-batch.sol").unwrap();
+    send_notification(
+        &client,
+        "textDocument/didOpen",
+        open_params(&uri, "contract Original {}"),
+    );
+    let edit = |start, end, text: &str| TextDocumentContentChangeEvent {
+        range: Some(Range::new(start, end)),
+        range_length: None,
+        text: text.into(),
+    };
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 1,
+            },
+            content_changes: vec![
+                edit(Position::new(0, 9), Position::new(0, 17), "Discarded"),
+                TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: "// 🌍\r\ncontract Old {}\r\n".into(),
+                },
+                edit(Position::new(0, 3), Position::new(0, 5), "é😀"),
+                edit(Position::new(1, 9), Position::new(1, 12), "New"),
+                edit(Position::new(0, 0), Position::new(0, 0), "\r\n"),
+                edit(Position::new(2, 9), Position::new(2, 12), "Final"),
+            ],
+        },
+    );
+    // A subsequent notification must use the final index from the whole batch.
+    send_notification(
+        &client,
+        "textDocument/didChange",
+        DidChangeTextDocumentParams {
+            text_document: VersionedTextDocumentIdentifier {
+                uri: uri.clone(),
+                version: 2,
+            },
+            content_changes: vec![edit(Position::new(2, 9), Position::new(2, 14), "Verified")],
+        },
+    );
+    send_request(
+        &client,
+        1,
+        "textDocument/documentSymbol",
+        DocumentSymbolParams {
+            text_document: doc_id(&uri),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        },
+    );
+    let symbols: DocumentSymbolResponse =
+        serde_json::from_value(next_response(&client).result.unwrap()).unwrap();
+    let DocumentSymbolResponse::Nested(symbols) = symbols else {
+        panic!("expected nested symbols");
+    };
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, "Verified");
+    assert_eq!(symbols[0].selection_range.start, Position::new(2, 9));
+    send_request(&client, 2, "shutdown", serde_json::Value::Null);
+    let _ = next_response(&client);
+    send_notification(&client, "exit", serde_json::Value::Null);
+    server_thread.join().unwrap();
+}
+
+#[test]
 fn oversized_columns_in_edits_preserve_the_following_line() {
     for ending in ["\n", "\r\n"] {
         let (server, client) = Connection::memory();

@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use crate::diagnostics::{
     publish_diagnostics, publish_syntax_diagnostics_if_errors, send_diagnostics,
 };
-use crate::protocol::{apply_change, extract_err_response, extract_notification};
+use crate::protocol::{apply_changes, extract_err_response, extract_notification};
 use crate::state::{self, ServerState};
 
 const CHANGE_SYNTAX_DEBOUNCE: Duration = Duration::from_millis(120);
@@ -297,15 +297,16 @@ fn handle_notification(
             // INCREMENTAL sync: apply each content change in order to the current text
             // (each is relative to the document after the previous change), then reset
             // the whole text — full-document changes (range: None) also work.
-            let Some(mut text) = state.text(&uri) else {
+            let (Some(file), Some(index)) = (state.file(&uri), state.line_index(&uri)) else {
                 return Ok(());
             };
-            let old_imports = import_directive_fingerprint(&text);
-            for change in params.content_changes {
-                apply_change(&mut text, change);
-            }
-            let imports_changed = old_imports != import_directive_fingerprint(&text);
-            state.set(&uri, text);
+            let original = file.text(state.db());
+            let Some((text, index)) = apply_changes(original, index, params.content_changes) else {
+                return Ok(());
+            };
+            let imports_changed =
+                import_directive_fingerprint(original) != import_directive_fingerprint(&text);
+            state.set_with_line_index(&uri, text, index);
             if imports_changed {
                 state.load_import_graph(&uri);
             }
