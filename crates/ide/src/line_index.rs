@@ -12,55 +12,97 @@ pub struct LineCol {
     pub col: u32,
 }
 
-/// Maps byte offsets <-> line/UTF-16-column for one document. Built once per parse.
+/// Maps byte offsets <-> line/UTF-16-column for one document.
 ///
-/// We keep the line-start byte offsets plus an owned copy of the text; conversions
-/// walk a single line counting UTF-16 code units (exact, `O(line-length)`). The
-/// owned copy is the cost of the fixed `(&self, offset)` signature; if it ever
-/// matters, swap for a per-line non-ASCII delta table (rust-analyzer style) — the
-/// public API does not change.
+/// Construction scans the text once. Queries use binary searches over line starts
+/// and non-ASCII character boundaries, with no source-text copy or line rescanning.
 #[derive(Debug, Clone)]
 pub struct LineIndex {
-    /// Byte offset of the start of each line. `line_starts[0] == 0`; one entry per
-    /// line, in ascending order. A trailing `\n` yields a final empty-line entry
-    /// equal to `text.len()`.
-    line_starts: Vec<TextSize>,
-    /// The full source text — needed to count UTF-16 units within a line.
-    text: String,
+    lines: Vec<Line>,
+    non_ascii: Vec<NonAsciiChar>,
+}
+
+/// Global byte/UTF-16 starts and content ends (excluding LF/CRLF).
+#[derive(Debug, Clone, Copy)]
+struct Line {
+    byte_start: u32,
+    utf16_start: u32,
+    byte_end: u32,
+    utf16_end: u32,
+}
+
+/// At each non-ASCII boundary, byte_end - utf16_end is the cumulative difference
+/// between byte offsets and UTF-16 offsets. ASCII runs need no entries.
+#[derive(Debug, Clone, Copy)]
+struct NonAsciiChar {
+    byte_end: u32,
+    utf16_end: u32,
+    byte_len: u8,
+    utf16_len: u8,
 }
 
 impl LineIndex {
     pub fn new(text: &str) -> LineIndex {
-        let mut line_starts = vec![TextSize::from(0)];
-        for (i, b) in text.bytes().enumerate() {
-            if b == b'\n' {
-                line_starts.push(TextSize::from(i as u32 + 1));
+        let mut lines = Vec::new();
+        let mut non_ascii = Vec::new();
+        let mut byte_start = 0;
+        let mut utf16_start = 0;
+        let mut utf16 = 0;
+        for (byte, ch) in text.char_indices() {
+            let byte = byte as u32;
+            if ch == '\n' {
+                let crlf = byte > 0 && text.as_bytes()[byte as usize - 1] == b'\r';
+                lines.push(Line {
+                    byte_start,
+                    utf16_start,
+                    byte_end: byte - u32::from(crlf),
+                    utf16_end: utf16 - u32::from(crlf),
+                });
+                byte_start = byte + 1;
+                utf16_start = utf16 + 1;
+            }
+            utf16 += ch.len_utf16() as u32;
+            if !ch.is_ascii() {
+                non_ascii.push(NonAsciiChar {
+                    byte_end: byte + ch.len_utf8() as u32,
+                    utf16_end: utf16,
+                    byte_len: ch.len_utf8() as u8,
+                    utf16_len: ch.len_utf16() as u8,
+                });
             }
         }
-        LineIndex {
-            line_starts,
-            text: text.to_owned(),
-        }
+        // Always retain the final line, including an empty document/trailing LF.
+        lines.push(Line {
+            byte_start,
+            utf16_start,
+            byte_end: text.len() as u32,
+            utf16_end: utf16,
+        });
+        LineIndex { lines, non_ascii }
     }
 
     /// Byte offset -> line/UTF-16-column. Offsets past EOF clamp to the text end.
+    /// In-range offsets must be UTF-8 character boundaries.
     pub fn line_col(&self, offset: TextSize) -> LineCol {
-        let offset = (u32::from(offset) as usize).min(self.text.len());
-        // The line is the index of the greatest line-start <= offset. `partition_point`
-        // counts the line-starts that are <= offset; since line_starts[0] == 0 <= offset,
-        // that count is >= 1, so the subtraction never underflows.
+        let offset = u32::from(offset).min(self.lines.last().unwrap().byte_end);
         let line = self
-            .line_starts
-            .partition_point(|&start| u32::from(start) as usize <= offset)
+            .lines
+            .partition_point(|entry| entry.byte_start <= offset)
             - 1;
-        let line_start = u32::from(self.line_starts[line]) as usize;
-        let col: usize = self.text[line_start..offset]
-            .chars()
-            .map(char::len_utf16)
-            .sum();
+        let completed = self.non_ascii.partition_point(|ch| ch.byte_end <= offset);
+        if let Some(next) = self.non_ascii.get(completed) {
+            assert!(
+                offset <= next.byte_end - u32::from(next.byte_len),
+                "offset is inside a UTF-8 character"
+            );
+        }
+        let correction = completed
+            .checked_sub(1)
+            .map(|i| self.non_ascii[i].byte_end - self.non_ascii[i].utf16_end)
+            .unwrap_or(0);
         LineCol {
             line: line as u32,
-            col: col as u32,
+            col: offset - correction - self.lines[line].utf16_start,
         }
     }
 
@@ -68,31 +110,19 @@ impl LineIndex {
     /// past the line's content clamps to the line's end (LSP tolerates over-range
     /// positions); a `col` that lands mid-surrogate clamps forward to the next char.
     pub fn offset(&self, line_col: LineCol) -> Option<TextSize> {
-        let line = line_col.line as usize;
-        let line_start = u32::from(*self.line_starts.get(line)?) as usize;
-        let line_end = self
-            .line_starts
-            .get(line + 1)
-            .map(|&s| u32::from(s) as usize)
-            .unwrap_or(self.text.len());
-        let mut utf16: u32 = 0;
-        let mut byte = line_start;
-        // A line-start boundary includes the preceding line's terminator. LSP
-        // columns address content only, so never count LF or either byte of CRLF.
-        let line_text = &self.text[line_start..line_end];
-        let content = if let Some(without_lf) = line_text.strip_suffix('\n') {
-            without_lf.strip_suffix('\r').unwrap_or(without_lf)
-        } else {
-            line_text
-        };
-        for c in content.chars() {
-            if utf16 >= line_col.col {
-                break;
+        let line = self.lines.get(line_col.line as usize)?;
+        let utf16 = line.utf16_start + line_col.col.min(line.utf16_end - line.utf16_start);
+        let completed = self.non_ascii.partition_point(|ch| ch.utf16_end <= utf16);
+        if let Some(next) = self.non_ascii.get(completed) {
+            if utf16 > next.utf16_end - u32::from(next.utf16_len) {
+                return Some(TextSize::from(next.byte_end));
             }
-            utf16 += c.len_utf16() as u32;
-            byte += c.len_utf8();
         }
-        Some(TextSize::from(byte as u32))
+        let correction = completed
+            .checked_sub(1)
+            .map(|i| self.non_ascii[i].byte_end - self.non_ascii[i].utf16_end)
+            .unwrap_or(0);
+        Some(TextSize::from(utf16 + correction))
     }
 }
 
@@ -162,6 +192,82 @@ mod tests {
             LineIndex::new("🌍\r\nnext").offset(LineCol { line: 0, col: 1 }),
             Some(TextSize::from(4))
         );
+    }
+
+    #[test]
+    fn indexed_coordinates_match_character_walks() {
+        for text in [
+            "",
+            "ascii",
+            "\n\r\n\n",
+            "a\r\nb\nlast",
+            "last\r",
+            "é€🌍𐐀a\r\n🌍é\n\n終😀",
+            "a🌍b🌍c",
+            "\u{0000}é\r\nx",
+        ] {
+            let index = LineIndex::new(text);
+            for offset in text
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain([text.len()])
+            {
+                let before = &text[..offset];
+                let expected = LineCol {
+                    line: before.bytes().filter(|&b| b == b'\n').count() as u32,
+                    col: before.rsplit('\n').next().unwrap().encode_utf16().count() as u32,
+                };
+                assert_eq!(
+                    index.line_col(TextSize::from(offset as u32)),
+                    expected,
+                    "{text:?} at {offset}"
+                );
+            }
+            assert_eq!(
+                index.line_col(TextSize::from(u32::MAX)),
+                index.line_col(TextSize::from(text.len() as u32))
+            );
+            let mut start = 0;
+            let mut line = 0;
+            loop {
+                let next = text[start..].find('\n').map(|i| start + i + 1);
+                let raw = &text[start..next.unwrap_or(text.len())];
+                let content = if let Some(s) = raw.strip_suffix('\n') {
+                    s.strip_suffix('\r').unwrap_or(s)
+                } else {
+                    raw
+                };
+                let width = content.encode_utf16().count() as u32;
+                for col in (0..=width + 2).chain([u32::MAX]) {
+                    let mut expected = start;
+                    let mut units = 0;
+                    for ch in content.chars() {
+                        if units >= col {
+                            break;
+                        }
+                        units += ch.len_utf16() as u32;
+                        expected += ch.len_utf8();
+                    }
+                    assert_eq!(
+                        index.offset(LineCol { line, col }),
+                        Some(TextSize::from(expected as u32)),
+                        "{text:?} at {line}:{col}"
+                    );
+                }
+                let Some(next) = next else {
+                    break;
+                };
+                start = next;
+                line += 1;
+            }
+            assert_eq!(
+                index.offset(LineCol {
+                    line: line + 1,
+                    col: 0
+                }),
+                None
+            );
+        }
     }
 
     #[test]
